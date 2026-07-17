@@ -16,6 +16,20 @@ supervised autonomy → AI-native).
 - Push to GitHub (`origin main`) after committing — the remote is the source
   of truth, and local-only commits defeat cloud/scheduled agents at levels 3–4.
 
+## Project standards (each earned by a real failure — see git history)
+
+- **Silent success is the enemy.** This is a data pipeline: the worst bugs
+  report success while losing data (skip logic that wrongly says "current",
+  filters that silently drop symbols, parses that swallow rows). Any code that
+  skips, caches, resumes, or filters must warn loudly about what it excluded,
+  and must have tests for the backfill and partial-coverage paths — not just
+  the happy path. (Session 1's review found four of these on "all-green" code.)
+- **Lint cold before pushing:** `uv run ruff check --no-cache .` — a stale
+  ruff cache passed locally and failed in CI after a package-structure change.
+- **Network code test pattern:** offline unit tests against canned payloads
+  (fixtures in tests/conftest.py) plus `@pytest.mark.live` smoke tests; CI
+  runs offline only. Follow it; don't invent a new pattern per module.
+
 ## GitHub workflow
 
 - Work is tracked as **GitHub issues** grouped into **milestones** (one per

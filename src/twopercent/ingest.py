@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 
 import duckdb
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -44,8 +45,12 @@ def frames_to_rows(data: pd.DataFrame, yf_to_symbol: dict[str, str]) -> pd.DataF
         else:
             raise ValueError("expected group_by='ticker' MultiIndex columns")
     out: list[pd.DataFrame] = []
+    dropped_invalid = 0
     for yf_sym in data.columns.get_level_values(0).unique():
         sub = data[yf_sym].dropna(subset=["Open", "Close"], how="any")
+        valid = (sub["Open"] > 0) & np.isfinite(sub["Open"]) & np.isfinite(sub["Close"])
+        dropped_invalid += int((~valid).sum())
+        sub = sub[valid]
         if sub.empty:
             continue
         frame = pd.DataFrame(
@@ -61,6 +66,10 @@ def frames_to_rows(data: pd.DataFrame, yf_to_symbol: dict[str, str]) -> pd.DataF
             }
         )
         out.append(frame)
+    if dropped_invalid:
+        logger.warning(
+            "%d rows dropped for invalid open/close (<=0 or non-finite)", dropped_invalid
+        )
     if not out:
         return pd.DataFrame(
             columns=["symbol", "date", "open", "high", "low", "close", "adj_close", "volume"]

@@ -59,6 +59,14 @@ def test_frames_to_rows_drops_all_nan_symbols():
     assert set(rows["symbol"]) == {"AAPL"}
 
 
+def test_frames_to_rows_drops_invalid_opens_loudly(caplog):
+    frame = make_yf_frame(["AAPL"], days=4)
+    frame.loc[frame.index[0], ("AAPL", "Open")] = 0.0
+    rows = ingest.frames_to_rows(frame, {"AAPL": "AAPL"})
+    assert len(rows) == 3  # zero-open row rejected at ingest, not just hidden by the view
+    assert "dropped for invalid open/close" in caplog.text
+
+
 def test_frames_to_rows_accepts_flat_columns_for_single_symbol():
     flat = make_yf_frame(["AAPL"], days=4)["AAPL"]
     rows = ingest.frames_to_rows(flat, {"AAPL": "AAPL"})

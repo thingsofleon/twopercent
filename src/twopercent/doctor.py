@@ -1,0 +1,243 @@
+"""Data-quality doctor: gaps, staleness, suspicious bars, and coverage checks."""
+
+from __future__ import annotations
+
+import datetime as dt
+from dataclasses import dataclass
+
+import duckdb
+import pandas as pd
+
+from twopercent import scan
+
+DEFAULT_STALE_DAYS = 7
+EXTREME_RETURN_THRESHOLD = 0.5
+ZERO_VOLUME_MIN_RUN = 3
+
+
+def gap_counts(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """Per-symbol count of missing bars, measured against the store's own calendar.
+
+    The calendar is the set of dates present in daily_returns across all
+    symbols. A symbol has a gap if a calendar date between its own first and
+    last bar has no bar for it. Ordered worst-first.
+    """
+    return con.execute(
+        """
+        WITH calendar AS (SELECT DISTINCT date FROM daily_returns),
+             spans AS (
+                 SELECT symbol, min(date) AS first_date, max(date) AS last_date
+                 FROM daily_returns GROUP BY symbol
+             )
+        SELECT s.symbol,
+               count(*) AS missing,
+               min(c.date) AS first_missing,
+               max(c.date) AS last_missing
+        FROM spans s
+        JOIN calendar c ON c.date > s.first_date AND c.date < s.last_date
+        LEFT JOIN daily_returns r ON r.symbol = s.symbol AND r.date = c.date
+        WHERE r.symbol IS NULL
+        GROUP BY s.symbol
+        ORDER BY missing DESC, s.symbol
+        """
+    ).df()
+
+
+def stale_symbols(
+    con: duckdb.DuckDBPyConnection, stale_days: int = DEFAULT_STALE_DAYS
+) -> pd.DataFrame:
+    """Symbols whose last bar is more than `stale_days` before the store's max date."""
+    return con.execute(
+        """
+        WITH last_bars AS (SELECT symbol, max(date) AS last_date FROM prices GROUP BY symbol),
+             store_max AS (SELECT max(date) AS max_date FROM prices)
+        SELECT symbol, last_date, max_date - last_date AS age_days
+        FROM last_bars, store_max
+        WHERE max_date - last_date > ?
+        ORDER BY age_days DESC, symbol
+        """,
+        [stale_days],
+    ).df()
+
+
+def extreme_bars(
+    con: duckdb.DuckDBPyConnection, threshold: float = EXTREME_RETURN_THRESHOLD
+) -> pd.DataFrame:
+    """Bars whose open-to-close move exceeds `threshold` in either direction."""
+    return con.execute(
+        """
+        SELECT symbol, date, oc_return
+        FROM daily_returns
+        WHERE isfinite(oc_return) AND abs(oc_return) > ?
+        ORDER BY abs(oc_return) DESC, symbol, date
+        """,
+        [threshold],
+    ).df()
+
+
+def zero_volume_runs(
+    con: duckdb.DuckDBPyConnection, min_run: int = ZERO_VOLUME_MIN_RUN
+) -> pd.DataFrame:
+    """Runs of >= `min_run` consecutive zero-volume bars (consecutive in the
+    symbol's own bar sequence, not the calendar)."""
+    return con.execute(
+        """
+        WITH seq AS (
+            SELECT symbol, date, volume,
+                   row_number() OVER (PARTITION BY symbol ORDER BY date) AS rn
+            FROM prices
+        ),
+        zero AS (
+            SELECT symbol, date,
+                   rn - row_number() OVER (PARTITION BY symbol ORDER BY date) AS grp
+            FROM seq WHERE volume = 0
+        )
+        SELECT symbol, min(date) AS run_start, max(date) AS run_end,
+               count(*) AS run_length
+        FROM zero
+        GROUP BY symbol, grp
+        HAVING count(*) >= ?
+        ORDER BY run_length DESC, symbol, run_start
+        """,
+        [min_run],
+    ).df()
+
+
+def universe_symbols_without_prices(con: duckdb.DuckDBPyConnection) -> list[str]:
+    """Symbols in the latest universe snapshot with no price rows at all."""
+    rows = con.execute(
+        """
+        SELECT symbol FROM latest_universe
+        EXCEPT SELECT DISTINCT symbol FROM prices
+        ORDER BY symbol
+        """
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def price_symbols_without_meta(con: duckdb.DuckDBPyConnection) -> list[str]:
+    """Symbols with price rows but no ingest_meta row (unknown coverage window)."""
+    rows = con.execute(
+        """
+        SELECT DISTINCT symbol FROM prices
+        EXCEPT SELECT symbol FROM ingest_meta
+        ORDER BY symbol
+        """
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+@dataclass(frozen=True)
+class DoctorReport:
+    max_date: dt.date | None
+    stale_days: int
+    has_universe: bool
+    gaps: pd.DataFrame
+    stale: pd.DataFrame
+    extreme: pd.DataFrame
+    zero_runs: pd.DataFrame
+    universe_missing_prices: list[str]
+    prices_missing_meta: list[str]
+
+    @property
+    def problem_count(self) -> int:
+        return (
+            len(self.gaps)
+            + len(self.stale)
+            + len(self.extreme)
+            + len(self.zero_runs)
+            + len(self.universe_missing_prices)
+            + len(self.prices_missing_meta)
+        )
+
+    @property
+    def ok(self) -> bool:
+        return self.problem_count == 0
+
+
+def run(con: duckdb.DuckDBPyConnection, stale_days: int = DEFAULT_STALE_DAYS) -> DoctorReport:
+    """Run every check and collect the findings."""
+    has_universe = con.execute("SELECT count(*) FROM latest_universe").fetchone()[0] > 0
+    return DoctorReport(
+        max_date=scan.latest_price_date(con),
+        stale_days=stale_days,
+        has_universe=has_universe,
+        gaps=gap_counts(con),
+        stale=stale_symbols(con, stale_days=stale_days),
+        extreme=extreme_bars(con),
+        zero_runs=zero_volume_runs(con),
+        universe_missing_prices=universe_symbols_without_prices(con),
+        prices_missing_meta=price_symbols_without_meta(con),
+    )
+
+
+def _mark(problems: int) -> str:
+    return "[ OK ]" if problems == 0 else "[FAIL]"
+
+
+def _overflow(lines: list[str], total: int, examples: int) -> None:
+    if total > examples:
+        lines.append(f"    ... and {total - examples} more")
+
+
+def format_report(report: DoctorReport, examples: int = 10) -> list[str]:
+    """Human-readable summary: one section per check, worst examples first."""
+    lines: list[str] = [f"store max date: {report.max_date}"]
+
+    missing_total = 0 if report.gaps.empty else int(report.gaps["missing"].sum())
+    lines.append(
+        f"{_mark(len(report.gaps))} gaps: {len(report.gaps)} symbols missing "
+        f"{missing_total} bars present in the store calendar"
+    )
+    for row in report.gaps.head(examples).itertuples():
+        lines.append(
+            f"    {row.symbol:<8} {row.missing} missing between "
+            f"{row.first_missing:%Y-%m-%d} and {row.last_missing:%Y-%m-%d}"
+        )
+    _overflow(lines, len(report.gaps), examples)
+
+    lines.append(
+        f"{_mark(len(report.stale))} stale: {len(report.stale)} symbols with last bar "
+        f"> {report.stale_days} days before store max"
+    )
+    for row in report.stale.head(examples).itertuples():
+        lines.append(
+            f"    {row.symbol:<8} last bar {row.last_date:%Y-%m-%d} ({row.age_days} days old)"
+        )
+    _overflow(lines, len(report.stale), examples)
+
+    suspicious = len(report.extreme) + len(report.zero_runs)
+    lines.append(
+        f"{_mark(suspicious)} suspicious: {len(report.extreme)} bars with "
+        f"|oc_return| > {EXTREME_RETURN_THRESHOLD:.0%}, {len(report.zero_runs)} "
+        f"zero-volume runs of >= {ZERO_VOLUME_MIN_RUN} bars"
+    )
+    for row in report.extreme.head(examples).itertuples():
+        lines.append(f"    {row.symbol:<8} {row.date:%Y-%m-%d} oc_return {row.oc_return:+.1%}")
+    _overflow(lines, len(report.extreme), examples)
+    for row in report.zero_runs.head(examples).itertuples():
+        lines.append(
+            f"    {row.symbol:<8} zero volume x{row.run_length} "
+            f"{row.run_start:%Y-%m-%d}..{row.run_end:%Y-%m-%d}"
+        )
+    _overflow(lines, len(report.zero_runs), examples)
+
+    coverage = len(report.universe_missing_prices) + len(report.prices_missing_meta)
+    lines.append(
+        f"{_mark(coverage)} coverage: {len(report.universe_missing_prices)} universe "
+        f"symbols with no prices, {len(report.prices_missing_meta)} price symbols "
+        f"with no ingest_meta row"
+    )
+    if not report.has_universe:
+        lines.append(
+            "    warning: no universe stored — universe coverage could not be checked "
+            "(run `twopercent universe --refresh`)"
+        )
+    for symbol in report.universe_missing_prices[:examples]:
+        lines.append(f"    {symbol:<8} in latest universe but has no price rows")
+    _overflow(lines, len(report.universe_missing_prices), examples)
+    for symbol in report.prices_missing_meta[:examples]:
+        lines.append(f"    {symbol:<8} has price rows but no ingest_meta row")
+    _overflow(lines, len(report.prices_missing_meta), examples)
+
+    return lines

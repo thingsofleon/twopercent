@@ -114,6 +114,45 @@ def benchmark_cmd(
         typer.echo(f"  {key:>15}: {value}")
 
 
+@app.command("compare")
+def compare_cmd(
+    strat_a: str = typer.Argument(..., help="First strategy name."),
+    strat_b: str = typer.Argument(..., help="Second strategy name."),
+    months: int = typer.Option(12, help="Test months (walk-forward, monthly retrain)."),
+    top: int = typer.Option(20, help="Daily top-N for precision@N."),
+    db: Path = DbOption,
+) -> None:
+    """Benchmark two strategies on identical folds and compare their metrics."""
+    from twopercent import backtest, strategies
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    for name in (strat_a, strat_b):
+        if name not in strategies.names():
+            typer.echo(f"Unknown strategy {name!r}. Available: {', '.join(strategies.names())}")
+            raise typer.Exit(2)
+    con = store.connect(db)
+    results = {
+        name: backtest.run_benchmark(con, name, months=months, top_n=top)
+        for name in (strat_a, strat_b)
+    }
+
+    width = max(len(strat_a), len(strat_b), 10)
+    typer.echo(f"Compare over last {months} months (top-{top} daily, identical folds):")
+    typer.echo(f"  {'metric':>15}  {strat_a:>{width}}  {strat_b:>{width}}")
+    for key in results[strat_a]:
+        a, b = results[strat_a][key], results[strat_b][key]
+        typer.echo(f"  {key:>15}  {a!s:>{width}}  {b!s:>{width}}")
+
+    lift_a, lift_b = results[strat_a]["lift"], results[strat_b]["lift"]
+    if lift_a is None or lift_b is None:
+        typer.echo("Winner on lift: undecided (lift unavailable for at least one strategy)")
+    elif lift_a == lift_b:
+        typer.echo(f"Winner on lift: tie at {lift_a}")
+    else:
+        winner = strat_a if lift_a > lift_b else strat_b
+        typer.echo(f"Winner on lift: {winner} ({max(lift_a, lift_b)} vs {min(lift_a, lift_b)})")
+
+
 @app.command("predict")
 def predict_cmd(
     strategy: str = typer.Option(None, help="Strategy name (default: champion)."),

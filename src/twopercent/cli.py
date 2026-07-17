@@ -195,7 +195,8 @@ def experiments_cmd(
 def doctor_cmd(
     stale_days: int = typer.Option(
         doctor_mod.DEFAULT_STALE_DAYS,
-        help="Flag symbols whose last bar is older than this many days before the store max.",
+        help="Flag symbols whose last bar is more than this many trading days "
+        "behind the store max.",
     ),
     examples: int = typer.Option(10, help="Worst examples to print per check."),
     db: Path = DbOption,

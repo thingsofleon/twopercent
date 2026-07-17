@@ -10,7 +10,7 @@ import pandas as pd
 
 from twopercent import scan
 
-DEFAULT_STALE_DAYS = 7
+DEFAULT_STALE_DAYS = 2
 EXTREME_RETURN_THRESHOLD = 0.5
 ZERO_VOLUME_MIN_RUN = 3
 
@@ -46,17 +46,44 @@ def gap_counts(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
 def stale_symbols(
     con: duckdb.DuckDBPyConnection, stale_days: int = DEFAULT_STALE_DAYS
 ) -> pd.DataFrame:
-    """Symbols whose last bar is more than `stale_days` before the store's max date."""
+    """Symbols whose last bar is more than `stale_days` TRADING days behind the store max.
+
+    Measured against the store's own calendar (dates present in daily_returns),
+    not calendar days — a symbol missing only its most recent bars would
+    otherwise pass silently for up to a week (gaps are interior-only).
+    """
     return con.execute(
         """
-        WITH last_bars AS (SELECT symbol, max(date) AS last_date FROM prices GROUP BY symbol),
-             store_max AS (SELECT max(date) AS max_date FROM prices)
-        SELECT symbol, last_date, max_date - last_date AS age_days
-        FROM last_bars, store_max
-        WHERE max_date - last_date > ?
-        ORDER BY age_days DESC, symbol
+        WITH calendar AS (SELECT DISTINCT date FROM daily_returns),
+             last_bars AS (SELECT symbol, max(date) AS last_date FROM prices GROUP BY symbol)
+        SELECT l.symbol, l.last_date, count(c.date) AS trading_days_behind
+        FROM last_bars l
+        LEFT JOIN calendar c ON c.date > l.last_date
+        GROUP BY l.symbol, l.last_date
+        HAVING count(c.date) > ?
+        ORDER BY trading_days_behind DESC, symbol
         """,
         [stale_days],
+    ).df()
+
+
+def invalid_bars(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """Per-symbol count of price rows the daily_returns view silently excludes.
+
+    These rows (open <= 0/NULL or non-finite open/close) are invisible to the
+    gap and extreme checks yet make a symbol look fresh to the stale check —
+    corrupt recent bars would otherwise report a healthy store.
+    """
+    return con.execute(
+        """
+        SELECT symbol, count(*) AS invalid,
+               min(date) AS first_invalid, max(date) AS last_invalid
+        FROM prices
+        WHERE open IS NULL OR open <= 0 OR NOT isfinite(open)
+           OR close IS NULL OR NOT isfinite(close)
+        GROUP BY symbol
+        ORDER BY invalid DESC, symbol
+        """
     ).df()
 
 
@@ -78,8 +105,8 @@ def extreme_bars(
 def zero_volume_runs(
     con: duckdb.DuckDBPyConnection, min_run: int = ZERO_VOLUME_MIN_RUN
 ) -> pd.DataFrame:
-    """Runs of >= `min_run` consecutive zero-volume bars (consecutive in the
-    symbol's own bar sequence, not the calendar)."""
+    """Runs of >= `min_run` consecutive zero/NULL-volume bars (consecutive in
+    the symbol's own bar sequence, not the calendar)."""
     return con.execute(
         """
         WITH seq AS (
@@ -90,7 +117,7 @@ def zero_volume_runs(
         zero AS (
             SELECT symbol, date,
                    rn - row_number() OVER (PARTITION BY symbol ORDER BY date) AS grp
-            FROM seq WHERE volume = 0
+            FROM seq WHERE volume = 0 OR volume IS NULL
         )
         SELECT symbol, min(date) AS run_start, max(date) AS run_end,
                count(*) AS run_length
@@ -136,6 +163,7 @@ class DoctorReport:
     stale: pd.DataFrame
     extreme: pd.DataFrame
     zero_runs: pd.DataFrame
+    invalid: pd.DataFrame
     universe_missing_prices: list[str]
     prices_missing_meta: list[str]
 
@@ -146,6 +174,7 @@ class DoctorReport:
             + len(self.stale)
             + len(self.extreme)
             + len(self.zero_runs)
+            + len(self.invalid)
             + len(self.universe_missing_prices)
             + len(self.prices_missing_meta)
         )
@@ -166,6 +195,7 @@ def run(con: duckdb.DuckDBPyConnection, stale_days: int = DEFAULT_STALE_DAYS) ->
         stale=stale_symbols(con, stale_days=stale_days),
         extreme=extreme_bars(con),
         zero_runs=zero_volume_runs(con),
+        invalid=invalid_bars(con),
         universe_missing_prices=universe_symbols_without_prices(con),
         prices_missing_meta=price_symbols_without_meta(con),
     )
@@ -198,11 +228,12 @@ def format_report(report: DoctorReport, examples: int = 10) -> list[str]:
 
     lines.append(
         f"{_mark(len(report.stale))} stale: {len(report.stale)} symbols with last bar "
-        f"> {report.stale_days} days before store max"
+        f"> {report.stale_days} trading days behind store max"
     )
     for row in report.stale.head(examples).itertuples():
         lines.append(
-            f"    {row.symbol:<8} last bar {row.last_date:%Y-%m-%d} ({row.age_days} days old)"
+            f"    {row.symbol:<8} last bar {row.last_date:%Y-%m-%d} "
+            f"({row.trading_days_behind} trading days behind)"
         )
     _overflow(lines, len(report.stale), examples)
 
@@ -221,6 +252,18 @@ def format_report(report: DoctorReport, examples: int = 10) -> list[str]:
             f"{row.run_start:%Y-%m-%d}..{row.run_end:%Y-%m-%d}"
         )
     _overflow(lines, len(report.zero_runs), examples)
+
+    invalid_total = 0 if report.invalid.empty else int(report.invalid["invalid"].sum())
+    lines.append(
+        f"{_mark(len(report.invalid))} invalid: {len(report.invalid)} symbols with "
+        f"{invalid_total} bars excluded from scans (open <= 0/NULL or non-finite open/close)"
+    )
+    for row in report.invalid.head(examples).itertuples():
+        lines.append(
+            f"    {row.symbol:<8} {row.invalid} invalid bars between "
+            f"{row.first_invalid:%Y-%m-%d} and {row.last_invalid:%Y-%m-%d}"
+        )
+    _overflow(lines, len(report.invalid), examples)
 
     coverage = len(report.universe_missing_prices) + len(report.prices_missing_meta)
     lines.append(

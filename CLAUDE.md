@@ -52,13 +52,25 @@ supervised autonomy → AI-native).
 - Work is tracked as **GitHub issues** grouped into **milestones** (one per
   adoption level). Start work by picking up an issue; file new issues for new
   work instead of keeping private todo lists.
-- Code changes land via **pull request** from a feature branch, referencing
-  the issue (`Closes #N`). Direct pushes to `main` are for docs/config only,
-  and stop entirely once branch protection is on (#6).
-- A PR merges only when CI is green and `/code-review` has run. Same bar for
-  human- and agent-written code.
-- At level 2+, parallel agents each work in their **own git worktree** on
-  their own branch — one agent, one branch, one PR.
+- **Everything lands via pull request** from a feature branch, referencing the
+  issue (`Closes #N`). `main` is branch-protected (required check: `test`,
+  strict up-to-date, admins included) — direct pushes are rejected, including
+  docs. Reflection/roadmap updates ride in the PR that finished the work.
+- A PR merges only when CI is green and review has run. Same bar for human-
+  and agent-written code. The user merges; agents never merge.
+- Parallel agents each work in their **own git worktree** on their own branch
+  — one agent, one branch, one PR.
+
+## Agent team (.claude/agents/)
+
+- **builder** — implements one scoped feature end-to-end on its own branch
+  and opens the PR. Spawn one per independent work item; worktree isolation
+  when parallel.
+- **reviewer** — reviews a PR diff against the earned standards above;
+  read/test only. Run on every agent-built PR before merge.
+- **quant-skeptic** — adversarial methodology review (lookahead, leakage,
+  contamination, survivorship, overfitting, regime). Mandatory for any PR
+  touching features, labels, training, evaluation, or reported metrics.
 
 ## Working loop
 

@@ -17,6 +17,7 @@ from twopercent import store, universe
 app = typer.Typer(help="Scanner + predictor for +2% open-to-close US stock moves.")
 
 DbOption = typer.Option(store.DEFAULT_DB_PATH, "--db", help="Path to the DuckDB file.")
+OutOption = typer.Option(Path("dashboard.html"), "--out", help="Output HTML path.")
 
 
 @app.command("universe")
@@ -116,40 +117,63 @@ def benchmark_cmd(
 @app.command("predict")
 def predict_cmd(
     strategy: str = typer.Option(None, help="Strategy name (default: champion)."),
+    date: str = typer.Option(
+        None, "--date", help="Signal date YYYY-MM-DD (default: latest; past dates backfill)."
+    ),
     top: int = typer.Option(20, help="How many candidates to print."),
+    save: bool = typer.Option(True, help="Log predictions for track-record scoring."),
     db: Path = DbOption,
 ) -> None:
     """Rank tickers by probability of a +2% open-to-close move next trading day."""
-    from twopercent import champion, strategies
-    from twopercent.features import feature_frame
+    from twopercent import champion
+    from twopercent.predict import predict_for
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     name = strategy or champion.get_champion()
     con = store.connect(db)
-    frame = feature_frame(con)
-    if frame.empty:
-        typer.echo("No feature rows — is the store ingested?")
-        raise typer.Exit(1)
-
-    labeled = frame[frame["did_2pct_next"].notna()]
-    if labeled.empty:
-        typer.echo("No labeled history to train on — ingest more than one day of data.")
-        raise typer.Exit(1)
-    signal_date = frame["signal_date"].max()
-    latest = frame[frame["signal_date"] == signal_date]
-
-    strat = strategies.get(name)
-    strat.fit(labeled)
-    ranked = latest.assign(prob=strat.predict_proba(latest)).nlargest(top, "prob")
+    signal_date = None
+    if date is not None:
+        try:
+            signal_date = dt.date.fromisoformat(date)
+        except ValueError:
+            typer.echo(f"Invalid --date {date!r}: expected YYYY-MM-DD.")
+            raise typer.Exit(2) from None
+    try:
+        result = predict_for(con, name, signal_date=signal_date, save=save)
+    except ValueError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(1) from None
 
     uni = store.latest_universe(con).set_index("symbol")["name"]
     typer.echo(
-        f"Top {top} candidates for the trading day after {signal_date.date()} "
-        f"(strategy: {name}, trained on {len(labeled):,} rows):"
+        f"Top {top} candidates for the trading day after {result.signal_date} "
+        f"(strategy: {name}, trained on {result.trained_rows:,} rows"
+        f"{', logged' if save else ''}):"
     )
-    for i, row in enumerate(ranked.itertuples(), start=1):
+    for row in result.scored.head(top).itertuples():
         company = str(uni.get(row.symbol, "?"))[:40]
-        typer.echo(f"  {i:>3}. {row.symbol:<6} p={row.prob:0.3f}  {company}")
+        typer.echo(f"  {row.rank:>3}. {row.symbol:<6} p={row.prob:0.3f}  {company}")
+
+
+@app.command("dashboard")
+def dashboard_cmd(
+    out: Path = OutOption,
+    strategy: str = typer.Option(None, help="Strategy name (default: champion)."),
+    top: int = typer.Option(20, help="Candidates to show / score."),
+    db: Path = DbOption,
+) -> None:
+    """Generate the static HTML dashboard (candidates + track record)."""
+    from twopercent import champion, dashboard
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    name = strategy or champion.get_champion()
+    con = store.connect(db)
+    try:
+        path = dashboard.render(con, name, str(out), top=top)
+    except ValueError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(1) from None
+    typer.echo(f"Dashboard written to {path}")
 
 
 @app.command("experiments")

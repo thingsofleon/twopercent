@@ -50,6 +50,15 @@ CREATE TABLE IF NOT EXISTS experiments (
     test_end DATE,
     metrics TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS predictions (
+    strategy TEXT NOT NULL,
+    signal_date DATE NOT NULL,
+    symbol TEXT NOT NULL,
+    prob DOUBLE NOT NULL,
+    rank INTEGER NOT NULL,
+    created_ts TIMESTAMP NOT NULL,
+    PRIMARY KEY (strategy, signal_date, symbol)
+);
 CREATE OR REPLACE VIEW latest_universe AS
     SELECT symbol, name, market_cap, as_of
     FROM universe
@@ -146,6 +155,34 @@ def record_ingest_from(
 
 def price_row_count(con: duckdb.DuckDBPyConnection) -> int:
     return con.execute("SELECT count(*) FROM prices").fetchone()[0]
+
+
+def save_predictions(
+    con: duckdb.DuckDBPyConnection, strategy: str, signal_date: dt.date, df: pd.DataFrame
+) -> int:
+    """Idempotently store scored rows (columns: symbol, prob, rank) for a signal date."""
+    if df.empty:
+        return 0
+    rows = df[["symbol", "prob", "rank"]].copy()
+    rows.insert(0, "strategy", strategy)
+    rows.insert(1, "signal_date", signal_date)
+    con.register("predictions_in", rows)
+    con.execute(
+        """
+        INSERT OR REPLACE INTO predictions
+        SELECT strategy, signal_date, symbol, prob, rank, now() FROM predictions_in
+        """
+    )
+    con.unregister("predictions_in")
+    return len(rows)
+
+
+def predicted_signal_dates(con: duckdb.DuckDBPyConnection, strategy: str) -> list[dt.date]:
+    rows = con.execute(
+        "SELECT DISTINCT signal_date FROM predictions WHERE strategy = ? ORDER BY signal_date",
+        [strategy],
+    ).fetchall()
+    return [r[0] for r in rows]
 
 
 def record_experiment(

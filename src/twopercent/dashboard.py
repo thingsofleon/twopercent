@@ -133,6 +133,7 @@ def build_html(
     n_prices = store.price_row_count(con)
 
     head = (
+        '<meta charset="utf-8">'
         "<title>twopercent dashboard</title>"
         + _CSS
         + '<div class="tp-root">'

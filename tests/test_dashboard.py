@@ -55,6 +55,7 @@ def test_dashboard_renders_scored_track_record(modeled, tmp_path):
     assert "&lt;Corp&gt; &amp; Sons" in content  # names HTML-escaped
     assert "<Corp>" not in content
     assert 'src="http' not in content and 'href="http' not in content  # self-contained
+    assert '<meta charset="utf-8">' in content  # no mojibake when served header-less
     assert "<svg" in content  # chart rendered for the scored days
     assert "Awaiting outcomes" in content  # the render-day prediction is pending
 

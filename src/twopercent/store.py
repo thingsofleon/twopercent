@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from pathlib import Path
 
 import duckdb
@@ -34,9 +35,21 @@ CREATE TABLE IF NOT EXISTS ingest_meta (
     from_date DATE NOT NULL
 );
 CREATE OR REPLACE VIEW daily_returns AS
-    SELECT symbol, date, open, close, volume, (close - open) / open AS oc_return
+    SELECT symbol, date, open, high, low, close, volume,
+           (close - open) / open AS oc_return
     FROM prices
     WHERE open > 0 AND isfinite(open) AND isfinite(close);
+CREATE SEQUENCE IF NOT EXISTS experiment_id_seq;
+CREATE TABLE IF NOT EXISTS experiments (
+    id BIGINT PRIMARY KEY DEFAULT nextval('experiment_id_seq'),
+    run_ts TIMESTAMP NOT NULL,
+    strategy TEXT NOT NULL,
+    params TEXT,
+    train_start DATE,
+    test_start DATE,
+    test_end DATE,
+    metrics TEXT NOT NULL
+);
 CREATE OR REPLACE VIEW latest_universe AS
     SELECT symbol, name, market_cap, as_of
     FROM universe
@@ -133,3 +146,26 @@ def record_ingest_from(
 
 def price_row_count(con: duckdb.DuckDBPyConnection) -> int:
     return con.execute("SELECT count(*) FROM prices").fetchone()[0]
+
+
+def record_experiment(
+    con: duckdb.DuckDBPyConnection,
+    strategy: str,
+    params: dict,
+    train_start: dt.date,
+    test_start: dt.date,
+    test_end: dt.date,
+    metrics: dict,
+) -> None:
+    con.execute(
+        """
+        INSERT INTO experiments (run_ts, strategy, params, train_start, test_start,
+                                 test_end, metrics)
+        VALUES (now(), ?, ?, ?, ?, ?, ?)
+        """,
+        [strategy, json.dumps(params), train_start, test_start, test_end, json.dumps(metrics)],
+    )
+
+
+def list_experiments(con: duckdb.DuckDBPyConnection, limit: int = 20) -> pd.DataFrame:
+    return con.execute("SELECT * FROM experiments ORDER BY run_ts DESC LIMIT ?", [limit]).df()

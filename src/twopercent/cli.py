@@ -91,6 +91,81 @@ def scan_cmd(
         typer.echo(f"  ... and {len(movers) - limit} more (raise --limit to see them)")
 
 
+@app.command("benchmark")
+def benchmark_cmd(
+    strategy: str = typer.Argument(None, help="Strategy name (default: champion)."),
+    months: int = typer.Option(12, help="Test months (walk-forward, monthly retrain)."),
+    top: int = typer.Option(20, help="Daily top-N for precision@N."),
+    db: Path = DbOption,
+) -> None:
+    """Walk-forward benchmark of a strategy; records an experiments row."""
+    from twopercent import backtest, champion, strategies
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    name = strategy or champion.get_champion()
+    if name not in strategies.names():
+        typer.echo(f"Unknown strategy {name!r}. Available: {', '.join(strategies.names())}")
+        raise typer.Exit(2)
+    con = store.connect(db)
+    metrics = backtest.run_benchmark(con, name, months=months, top_n=top)
+    typer.echo(f"Benchmark {name} over last {months} months (top-{top} daily):")
+    for key, value in metrics.items():
+        typer.echo(f"  {key:>15}: {value}")
+
+
+@app.command("predict")
+def predict_cmd(
+    strategy: str = typer.Option(None, help="Strategy name (default: champion)."),
+    top: int = typer.Option(20, help="How many candidates to print."),
+    db: Path = DbOption,
+) -> None:
+    """Rank tickers by probability of a +2% open-to-close move next trading day."""
+    from twopercent import champion, strategies
+    from twopercent.features import feature_frame
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    name = strategy or champion.get_champion()
+    con = store.connect(db)
+    frame = feature_frame(con)
+    if frame.empty:
+        typer.echo("No feature rows — is the store ingested?")
+        raise typer.Exit(1)
+
+    labeled = frame[frame["did_2pct_next"].notna()]
+    if labeled.empty:
+        typer.echo("No labeled history to train on — ingest more than one day of data.")
+        raise typer.Exit(1)
+    signal_date = frame["signal_date"].max()
+    latest = frame[frame["signal_date"] == signal_date]
+
+    strat = strategies.get(name)
+    strat.fit(labeled)
+    ranked = latest.assign(prob=strat.predict_proba(latest)).nlargest(top, "prob")
+
+    uni = store.latest_universe(con).set_index("symbol")["name"]
+    typer.echo(
+        f"Top {top} candidates for the trading day after {signal_date.date()} "
+        f"(strategy: {name}, trained on {len(labeled):,} rows):"
+    )
+    for i, row in enumerate(ranked.itertuples(), start=1):
+        company = str(uni.get(row.symbol, "?"))[:40]
+        typer.echo(f"  {i:>3}. {row.symbol:<6} p={row.prob:0.3f}  {company}")
+
+
+@app.command("experiments")
+def experiments_cmd(
+    limit: int = typer.Option(10, help="How many recent runs to show."),
+    db: Path = DbOption,
+) -> None:
+    """List recent benchmark runs from the experiments table."""
+    df = store.list_experiments(store.connect(db), limit=limit)
+    if df.empty:
+        typer.echo("No experiments recorded yet — run `twopercent benchmark`.")
+        raise typer.Exit(0)
+    for row in df.itertuples():
+        typer.echo(f"#{row.id} {row.run_ts:%Y-%m-%d %H:%M} {row.strategy} {row.metrics}")
+
+
 @app.command("ingest")
 def ingest_cmd(
     years: float = typer.Option(5.0, help="Years of history to download."),

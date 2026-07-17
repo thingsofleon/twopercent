@@ -36,6 +36,42 @@ def screener_rows():
     ]
 
 
+def seed_history(
+    con, oc_returns: dict[str, list[float]], start="2026-01-05", vary_volume: bool = False
+) -> pd.DataFrame:
+    """Seed prices for symbols with exact open-to-close returns per business day.
+
+    open is always 100.0, so close = 100 * (1 + oc). vary_volume avoids
+    constant feature columns (sklearn's binner rejects single-valued columns).
+    """
+    from twopercent import store
+
+    frames = []
+    for symbol, ocs in oc_returns.items():
+        n = len(ocs)
+        dates = pd.bdate_range(start, periods=n)
+        opens = np.full(n, 100.0)
+        closes = opens * (1 + np.asarray(ocs))
+        volume = 1_000_000 + (np.arange(n) % 17) * 1_000 if vary_volume else 1_000_000
+        frames.append(
+            pd.DataFrame(
+                {
+                    "symbol": symbol,
+                    "date": dates.date,
+                    "open": opens,
+                    "high": np.maximum(opens, closes) * 1.001,
+                    "low": np.minimum(opens, closes) * 0.999,
+                    "close": closes,
+                    "adj_close": closes,
+                    "volume": volume,
+                }
+            )
+        )
+    df = pd.concat(frames, ignore_index=True)
+    store.upsert_prices(con, df)
+    return df
+
+
 def make_yf_frame(symbols: list[str], days: int = 5, start_price: float = 100.0) -> pd.DataFrame:
     """Synthetic yf.download output: MultiIndex (ticker, field) columns."""
     dates = pd.bdate_range("2026-01-05", periods=days)

@@ -6,6 +6,13 @@ close and used to predict the NEXT trading day. The label `did_2pct_next` is
 the next trading day's +2% outcome (explicitly a LEAD; everything else must
 never look forward). Predictions for "tomorrow" are the rows at the latest
 signal_date, which have no label yet.
+
+Caveat to the claim above: price-derived features honor it strictly, but
+sector labels, sector-aggregate membership, and log_mcap come from the LATEST
+universe snapshot applied to all of history. That is survivorship in feature
+values (today's sector/cap assignments were not knowable on past signal
+dates), and historical values of those features change when the universe
+refreshes — reproduce a logged experiment only against the same snapshot.
 """
 
 from __future__ import annotations
@@ -32,6 +39,8 @@ FEATURE_COLUMNS = [
     "breadth",
     "market_heat",
     "log_mcap",
+    "sector_breadth",
+    "sector_excess",
 ]
 
 _SQL = """
@@ -58,6 +67,17 @@ market AS (
         avg(CASE WHEN oc_return >= ? THEN 1.0 ELSE 0.0 END) AS market_heat
     FROM daily_returns
     GROUP BY date
+),
+sector_day AS (
+    SELECT
+        d.date,
+        u.sector,
+        avg(CASE WHEN d.oc_return > 0 THEN 1.0 ELSE 0.0 END) AS sector_breadth,
+        avg(d.oc_return) AS sector_mean_oc
+    FROM daily_returns d
+    JOIN latest_universe u USING (symbol)
+    WHERE u.sector IS NOT NULL AND u.sector <> ''
+    GROUP BY d.date, u.sector
 )
 SELECT
     s.symbol,
@@ -77,10 +97,13 @@ SELECT
     m.breadth,
     m.market_heat,
     ln(u.market_cap) AS log_mcap,
+    sd.sector_breadth,
+    s.oc_return - sd.sector_mean_oc AS sector_excess,
     s.history_days
 FROM per_symbol s
 JOIN market m ON s.date = m.date
 LEFT JOIN latest_universe u USING (symbol)
+LEFT JOIN sector_day sd ON sd.date = s.date AND sd.sector = u.sector
 WHERE s.date >= ? AND s.date <= ?
 ORDER BY s.date, s.symbol
 """
@@ -105,4 +128,19 @@ def feature_frame(
             int(thin.sum()),
             MIN_HISTORY_DAYS,
         )
-    return df[~thin].drop(columns="history_days").reset_index(drop=True)
+    out = df[~thin].drop(columns="history_days").reset_index(drop=True)
+    nan_sector = out["sector_breadth"].isna()
+    if not out.empty and nan_sector.all():
+        logger.warning(
+            "no sector data in the latest universe snapshot: sector_breadth/sector_excess "
+            "are all NaN (refresh the universe to populate sectors; all-NaN columns crash "
+            "sklearn's HistGradientBoosting binner)"
+        )
+    elif nan_sector.any():
+        logger.warning(
+            "%d feature rows across %d symbols have NaN sector features "
+            "(blank sector or symbol missing from the latest universe snapshot)",
+            int(nan_sector.sum()),
+            out.loc[nan_sector, "symbol"].nunique(),
+        )
+    return out

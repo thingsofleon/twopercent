@@ -17,8 +17,10 @@ CREATE TABLE IF NOT EXISTS universe (
     name TEXT NOT NULL,
     market_cap DOUBLE NOT NULL,
     as_of DATE NOT NULL,
+    sector TEXT,
     PRIMARY KEY (symbol, as_of)
 );
+ALTER TABLE universe ADD COLUMN IF NOT EXISTS sector TEXT;
 CREATE TABLE IF NOT EXISTS prices (
     symbol TEXT NOT NULL,
     date DATE NOT NULL,
@@ -60,7 +62,7 @@ CREATE TABLE IF NOT EXISTS predictions (
     PRIMARY KEY (strategy, signal_date, symbol)
 );
 CREATE OR REPLACE VIEW latest_universe AS
-    SELECT symbol, name, market_cap, as_of
+    SELECT symbol, name, market_cap, as_of, sector
     FROM universe
     WHERE as_of = (SELECT max(as_of) FROM universe);
 """
@@ -75,11 +77,20 @@ def connect(db_path: Path | str = DEFAULT_DB_PATH) -> duckdb.DuckDBPyConnection:
 
 
 def upsert_universe(con: duckdb.DuckDBPyConnection, df: pd.DataFrame, as_of: dt.date) -> int:
-    """Store a universe snapshot (columns: symbol, name, market_cap) for a date."""
+    """Store a universe snapshot (columns: symbol, name, market_cap[, sector]) for a date.
+
+    Frames without a sector column (pre-sector callers) store an empty string.
+    """
     snapshot = df[["symbol", "name", "market_cap"]].copy()
+    snapshot["sector"] = df["sector"].fillna("") if "sector" in df.columns else ""
     snapshot["as_of"] = as_of
     con.register("universe_in", snapshot)
-    con.execute("INSERT OR REPLACE INTO universe SELECT * FROM universe_in")
+    con.execute(
+        """
+        INSERT OR REPLACE INTO universe (symbol, name, market_cap, sector, as_of)
+        SELECT symbol, name, market_cap, sector, as_of FROM universe_in
+        """
+    )
     con.unregister("universe_in")
     return len(snapshot)
 

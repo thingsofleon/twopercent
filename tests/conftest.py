@@ -97,6 +97,9 @@ def seed_planted(con, n_each: int = 30, universe_symbols: list[str] | None = Non
                 "symbol": symbols,
                 "name": symbols,
                 "market_cap": [1e9 * (i + 1) for i in range(len(symbols))],
+                # One shared sector: runners and flats mix, so sector features
+                # vary per row (an all-NaN column crashes HistGBM's binner).
+                "sector": ["Tech"] * len(symbols),
             }
         ),
         as_of=pd.Timestamp("2026-06-01").date(),

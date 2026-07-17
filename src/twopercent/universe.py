@@ -90,12 +90,17 @@ def _parse_market_cap(raw: str | float | None) -> float:
 def build_universe(rows: list[dict], top_n: int = TOP_N) -> pd.DataFrame:
     """Rank screener rows by market cap and keep the top N common stocks.
 
-    Returns columns: symbol, name, market_cap.
+    Returns columns: symbol, name, market_cap, sector. A missing sector never
+    drops a row — it becomes an empty string (sector features treat it as NaN).
     """
     df = pd.DataFrame(rows)
     df["symbol"] = df["symbol"].astype(str).str.strip()
     df["name"] = df["name"].astype(str).str.strip()
     df["market_cap"] = df["marketCap"].map(_parse_market_cap)
+    if "sector" in df.columns:
+        df["sector"] = df["sector"].fillna("").astype(str).str.strip()
+    else:
+        df["sector"] = ""
 
     bad_cap = df["market_cap"] <= 0
     if bad_cap.any():
@@ -108,9 +113,16 @@ def build_universe(rows: list[dict], top_n: int = TOP_N) -> pd.DataFrame:
 
     df = df.sort_values("market_cap", ascending=False)
     df = df.drop_duplicates(subset="symbol", keep="first")
-    out = df[["symbol", "name", "market_cap"]].head(top_n).reset_index(drop=True)
+    out = df[["symbol", "name", "market_cap", "sector"]].head(top_n).reset_index(drop=True)
     if len(out) < top_n:
         logger.warning("universe smaller than requested: %d < %d symbols", len(out), top_n)
+    no_sector = out["sector"] == ""
+    if no_sector.any():
+        logger.warning(
+            "%d of %d universe rows have no sector (their sector features will be NaN)",
+            int(no_sector.sum()),
+            len(out),
+        )
     return out
 
 

@@ -28,6 +28,84 @@ def test_build_universe_respects_top_n(screener_rows):
     assert df["symbol"].tolist() == ["NVDA", "AAPL"]
 
 
+def test_build_universe_keeps_sector_and_tolerates_missing():
+    rows = [
+        {
+            "symbol": "NVDA",
+            "name": "NVIDIA Corporation Common Stock",
+            "marketCap": "4,974,496,340,000",
+            "sector": "Technology",
+        },
+        {
+            "symbol": "XOM",
+            "name": "Exxon Mobil Corporation Common Stock",
+            "marketCap": "500,000,000,000",
+            "sector": " Energy ",  # screener whitespace stripped
+        },
+        {
+            "symbol": "NOSEC",
+            "name": "No Sector Inc Common Stock",
+            "marketCap": "400,000,000,000",
+            # no sector key at all — must NOT drop the row
+        },
+        {
+            "symbol": "NULLSEC",
+            "name": "Null Sector Inc Common Stock",
+            "marketCap": "300,000,000,000",
+            "sector": None,
+        },
+    ]
+    df = build_universe(rows, top_n=10).set_index("symbol")
+    assert df.loc["NVDA", "sector"] == "Technology"
+    assert df.loc["XOM", "sector"] == "Energy"
+    assert df.loc["NOSEC", "sector"] == ""  # kept, empty sector
+    assert df.loc["NULLSEC", "sector"] == ""
+
+
+def test_build_universe_without_any_sector_field(screener_rows):
+    # Pre-sector payloads (no sector key anywhere) still build, with empty sectors.
+    df = build_universe(screener_rows, top_n=10)
+    assert "sector" in df.columns
+    assert (df["sector"] == "").all()
+
+
+def test_build_universe_warns_on_missing_sectors(caplog):
+    rows = [
+        {
+            "symbol": "NVDA",
+            "name": "NVIDIA Corporation Common Stock",
+            "marketCap": "4,974,496,340,000",
+            "sector": "Technology",
+        },
+        {
+            "symbol": "NOSEC",
+            "name": "No Sector Inc Common Stock",
+            "marketCap": "400,000,000,000",
+        },
+        {
+            "symbol": "NULLSEC",
+            "name": "Null Sector Inc Common Stock",
+            "marketCap": "300,000,000,000",
+            "sector": None,
+        },
+    ]
+    build_universe(rows, top_n=10)
+    assert "2 of 3 universe rows have no sector" in caplog.text
+
+
+def test_build_universe_full_sector_coverage_stays_quiet(caplog):
+    rows = [
+        {
+            "symbol": "NVDA",
+            "name": "NVIDIA Corporation Common Stock",
+            "marketCap": "4,974,496,340,000",
+            "sector": "Technology",
+        },
+    ]
+    build_universe(rows, top_n=1)
+    assert "have no sector" not in caplog.text
+
+
 def test_exclude_patterns_are_word_bounded():
     rows = [
         {"symbol": "PFBC", "name": "Preferred Bank Common Stock", "marketCap": "2,000,000,000"},

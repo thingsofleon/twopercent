@@ -37,7 +37,9 @@ supervised autonomy → AI-native).
 - **sklearn's HistGradientBoosting binner crashes on single-valued feature
   columns** ("window shape cannot be larger than input array shape"). Synthetic
   test/experiment data must vary every feature column (see tests/conftest.py
-  seed_history vary_volume). Real market data never triggers this.
+  seed_history vary_volume). Real market data never triggers this. An all-NaN
+  feature column crashes the same way — seeded test universes need non-empty
+  sectors or the sector features are all NaN (Batch 1b).
 - **Generated HTML/visual output must be looked at, not just grepped.** The
   dashboard's missing charset (mojibake in every dash) passed all
   string-assertion tests and was caught only by rendering a screenshot.

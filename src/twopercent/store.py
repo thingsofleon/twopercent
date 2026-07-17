@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS prices (
     volume BIGINT,
     PRIMARY KEY (symbol, date)
 );
+CREATE TABLE IF NOT EXISTS ingest_meta (
+    symbol TEXT NOT NULL PRIMARY KEY,
+    from_date DATE NOT NULL
+);
 """
 
 
@@ -62,6 +66,22 @@ def latest_universe(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
     ).df()
 
 
+def all_universe_symbols(con: duckdb.DuckDBPyConnection) -> list[str]:
+    """Union of symbols across ALL universe snapshots, largest cap first.
+
+    Ingest keys off this rather than the latest snapshot so a symbol that
+    churns out around the rank-3000 boundary keeps its price history current.
+    """
+    rows = con.execute(
+        """
+        SELECT symbol FROM universe
+        GROUP BY symbol
+        ORDER BY max(market_cap) DESC
+        """
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
 def upsert_prices(con: duckdb.DuckDBPyConnection, df: pd.DataFrame) -> int:
     """Idempotently upsert price rows.
 
@@ -84,6 +104,30 @@ def last_price_dates(con: duckdb.DuckDBPyConnection) -> dict[str, dt.date]:
     """Map each stored symbol to its most recent price date (for resume logic)."""
     rows = con.execute("SELECT symbol, max(date) FROM prices GROUP BY symbol").fetchall()
     return dict(rows)
+
+
+def ingest_from_dates(con: duckdb.DuckDBPyConnection) -> dict[str, dt.date]:
+    """Map each symbol to the earliest window start it was ever ingested from."""
+    rows = con.execute("SELECT symbol, from_date FROM ingest_meta").fetchall()
+    return dict(rows)
+
+
+def record_ingest_from(
+    con: duckdb.DuckDBPyConnection, symbols: list[str], from_date: dt.date
+) -> None:
+    """Record that `symbols` now have coverage from `from_date` (keeps the earliest)."""
+    if not symbols:
+        return
+    df = pd.DataFrame({"symbol": symbols, "from_date": from_date})
+    con.register("meta_in", df)
+    con.execute(
+        """
+        INSERT INTO ingest_meta SELECT symbol, from_date FROM meta_in
+        ON CONFLICT (symbol)
+        DO UPDATE SET from_date = least(ingest_meta.from_date, excluded.from_date)
+        """
+    )
+    con.unregister("meta_in")
 
 
 def price_row_count(con: duckdb.DuckDBPyConnection) -> int:

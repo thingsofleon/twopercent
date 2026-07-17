@@ -47,3 +47,28 @@ def test_universe_snapshot_roundtrip(con):
     latest = store.latest_universe(con)
     assert latest["as_of"].iloc[0].date() == dt.date(2026, 7, 18)
     assert latest["market_cap"].iloc[0] == 6e12
+
+
+def test_all_universe_symbols_unions_snapshots(con):
+    df1 = pd.DataFrame(
+        {"symbol": ["AAPL", "EDGE"], "name": ["Apple", "Edge Co"], "market_cap": [4e12, 1e9]}
+    )
+    store.upsert_universe(con, df1, as_of=dt.date(2026, 7, 16))
+    # EDGE churns out of the next snapshot but must remain ingestable.
+    df2 = pd.DataFrame(
+        {"symbol": ["AAPL", "NVDA"], "name": ["Apple", "NVIDIA"], "market_cap": [4e12, 5e12]}
+    )
+    store.upsert_universe(con, df2, as_of=dt.date(2026, 7, 17))
+
+    symbols = store.all_universe_symbols(con)
+    assert set(symbols) == {"AAPL", "NVDA", "EDGE"}
+    assert symbols[0] == "NVDA"  # largest cap first
+
+
+def test_record_ingest_from_keeps_earliest(con):
+    store.record_ingest_from(con, ["AAPL"], dt.date(2024, 1, 1))
+    store.record_ingest_from(con, ["AAPL"], dt.date(2025, 1, 1))  # later; must not regress
+    assert store.ingest_from_dates(con)["AAPL"] == dt.date(2024, 1, 1)
+
+    store.record_ingest_from(con, ["AAPL"], dt.date(2020, 1, 1))  # earlier; must win
+    assert store.ingest_from_dates(con)["AAPL"] == dt.date(2020, 1, 1)

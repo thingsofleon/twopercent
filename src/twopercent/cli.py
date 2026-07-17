@@ -53,11 +53,12 @@ def ingest_cmd(
     if symbols:
         symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     else:
-        uni = store.latest_universe(con)
-        if uni.empty:
+        # Union across all snapshots, so symbols churning around the rank-3000
+        # boundary keep their histories current.
+        symbol_list = store.all_universe_symbols(con)
+        if not symbol_list:
             typer.echo("No universe stored — run `twopercent universe --refresh` first.")
             raise typer.Exit(1)
-        symbol_list = uni["symbol"].tolist()
 
     result = ingest_mod.ingest(con, symbol_list, years=years, batch_size=batch_size)
     typer.echo(

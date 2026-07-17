@@ -1,52 +1,79 @@
-"""Ticker universe: top N US common stocks by market cap (Russell 3000 proxy).
+"""Ticker universe: top N US-listed common stocks by market cap (Russell 3000 proxy).
 
 Source is the NASDAQ stock screener API, which lists all US-listed stocks with
-market caps and needs no API key. Known limitation (see ROADMAP.md): applying
-today's constituents to historical data introduces survivorship bias.
+market caps and needs no API key. Known limitations (see ROADMAP.md):
+survivorship bias (today's constituents applied to history), and unlike the
+real Russell 3000, foreign-domiciled US-listed ordinaries are included — a
+deliberate widening, since they trade here and can do 2% days.
 """
 
 from __future__ import annotations
 
+import logging
+import time
+
 import pandas as pd
 import requests
+
+logger = logging.getLogger(__name__)
 
 SCREENER_URL = "https://api.nasdaq.com/api/screener/stocks"
 EXCHANGES = ("NASDAQ", "NYSE", "AMEX")
 TOP_N = 3000
+_RETRY_SLEEP_SECONDS = 2.0
 
 _HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept": "application/json",
 }
 
-# Name fragments that indicate non-common-stock listings to exclude.
-_EXCLUDE_NAME_FRAGMENTS = (
-    " etf",
-    " fund",
-    " trust units",
-    "warrant",
-    " right",
-    " unit ",
-    "preferred",
-    "depositary",
-    "notes due",
+# Listing types that aren't common stock. Word-bounded so company names like
+# "Preferred Bank", "Wright Medical", or "MidCap Funding" survive.
+_EXCLUDE_NAME_PATTERNS = (
+    r"\betfs?\b",
+    r"\bfunds?\b",
+    r"\bwarrants?\b",
+    r"\brights?\b",
+    r"\bunits?(?:,| each\b| consisting\b|$)",
+    r"\bpreferred (?:stock|shares?)\b",
+    r"\bdepositary\b",
+    r"\bnotes? due\b",
+    r"%",
 )
+_EXCLUDE_PATTERN = "|".join(_EXCLUDE_NAME_PATTERNS)
 
 
 def fetch_screener_rows(
-    exchange: str, session: requests.Session | None = None, timeout: int = 30
+    exchange: str,
+    session: requests.Session | None = None,
+    timeout: int = 30,
+    retries: int = 3,
 ) -> list[dict]:
-    """All screener rows for one exchange."""
+    """All screener rows for one exchange.
+
+    The API sometimes answers HTTP 200 with `{"data": null}` when throttling,
+    so an empty payload is retried and then raised as a clear error.
+    """
     ses = session or requests.Session()
-    resp = ses.get(
-        SCREENER_URL,
-        params={"exchange": exchange, "limit": 25000, "download": "true"},
-        headers=_HEADERS,
-        timeout=timeout,
+    last_status = None
+    for attempt in range(retries):
+        resp = ses.get(
+            SCREENER_URL,
+            params={"exchange": exchange, "limit": 25000, "download": "true"},
+            headers=_HEADERS,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        rows = (payload.get("data") or {}).get("rows")
+        if rows:
+            return rows
+        last_status = payload.get("status")
+        if attempt < retries - 1:
+            time.sleep(_RETRY_SLEEP_SECONDS * (attempt + 1))
+    raise RuntimeError(
+        f"NASDAQ screener returned no rows for {exchange} (throttled?); status: {last_status}"
     )
-    resp.raise_for_status()
-    payload = resp.json()
-    return payload["data"]["rows"]
 
 
 def _parse_market_cap(raw: str | float | None) -> float:
@@ -70,16 +97,21 @@ def build_universe(rows: list[dict], top_n: int = TOP_N) -> pd.DataFrame:
     df["name"] = df["name"].astype(str).str.strip()
     df["market_cap"] = df["marketCap"].map(_parse_market_cap)
 
-    df = df[df["market_cap"] > 0]
+    bad_cap = df["market_cap"] <= 0
+    if bad_cap.any():
+        logger.warning(
+            "%d screener rows dropped for missing/invalid market cap", int(bad_cap.sum())
+        )
+    df = df[~bad_cap]
     df = df[~df["symbol"].str.contains(r"[\^~]", regex=True)]
-    lowered = df["name"].str.lower()
-    for fragment in _EXCLUDE_NAME_FRAGMENTS:
-        df = df[~lowered.str.contains(fragment, regex=False)]
-        lowered = df["name"].str.lower()
+    df = df[~df["name"].str.lower().str.contains(_EXCLUDE_PATTERN, regex=True)]
 
     df = df.sort_values("market_cap", ascending=False)
     df = df.drop_duplicates(subset="symbol", keep="first")
-    return df[["symbol", "name", "market_cap"]].head(top_n).reset_index(drop=True)
+    out = df[["symbol", "name", "market_cap"]].head(top_n).reset_index(drop=True)
+    if len(out) < top_n:
+        logger.warning("universe smaller than requested: %d < %d symbols", len(out), top_n)
+    return out
 
 
 def refresh_universe(top_n: int = TOP_N, session: requests.Session | None = None) -> pd.DataFrame:

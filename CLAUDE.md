@@ -34,6 +34,10 @@ supervised autonomy → AI-native).
   exactly-2% boundary passed at open=100.0 but failed at open=5.00 (FP
   rounding); a round-number boundary test can be a false all-clear. Threshold
   comparisons on derived floats need an epsilon.
+- **sklearn's HistGradientBoosting binner crashes on single-valued feature
+  columns** ("window shape cannot be larger than input array shape"). Synthetic
+  test/experiment data must vary every feature column (see tests/conftest.py
+  seed_history vary_volume). Real market data never triggers this.
 - **Network code test pattern:** offline unit tests against canned payloads
   (fixtures in tests/conftest.py) plus `@pytest.mark.live` smoke tests; CI
   runs offline only. Follow it; don't invent a new pattern per module.

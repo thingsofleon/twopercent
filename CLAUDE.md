@@ -40,6 +40,15 @@ supervised autonomy → AI-native).
   seed_history vary_volume). Real market data never triggers this. An all-NaN
   feature column crashes the same way — seeded test universes need non-empty
   sectors or the sector features are all NaN (Batch 1b).
+- **Diagnostics must read raw tables, never filtered views.** The doctor's
+  first draft read daily_returns — whose WHERE clause hides exactly the
+  corrupt bars a doctor exists to find, while making broken symbols look
+  fresh. A view's filter is invisible data loss to anything built on it.
+- **Green CI proves the code, not the system.** The sector-features batch
+  passed every test and review, then crashed live on a migrated-but-
+  unrefreshed store (all-NaN columns). Failures can live in operational
+  state no diff contains — run the real pipeline after merging anything
+  that changes schema or features (level 3 automates this as a routine).
 - **Generated HTML/visual output must be looked at, not just grepped.** The
   dashboard's missing charset (mojibake in every dash) passed all
   string-assertion tests and was caught only by rendering a screenshot.

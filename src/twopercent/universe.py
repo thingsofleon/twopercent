@@ -116,6 +116,13 @@ def build_universe(rows: list[dict], top_n: int = TOP_N) -> pd.DataFrame:
     out = df[["symbol", "name", "market_cap", "sector"]].head(top_n).reset_index(drop=True)
     if len(out) < top_n:
         logger.warning("universe smaller than requested: %d < %d symbols", len(out), top_n)
+    no_sector = out["sector"] == ""
+    if no_sector.any():
+        logger.warning(
+            "%d of %d universe rows have no sector (their sector features will be NaN)",
+            int(no_sector.sum()),
+            len(out),
+        )
     return out
 
 

@@ -69,6 +69,43 @@ def test_build_universe_without_any_sector_field(screener_rows):
     assert (df["sector"] == "").all()
 
 
+def test_build_universe_warns_on_missing_sectors(caplog):
+    rows = [
+        {
+            "symbol": "NVDA",
+            "name": "NVIDIA Corporation Common Stock",
+            "marketCap": "4,974,496,340,000",
+            "sector": "Technology",
+        },
+        {
+            "symbol": "NOSEC",
+            "name": "No Sector Inc Common Stock",
+            "marketCap": "400,000,000,000",
+        },
+        {
+            "symbol": "NULLSEC",
+            "name": "Null Sector Inc Common Stock",
+            "marketCap": "300,000,000,000",
+            "sector": None,
+        },
+    ]
+    build_universe(rows, top_n=10)
+    assert "2 of 3 universe rows have no sector" in caplog.text
+
+
+def test_build_universe_full_sector_coverage_stays_quiet(caplog):
+    rows = [
+        {
+            "symbol": "NVDA",
+            "name": "NVIDIA Corporation Common Stock",
+            "marketCap": "4,974,496,340,000",
+            "sector": "Technology",
+        },
+    ]
+    build_universe(rows, top_n=1)
+    assert "have no sector" not in caplog.text
+
+
 def test_exclude_patterns_are_word_bounded():
     rows = [
         {"symbol": "PFBC", "name": "Preferred Bank Common Stock", "marketCap": "2,000,000,000"},

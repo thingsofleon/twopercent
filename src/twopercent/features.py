@@ -6,6 +6,13 @@ close and used to predict the NEXT trading day. The label `did_2pct_next` is
 the next trading day's +2% outcome (explicitly a LEAD; everything else must
 never look forward). Predictions for "tomorrow" are the rows at the latest
 signal_date, which have no label yet.
+
+Caveat to the claim above: price-derived features honor it strictly, but
+sector labels, sector-aggregate membership, and log_mcap come from the LATEST
+universe snapshot applied to all of history. That is survivorship in feature
+values (today's sector/cap assignments were not knowable on past signal
+dates), and historical values of those features change when the universe
+refreshes — reproduce a logged experiment only against the same snapshot.
 """
 
 from __future__ import annotations
@@ -114,12 +121,6 @@ def feature_frame(
     """
     threshold = DEFAULT_THRESHOLD - _THRESHOLD_EPSILON
     df = con.execute(_SQL, [threshold, threshold, threshold, start, end]).df()
-    if not df.empty and df["sector_breadth"].isna().all():
-        logger.warning(
-            "no sector data in the latest universe snapshot: sector_breadth/sector_excess "
-            "are all NaN (refresh the universe to populate sectors; all-NaN columns crash "
-            "sklearn's HistGradientBoosting binner)"
-        )
     thin = df["history_days"] < MIN_HISTORY_DAYS
     if thin.any():
         logger.warning(
@@ -127,4 +128,19 @@ def feature_frame(
             int(thin.sum()),
             MIN_HISTORY_DAYS,
         )
-    return df[~thin].drop(columns="history_days").reset_index(drop=True)
+    out = df[~thin].drop(columns="history_days").reset_index(drop=True)
+    nan_sector = out["sector_breadth"].isna()
+    if not out.empty and nan_sector.all():
+        logger.warning(
+            "no sector data in the latest universe snapshot: sector_breadth/sector_excess "
+            "are all NaN (refresh the universe to populate sectors; all-NaN columns crash "
+            "sklearn's HistGradientBoosting binner)"
+        )
+    elif nan_sector.any():
+        logger.warning(
+            "%d feature rows across %d symbols have NaN sector features "
+            "(blank sector or symbol missing from the latest universe snapshot)",
+            int(nan_sector.sum()),
+            out.loc[nan_sector, "symbol"].nunique(),
+        )
+    return out

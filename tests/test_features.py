@@ -113,6 +113,26 @@ def test_sector_math_hand_checked(con):
     assert abs(first.loc["AAA", "sector_excess"]) < 1e-12
 
 
+def test_partial_sector_coverage_blank_sector_warns_with_counts(con, caplog):
+    # 25 seeded days − 19 thin-history days = 6 feature rows per symbol.
+    seed_history(con, {"AAA": _varied(25, 5), "BBB": _varied(25, 6), "CCC": _varied(25, 7)})
+    _seed_universe(con, {"AAA": "Tech", "BBB": "Tech", "CCC": ""})
+    frame = feature_frame(con)
+    assert frame.loc[frame["symbol"] == "AAA", "sector_breadth"].notna().all()  # covered stay
+    nan_rows = frame[frame["sector_breadth"].isna()]
+    assert set(nan_rows["symbol"]) == {"CCC"} and len(nan_rows) == 6
+    assert "6 feature rows across 1 symbols have NaN sector features" in caplog.text
+
+
+def test_partial_sector_coverage_missing_symbols_warn_with_counts(con, caplog):
+    seed_history(con, {"AAA": _varied(25, 5), "BBB": _varied(25, 6), "CCC": _varied(25, 7)})
+    _seed_universe(con, {"AAA": "Tech"})  # BBB and CCC absent from the universe
+    frame = feature_frame(con)
+    nan_rows = frame[frame["sector_breadth"].isna()]
+    assert set(nan_rows["symbol"]) == {"BBB", "CCC"}
+    assert "12 feature rows across 2 symbols have NaN sector features" in caplog.text
+
+
 def test_sector_features_nan_when_no_universe(con, caplog):
     # Prices without any universe snapshot: sector features are NaN, rows kept,
     # and the total absence of sector data is warned about loudly.

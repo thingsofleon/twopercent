@@ -38,6 +38,11 @@ supervised autonomy → AI-native).
   columns** ("window shape cannot be larger than input array shape"). Synthetic
   test/experiment data must vary every feature column (see tests/conftest.py
   seed_history vary_volume). Real market data never triggers this.
+- **Generated HTML/visual output must be looked at, not just grepped.** The
+  dashboard's missing charset (mojibake in every dash) passed all
+  string-assertion tests and was caught only by rendering a screenshot.
+  Verify visual output by rendering it (Playwright) before shipping; always
+  declare `<meta charset="utf-8">` in generated HTML.
 - **Network code test pattern:** offline unit tests against canned payloads
   (fixtures in tests/conftest.py) plus `@pytest.mark.live` smoke tests; CI
   runs offline only. Follow it; don't invent a new pattern per module.

@@ -49,6 +49,62 @@ def test_universe_snapshot_roundtrip(con):
     assert latest["market_cap"].iloc[0] == 6e12
 
 
+def test_universe_sector_roundtrip(con):
+    df = pd.DataFrame(
+        {
+            "symbol": ["NVDA", "XOM", "MYST"],
+            "name": ["NVIDIA", "Exxon", "Mystery Co"],
+            "market_cap": [5e12, 5e11, 1e9],
+            "sector": ["Technology", "Energy", ""],
+        }
+    )
+    store.upsert_universe(con, df, as_of=dt.date(2026, 7, 17))
+    latest = store.latest_universe(con).set_index("symbol")
+    assert latest.loc["NVDA", "sector"] == "Technology"
+    assert latest.loc["XOM", "sector"] == "Energy"
+    assert latest.loc["MYST", "sector"] == ""
+
+
+def test_upsert_universe_without_sector_column(con):
+    # Pre-sector callers pass frames without the column; sector defaults to "".
+    df = pd.DataFrame({"symbol": ["AAPL"], "name": ["Apple"], "market_cap": [4e12]})
+    assert store.upsert_universe(con, df, as_of=dt.date(2026, 7, 17)) == 1
+    latest = store.latest_universe(con)
+    assert latest["sector"].tolist() == [""]
+
+
+def test_connect_migrates_pre_sector_database(tmp_path):
+    # Simulate a database created before the sector column existed.
+    import duckdb
+
+    path = tmp_path / "old.duckdb"
+    old = duckdb.connect(str(path))
+    old.execute(
+        """
+        CREATE TABLE universe (
+            symbol TEXT NOT NULL,
+            name TEXT NOT NULL,
+            market_cap DOUBLE NOT NULL,
+            as_of DATE NOT NULL,
+            PRIMARY KEY (symbol, as_of)
+        );
+        INSERT INTO universe VALUES ('AAPL', 'Apple', 4e12, DATE '2026-07-16');
+        """
+    )
+    old.close()
+
+    con = store.connect(path)  # must add the sector column on connect
+    latest = store.latest_universe(con)
+    assert latest["symbol"].tolist() == ["AAPL"]
+    assert latest["sector"].isna().all()  # migrated rows have NULL sector
+
+    df = pd.DataFrame(
+        {"symbol": ["NVDA"], "name": ["NVIDIA"], "market_cap": [5e12], "sector": ["Technology"]}
+    )
+    store.upsert_universe(con, df, as_of=dt.date(2026, 7, 17))
+    assert store.latest_universe(con)["sector"].tolist() == ["Technology"]
+
+
 def test_all_universe_symbols_unions_snapshots(con):
     df1 = pd.DataFrame(
         {"symbol": ["AAPL", "EDGE"], "name": ["Apple", "Edge Co"], "market_cap": [4e12, 1e9]}

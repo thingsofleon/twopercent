@@ -32,6 +32,8 @@ FEATURE_COLUMNS = [
     "breadth",
     "market_heat",
     "log_mcap",
+    "sector_breadth",
+    "sector_excess",
 ]
 
 _SQL = """
@@ -58,6 +60,17 @@ market AS (
         avg(CASE WHEN oc_return >= ? THEN 1.0 ELSE 0.0 END) AS market_heat
     FROM daily_returns
     GROUP BY date
+),
+sector_day AS (
+    SELECT
+        d.date,
+        u.sector,
+        avg(CASE WHEN d.oc_return > 0 THEN 1.0 ELSE 0.0 END) AS sector_breadth,
+        avg(d.oc_return) AS sector_mean_oc
+    FROM daily_returns d
+    JOIN latest_universe u USING (symbol)
+    WHERE u.sector IS NOT NULL AND u.sector <> ''
+    GROUP BY d.date, u.sector
 )
 SELECT
     s.symbol,
@@ -77,10 +90,13 @@ SELECT
     m.breadth,
     m.market_heat,
     ln(u.market_cap) AS log_mcap,
+    sd.sector_breadth,
+    s.oc_return - sd.sector_mean_oc AS sector_excess,
     s.history_days
 FROM per_symbol s
 JOIN market m ON s.date = m.date
 LEFT JOIN latest_universe u USING (symbol)
+LEFT JOIN sector_day sd ON sd.date = s.date AND sd.sector = u.sector
 WHERE s.date >= ? AND s.date <= ?
 ORDER BY s.date, s.symbol
 """
@@ -98,6 +114,12 @@ def feature_frame(
     """
     threshold = DEFAULT_THRESHOLD - _THRESHOLD_EPSILON
     df = con.execute(_SQL, [threshold, threshold, threshold, start, end]).df()
+    if not df.empty and df["sector_breadth"].isna().all():
+        logger.warning(
+            "no sector data in the latest universe snapshot: sector_breadth/sector_excess "
+            "are all NaN (refresh the universe to populate sectors; all-NaN columns crash "
+            "sklearn's HistGradientBoosting binner)"
+        )
     thin = df["history_days"] < MIN_HISTORY_DAYS
     if thin.any():
         logger.warning(

@@ -26,6 +26,14 @@ supervised autonomy → AI-native).
   the happy path. (Session 1's review found four of these on "all-green" code.)
 - **Lint cold before pushing:** `uv run ruff check --no-cache .` — a stale
   ruff cache passed locally and failed in CI after a package-structure change.
+- **DuckDB uses total ordering in comparisons: `NaN > 0` is TRUE and NaN sorts
+  above every number.** Any SQL filtering or ranking float columns must guard
+  with `isfinite()` — a NaN row otherwise tops every ORDER BY DESC. (Session 2:
+  a NaN open would have ranked first in every scan.)
+- **Test numeric boundaries at adversarial values, not round ones.** The
+  exactly-2% boundary passed at open=100.0 but failed at open=5.00 (FP
+  rounding); a round-number boundary test can be a false all-clear. Threshold
+  comparisons on derived floats need an epsilon.
 - **Network code test pattern:** offline unit tests against canned payloads
   (fixtures in tests/conftest.py) plus `@pytest.mark.live` smoke tests; CI
   runs offline only. Follow it; don't invent a new pattern per module.

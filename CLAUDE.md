@@ -13,3 +13,31 @@ supervised autonomy → AI-native).
   relevant section and the status checklist in the same piece of work.
 - All model evaluation must be walk-forward — no lookahead. The 2% target is
   open-to-close: `(close − open) / open ≥ 2%`.
+- Push to GitHub (`origin main`) after committing — the remote is the source
+  of truth, and local-only commits defeat cloud/scheduled agents at levels 3–4.
+
+## Working loop
+
+Every substantive piece of work follows design → code → test → review →
+document → reflect:
+
+1. **Design** — state the approach before writing code (plan mode for sessions,
+   a short written plan for agents). Anything that changes scope or a locked-in
+   decision goes to ROADMAP.md first.
+2. **Code** — small vertical slices that run end-to-end; match existing style.
+3. **Test** — tests land in the same change as the code, never after. `pytest`
+   and `ruff` must pass before work is presented for review. Model-related
+   changes additionally prove no lookahead (walk-forward).
+4. **Review** — run `/code-review` on the diff before merge. Run
+   `/security-review` for changes touching ingestion, network calls,
+   credentials, subprocess use, or the dashboard. Hold agent-written and
+   human-written code to the same bar.
+5. **Document** — update README/CLAUDE.md only when commands, layout, or
+   invariants change. No narration comments; code should carry itself.
+6. **Reflect** — after each session or merged batch: tick the ROADMAP.md status
+   checklist, and if anything went wrong or required un-encoded knowledge, add
+   the missing context here or as a skill — that is the fix, not "review
+   harder next time."
+
+Keep this rule set minimal: add a rule only when a real failure shows the need,
+and delete rules that stop paying for themselves.

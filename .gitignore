@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Data — never commit market data caches or model artifacts
+data/
+*.duckdb
+*.duckdb.wal
+*.parquet
+models/*.pkl
+models/*.joblib
+
+# Local config / secrets
+.env
+.claude/settings.local.json
+
+# OS / editor
+.DS_Store

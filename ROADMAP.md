@@ -43,6 +43,13 @@ verification loop (tests + lint) that level 2 depends on.
 - **Session 3 — features + first model.** Features (prior-day return, volume
   ratio, volatility, gap, sector move, days-to-earnings), gradient-boosting
   classifier, walk-forward validation, ranked daily probability list.
+  **Architecture constraint (added 2026-07-17):** built for automated
+  experimentation by future research agents — strategies (features + model +
+  params) are registered plugins behind a small fit/predict interface; a
+  neutral benchmark harness scores every strategy on identical walk-forward
+  splits and metrics; results land in an experiments table; the active model
+  is a one-line champion config, promoted by benchmark-beats-champion via PR
+  and re-verified in CI. Agents add strategies; they never edit the referee.
 - **Session 4 — dashboard v1.** Today's/tomorrow's top candidates with
   probabilities and top signals; history of predictions vs. actuals.
 

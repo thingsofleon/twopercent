@@ -33,6 +33,10 @@ CREATE TABLE IF NOT EXISTS ingest_meta (
     symbol TEXT NOT NULL PRIMARY KEY,
     from_date DATE NOT NULL
 );
+CREATE VIEW IF NOT EXISTS daily_returns AS
+    SELECT symbol, date, open, close, volume, (close - open) / open AS oc_return
+    FROM prices
+    WHERE open > 0;
 """
 
 

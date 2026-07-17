@@ -167,7 +167,11 @@ def build_html(
         )
     else:
         overall_p = record.scored["hits"].sum() / record.scored["n_scored"].sum()
-        overall_b = record.scored["base_rate"].mean()
+        # Weight base rates like precision is pooled, or the headline lift is
+        # inconsistent when day sizes / base rates differ.
+        overall_b = (record.scored["base_rate"] * record.scored["n_scored"]).sum() / record.scored[
+            "n_scored"
+        ].sum()
         trs = "".join(
             f"<tr><td>{pd.Timestamp(r.target_date).date()}</td>"
             f"<td>{int(r.hits)}/{int(r.n_scored)}</td><td>{r.precision:.0%}</td>"

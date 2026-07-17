@@ -20,3 +20,4 @@ models/*.joblib
 
 # OS / editor
 .DS_Store
+dashboard.html

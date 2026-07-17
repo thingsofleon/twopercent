@@ -20,6 +20,9 @@ def modeled(con):
                 "symbol": list(data),
                 "name": [f"{s} <Corp> & Sons" for s in data],  # needs HTML escaping
                 "market_cap": [1e9 * (i + 1) for i in range(len(data))],
+                # Runners and flats share a sector so sector_excess varies per row;
+                # an all-NaN sector column would crash the binner (see CLAUDE.md).
+                "sector": ["Tech"] * len(data),
             }
         ),
         as_of=pd.Timestamp("2026-03-01").date(),

@@ -72,6 +72,41 @@ def seed_history(
     return df
 
 
+# Slight deterministic variation keeps every feature column multi-valued
+# (sklearn's binner rejects constant columns).
+RUNNER_OC = [0.03 + 0.001 * (i % 5) for i in range(100)]  # +3.0–3.4% every day
+FLAT_OC = [0.002 + 0.001 * (i % 3) for i in range(100)]  # +0.2–0.4%, never 2%
+
+
+def seed_planted(con, n_each: int = 30, universe_symbols: list[str] | None = None) -> list[str]:
+    """Planted-signal history: RUN* symbols do +2% every day, FLT* never do.
+
+    universe_symbols restricts which symbols get a universe row (default all);
+    omitted symbols flow NULL log_mcap through the features LEFT JOIN.
+    """
+    data = {}
+    for i in range(n_each):
+        data[f"RUN{i:02d}"] = RUNNER_OC
+        data[f"FLT{i:02d}"] = FLAT_OC
+    seed_history(con, data, vary_volume=True)
+    symbols = list(data) if universe_symbols is None else universe_symbols
+    store.upsert_universe(
+        con,
+        pd.DataFrame(
+            {
+                "symbol": symbols,
+                "name": symbols,
+                "market_cap": [1e9 * (i + 1) for i in range(len(symbols))],
+                # One shared sector: runners and flats mix, so sector features
+                # vary per row (an all-NaN column crashes HistGBM's binner).
+                "sector": ["Tech"] * len(symbols),
+            }
+        ),
+        as_of=pd.Timestamp("2026-06-01").date(),
+    )
+    return list(data)
+
+
 def make_yf_frame(symbols: list[str], days: int = 5, start_price: float = 100.0) -> pd.DataFrame:
     """Synthetic yf.download output: MultiIndex (ticker, field) columns."""
     dates = pd.bdate_range("2026-01-05", periods=days)

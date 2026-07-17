@@ -10,6 +10,7 @@ import duckdb
 import pandas as pd
 import typer
 
+from twopercent import doctor as doctor_mod
 from twopercent import ingest as ingest_mod
 from twopercent import scan as scan_mod
 from twopercent import store, universe
@@ -114,6 +115,60 @@ def benchmark_cmd(
         typer.echo(f"  {key:>15}: {value}")
 
 
+LIFT_NOISE_BAND = 0.1
+_NOISE_BAND_EPSILON = 1e-9  # FP: 2.05 - 1.95 == 0.0999...987, yet is a true 0.1 gap
+
+
+def _compare_verdict(strat_a: str, lift_a: float | None, strat_b: str, lift_b: float | None) -> str:
+    """One-line verdict on lift; refuses to crown a winner inside the noise band."""
+    if lift_a is None or lift_b is None:
+        return "Winner on lift: undecided (lift unavailable for at least one strategy)"
+    if lift_a == lift_b:
+        return f"Winner on lift: tie at {lift_a}"
+    if abs(lift_a - lift_b) < LIFT_NOISE_BAND - _NOISE_BAND_EPSILON:
+        return (
+            "Winner on lift: within noise — no meaningful difference "
+            "(same-window comparison; repeated trials against the same months "
+            "inflate the best result)"
+        )
+    winner = strat_a if lift_a > lift_b else strat_b
+    return f"Winner on lift: {winner} ({max(lift_a, lift_b)} vs {min(lift_a, lift_b)})"
+
+
+@app.command("compare")
+def compare_cmd(
+    strat_a: str = typer.Argument(..., help="First strategy name."),
+    strat_b: str = typer.Argument(..., help="Second strategy name."),
+    months: int = typer.Option(12, help="Test months (walk-forward, monthly retrain)."),
+    top: int = typer.Option(20, help="Daily top-N for precision@N."),
+    db: Path = DbOption,
+) -> None:
+    """Benchmark two strategies on identical folds and compare their metrics."""
+    from twopercent import backtest, strategies
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    for name in (strat_a, strat_b):
+        if name not in strategies.names():
+            typer.echo(f"Unknown strategy {name!r}. Available: {', '.join(strategies.names())}")
+            raise typer.Exit(2)
+    con = store.connect(db)
+    results = {
+        name: backtest.run_benchmark(con, name, months=months, top_n=top)
+        for name in (strat_a, strat_b)
+    }
+
+    width = max(len(strat_a), len(strat_b), 10)
+    typer.echo(f"Compare over last {months} months (top-{top} daily, identical folds):")
+    typer.echo(f"  {'metric':>15}  {strat_a:>{width}}  {strat_b:>{width}}")
+    for key in results[strat_a]:
+        a, b = results[strat_a][key], results[strat_b][key]
+        typer.echo(f"  {key:>15}  {a!s:>{width}}  {b!s:>{width}}")
+
+    typer.echo(
+        _compare_verdict(strat_a, results[strat_a]["lift"], strat_b, results[strat_b]["lift"])
+    )
+
+
 @app.command("predict")
 def predict_cmd(
     strategy: str = typer.Option(None, help="Strategy name (default: champion)."),
@@ -188,6 +243,36 @@ def experiments_cmd(
         raise typer.Exit(0)
     for row in df.itertuples():
         typer.echo(f"#{row.id} {row.run_ts:%Y-%m-%d %H:%M} {row.strategy} {row.metrics}")
+
+
+@app.command("doctor")
+def doctor_cmd(
+    stale_days: int = typer.Option(
+        doctor_mod.DEFAULT_STALE_DAYS,
+        help="Flag symbols whose last bar is more than this many trading days "
+        "behind the store max.",
+    ),
+    examples: int = typer.Option(10, help="Worst examples to print per check."),
+    db: Path = DbOption,
+) -> None:
+    """Data-quality checks over the price store; exit 1 if any check finds problems."""
+    try:
+        con = store.connect(db)
+    except duckdb.IOException:
+        typer.echo(f"Database {db} is locked by another process (ingest running?). Try again.")
+        raise typer.Exit(1) from None
+    if scan_mod.latest_price_date(con) is None:
+        typer.echo("Store has no price data — run `twopercent ingest` first.")
+        raise typer.Exit(1)
+
+    report = doctor_mod.run(con, stale_days=stale_days)
+    typer.echo(f"Doctor report for {db}")
+    for line in doctor_mod.format_report(report, examples=examples):
+        typer.echo(line)
+    if not report.ok:
+        typer.echo(f"doctor: {report.problem_count} problems found — store needs attention")
+        raise typer.Exit(1)
+    typer.echo("doctor: all checks passed")
 
 
 @app.command("ingest")

@@ -2,37 +2,9 @@ import json
 
 import pandas as pd
 
-from tests.conftest import seed_history
+from tests.conftest import seed_planted
 from twopercent import backtest, store
 from twopercent.strategies.base import _REGISTRY, register
-
-# Slight deterministic variation keeps every feature column multi-valued
-# (sklearn's binner rejects constant columns).
-RUNNER_OC = [0.03 + 0.001 * (i % 5) for i in range(100)]  # +3.0–3.4% every day
-FLAT_OC = [0.002 + 0.001 * (i % 3) for i in range(100)]  # +0.2–0.4%, never 2%
-
-
-def _seed_planted(con, n_each: int = 30):
-    data = {}
-    for i in range(n_each):
-        data[f"RUN{i:02d}"] = RUNNER_OC
-        data[f"FLT{i:02d}"] = FLAT_OC
-    seed_history(con, data, vary_volume=True)
-    store.upsert_universe(
-        con,
-        pd.DataFrame(
-            {
-                "symbol": list(data),
-                "name": list(data),
-                "market_cap": [1e9 * (i + 1) for i in range(len(data))],
-                # Runners and flats share a sector so sector_excess varies per row;
-                # an all-NaN sector column would crash the binner (see CLAUDE.md).
-                "sector": ["Tech"] * len(data),
-            }
-        ),
-        as_of=pd.Timestamp("2026-06-01").date(),
-    )
-
 
 if "split_spy" not in _REGISTRY:
 
@@ -53,7 +25,7 @@ if "split_spy" not in _REGISTRY:
 
 def test_walk_forward_never_trains_on_test_dates(con, monkeypatch):
     monkeypatch.setattr(backtest, "MIN_TRAIN_ROWS", 500)
-    _seed_planted(con)
+    seed_planted(con)
     _REGISTRY["split_spy"].observed.clear()
     backtest.run_benchmark(con, "split_spy", months=2, top_n=5, record=False)
     assert _REGISTRY["split_spy"].observed  # folds actually ran
@@ -63,7 +35,7 @@ def test_walk_forward_never_trains_on_test_dates(con, monkeypatch):
 
 def test_planted_signal_is_detected_and_recorded(con, monkeypatch):
     monkeypatch.setattr(backtest, "MIN_TRAIN_ROWS", 500)
-    _seed_planted(con)
+    seed_planted(con)
     metrics = backtest.run_benchmark(con, "baseline_gbm_v1", months=2, top_n=5)
 
     # Runners are perfectly identified by oc_return_today: near-perfect ranking.

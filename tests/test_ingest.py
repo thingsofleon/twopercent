@@ -2,8 +2,8 @@ import datetime as dt
 
 import pandas as pd
 import pytest
-from tests.conftest import make_yf_frame
 
+from tests.conftest import make_yf_frame
 from twopercent import ingest, store
 
 

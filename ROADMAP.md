@@ -18,7 +18,7 @@ Every trading day, many tickers move 2%+. The system:
 
 | Decision | Choice | Notes |
 |---|---|---|
-| Universe | Russell 3000 (broad US market) | Biggest signal surface; heaviest ingestion load |
+| Universe | Top 3000 US stocks by market cap (Russell 3000 proxy), via NASDAQ screener API | Changed in Session 1: iShares IWV holdings CSV no longer plainly downloadable; screener is free, keyless, self-updating. **Known limitation: survivorship bias** — today's constituents applied to history omit delisted/faded names. Accepted for v1; quant-skeptic's first target at level 2 |
 | Data source | yfinance (free) | Daily OHLCV, batched + cached locally; no true real-time/pre-market. Revisit paid API (e.g. Polygon) if used daily |
 | "Did 2%" definition | Open-to-close: `(close − open) / open ≥ 2%` | Regular-hours move only; gaps excluded; +2% direction only |
 | Signals/prediction | ML model from the start | Gradient boosting on engineered features; **walk-forward validation only** — no lookahead |

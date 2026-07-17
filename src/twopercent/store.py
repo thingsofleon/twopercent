@@ -33,10 +33,14 @@ CREATE TABLE IF NOT EXISTS ingest_meta (
     symbol TEXT NOT NULL PRIMARY KEY,
     from_date DATE NOT NULL
 );
-CREATE VIEW IF NOT EXISTS daily_returns AS
+CREATE OR REPLACE VIEW daily_returns AS
     SELECT symbol, date, open, close, volume, (close - open) / open AS oc_return
     FROM prices
-    WHERE open > 0;
+    WHERE open > 0 AND isfinite(open) AND isfinite(close);
+CREATE OR REPLACE VIEW latest_universe AS
+    SELECT symbol, name, market_cap, as_of
+    FROM universe
+    WHERE as_of = (SELECT max(as_of) FROM universe);
 """
 
 
@@ -60,14 +64,7 @@ def upsert_universe(con: duckdb.DuckDBPyConnection, df: pd.DataFrame, as_of: dt.
 
 def latest_universe(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
     """The most recent universe snapshot, ranked by market cap descending."""
-    return con.execute(
-        """
-        SELECT symbol, name, market_cap, as_of
-        FROM universe
-        WHERE as_of = (SELECT max(as_of) FROM universe)
-        ORDER BY market_cap DESC
-        """
-    ).df()
+    return con.execute("SELECT * FROM latest_universe ORDER BY market_cap DESC").df()
 
 
 def all_universe_symbols(con: duckdb.DuckDBPyConnection) -> list[str]:

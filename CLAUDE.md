@@ -16,6 +16,19 @@ supervised autonomy → AI-native).
 - Push to GitHub (`origin main`) after committing — the remote is the source
   of truth, and local-only commits defeat cloud/scheduled agents at levels 3–4.
 
+## GitHub workflow
+
+- Work is tracked as **GitHub issues** grouped into **milestones** (one per
+  adoption level). Start work by picking up an issue; file new issues for new
+  work instead of keeping private todo lists.
+- Code changes land via **pull request** from a feature branch, referencing
+  the issue (`Closes #N`). Direct pushes to `main` are for docs/config only,
+  and stop entirely once branch protection is on (#6).
+- A PR merges only when CI is green and `/code-review` has run. Same bar for
+  human- and agent-written code.
+- At level 2+, parallel agents each work in their **own git worktree** on
+  their own branch — one agent, one branch, one PR.
+
 ## Working loop
 
 Every substantive piece of work follows design → code → test → review →

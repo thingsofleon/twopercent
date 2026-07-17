@@ -98,10 +98,12 @@ At solo scale: scheduled autonomy, not thousand-agent fleets.
 
 ## Status
 
-- [ ] Level 1, Session 1 — skeleton + ingestion
-- [ ] Level 1, Session 2 — 2% scanner
-- [ ] Level 1, Session 3 — features + model
-- [ ] Level 1, Session 4 — dashboard v1
-- [ ] Level 2 — trust infra + first parallel batch
-- [ ] Level 3 — routines, loops, workflows
-- [ ] Level 4 — scheduled autonomy, closed loop
+Live tracking is on GitHub: **milestones** (one per level) and **issues**
+(#1–#10) at github.com/thingsofleon/twopercent. This file stays the source of
+truth for *decisions and plan shape*; GitHub is the source of truth for
+*work state*.
+
+- Level 1 — Assisted: sessions #1–#4, CI #5
+- Level 2 — Parallel: branch protection #6, agent team #7, parallel batch #8
+- Level 3 — Supervised autonomy: routines and loops #9
+- Level 4 — AI-native: scheduled cloud agents + closed loop #10

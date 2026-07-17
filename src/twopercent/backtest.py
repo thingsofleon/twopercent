@@ -48,6 +48,7 @@ def run_benchmark(
     all_probs: list[pd.Series] = []
     all_labels: list[pd.Series] = []
     daily_hits: list[float] = []
+    folds_run = 0
 
     for month_start, month_end in folds:
         train = labeled[labeled["target_date"] < month_start]
@@ -59,6 +60,7 @@ def run_benchmark(
                 "fold %s skipped: %d train / %d test rows", month_start, len(train), len(test)
             )
             continue
+        folds_run += 1
         strategy = strategies.get(strategy_name)
         strategy.fit(train)
         probs = strategy.predict_proba(test)
@@ -85,7 +87,7 @@ def run_benchmark(
         "brier": round(float(brier_score_loss(labels, probs)), 5),
         "test_rows": int(len(labels)),
         "test_days": len(daily_hits),
-        "folds": len(folds),
+        "folds": folds_run,
     }
     if record:
         store.record_experiment(

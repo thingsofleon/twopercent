@@ -15,5 +15,10 @@ CHAMPION_FILE = Path("champion.json")
 
 def get_champion(path: Path = CHAMPION_FILE) -> str:
     if path.exists():
-        return json.loads(path.read_text())["champion"]
+        try:
+            return json.loads(path.read_text())["champion"]
+        except (json.JSONDecodeError, KeyError) as exc:
+            raise ValueError(
+                f'{path} is malformed (expected {{"champion": "name"}}): {exc}'
+            ) from exc
     return DEFAULT_CHAMPION

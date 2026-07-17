@@ -132,6 +132,9 @@ def predict_cmd(
         raise typer.Exit(1)
 
     labeled = frame[frame["did_2pct_next"].notna()]
+    if labeled.empty:
+        typer.echo("No labeled history to train on — ingest more than one day of data.")
+        raise typer.Exit(1)
     signal_date = frame["signal_date"].max()
     latest = frame[frame["signal_date"] == signal_date]
 

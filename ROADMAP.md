@@ -111,6 +111,10 @@ truth for *decisions and plan shape*; GitHub is the source of truth for
 *work state*.
 
 - Level 1 — Assisted: **COMPLETE 2026-07-17** (sessions #1–#4, CI #5; milestone closed)
-- Level 2 — Parallel: branch protection #6, agent team #7, parallel batch #8
+- Level 2 — Parallel: **COMPLETE 2026-07-17** (branch protection #6, agent
+  team #7, parallel batch #8 → PRs #21/#22/#23; 11 review findings fixed;
+  follow-ups filed: #24 point-in-time sectors, #25 split-artifact labels,
+  #26 GBM all-NaN guard). Live results: doctor found 1,399 real data
+  problems; GBM vs logreg within noise (lift 2.05 vs 2.06), champion holds.
 - Level 3 — Supervised autonomy: routines and loops #9
 - Level 4 — AI-native: scheduled cloud agents + closed loop #10

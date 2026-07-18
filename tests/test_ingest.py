@@ -308,3 +308,34 @@ def test_ingest_dormant_still_backfills_without_coverage(con, download_calls):
 
     assert result.symbols_dormant == []
     assert [c[0] for c in download_calls] == [["DEAD"]]
+
+
+def test_refetch_empty_with_stored_bar_is_retained_not_failed(con, monkeypatch, caplog):
+    # Provider returns nothing for a 1-bar refetch window (rate-limit bursts
+    # read as "possibly delisted") — but we already hold the bar at the
+    # requested start, so the symbol is current, not failed.
+    today = dt.date.today()
+    _seed_price(con, "AAPL", today)
+    store.record_ingest_from(con, ["AAPL"], dt.date(2000, 1, 1))
+
+    def empty_download(tickers, **kwargs):
+        raise RuntimeError("batch download failed after 3 attempts: empty response")
+
+    monkeypatch.setattr(ingest, "_download_batch", empty_download)
+    monkeypatch.setattr(ingest, "RETRY_BACKOFF_SECONDS", 0.0)
+    result = ingest.ingest(con, ["AAPL"], years=1)
+
+    assert result.symbols_skipped == ["AAPL"]  # stored bar retained
+    assert result.symbols_failed == []
+
+
+def test_refetch_empty_without_stored_bar_still_fails(con, monkeypatch):
+    def empty_download(tickers, **kwargs):
+        raise RuntimeError("batch download failed after 3 attempts: empty response")
+
+    monkeypatch.setattr(ingest, "_download_batch", empty_download)
+    monkeypatch.setattr(ingest, "RETRY_BACKOFF_SECONDS", 0.0)
+    result = ingest.ingest(con, ["NVDA"], years=1)  # nothing stored for NVDA
+
+    assert result.symbols_failed == ["NVDA"]
+    assert result.symbols_skipped == []

@@ -15,21 +15,29 @@ OC = {
 }
 
 
-def _save(con, ranked, strategy="s"):
+def _save(con, ranked, strategy="s", live=False):
     store.save_predictions(
         con,
         strategy,
         DAYS[-2],
         pd.DataFrame({"symbol": ranked, "prob": [0.9, 0.5, 0.2], "rank": [1, 2, 3]}),
     )
+    if live:
+        # Stamp creation before the target day's open (06:00 local < 09:30 ET)
+        # so the day counts as a live forecast, not a backfill.
+        con.execute(
+            "UPDATE predictions SET created_ts = ? WHERE strategy = ?",
+            [dt.datetime.combine(DAYS[-1], dt.time(6, 0)), strategy],
+        )
 
 
 def test_pick_performance_math_and_costed_growth(con):
     seed_history(con, OC)
-    _save(con, ["WIN", "LOSE", "ALSO"])
+    _save(con, ["WIN", "LOSE", "ALSO"], live=True)
 
     picks = track.daily_pick_performance(con, "s", top_n=3)
     assert picks.days == 1
+    assert picks.late_days == 0
     row = picks.daily.iloc[0]
     assert row["top1_symbol"] == "WIN"
     assert abs(row["top1_return"] - 0.04) < 1e-12
@@ -47,7 +55,7 @@ def test_pick_performance_top1_is_best_available(con):
     # Rank 1's target bar missing (delisted before target) → the tradeable
     # top pick is rank 2, not a phantom.
     seed_history(con, OC)
-    _save(con, ["GONE", "WIN", "LOSE"])  # GONE has no price rows at all
+    _save(con, ["GONE", "WIN", "LOSE"], live=True)  # GONE has no price rows at all
 
     picks = track.daily_pick_performance(con, "s", top_n=3)
     row = picks.daily.iloc[0]
@@ -76,6 +84,7 @@ def test_benchmark_reports_tail_metrics_and_sim(con, monkeypatch):
     high = (1 + 0.034 - track.COST_ROUND_TRIP) ** days
     assert low * 0.99 <= metrics["sim_top1_growth"] <= high * 1.01
     assert metrics["sim_top5_growth"] > 1.0
+    assert len(metrics["sim_top1_growth_by_fold"]) == metrics["folds"]
 
 
 def test_next_oc_return_is_label_side(con):
@@ -124,13 +133,13 @@ def test_dashboard_shows_pick_tiles_and_column(con_with_universe, tmp_path):
     from twopercent import dashboard
     from twopercent.predict import predict_for
 
-    _save(con_with_universe, ["WIN", "LOSE", "ALSO"], strategy="baseline_gbm_v1")
+    _save(con_with_universe, ["WIN", "LOSE", "ALSO"], strategy="baseline_gbm_v1", live=True)
     result = predict_for(con_with_universe, "baseline_gbm_v1", save=False)
     out = tmp_path / "d.html"
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(dashboard.build_html(con_with_universe, result, top=3))
     content = out.read_text()
-    assert "Top pick hit rate" in content
-    assert "$1 → top pick daily" in content
+    assert "Top pick hit rate (live)" in content
+    assert "$1 → top pick daily (live)" in content
     assert "Top pick</th>" in content
     assert "WIN" in content

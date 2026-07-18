@@ -54,8 +54,10 @@ def run_benchmark(
     floored_row_days = 0
     unscoreable_days = 0
     daily_picks: list[tuple[float, int, float, float]] = []
+    fold_top1_growth: list[float] = []
 
     for month_start, month_end in folds:
+        fold_pick_start = len(daily_picks)
         train = labeled[labeled["target_date"] < month_start]
         test = labeled[
             (labeled["target_date"] >= month_start) & (labeled["target_date"] <= month_end)
@@ -93,6 +95,10 @@ def run_benchmark(
                     float(top5["did_2pct_next"].mean()),
                 )
             )
+        fold_growth = 1.0
+        for ret, _, _, _ in daily_picks[fold_pick_start:]:
+            fold_growth *= 1 + ret - track.COST_ROUND_TRIP
+        fold_top1_growth.append(round(fold_growth, 4))
         logger.info("fold %s..%s: %d train, %d test", month_start, month_end, len(train), len(test))
 
     if not all_probs:
@@ -138,11 +144,17 @@ def run_benchmark(
         "precision_at_1": round(float(picks["top1_hit"].mean()), 4),
         "precision_at_5": round(float(picks["top5_hits"].mean()), 4),
         # Growth of $1 trading the daily pick(s) open-to-close over the whole
-        # test window, net of track.COST_ROUND_TRIP per day. An execution
-        # upper bound (assumed costs, perfect fills at open/close) — see
-        # track.py for the cost caveat.
+        # test window, net of track.COST_ROUND_TRIP per day. Caveats, all
+        # flattering: assumed costs and perfect fills at open/close; the
+        # candidate pool is today's universe applied to history and requires
+        # a next-day bar, so delisted names can never hand the sim their
+        # final catastrophic day (survivorship — see ROADMAP/#24/#31); and a
+        # compounded product is tail-dominated (one hot month can carry it —
+        # per-fold breakdown below). CHAMPION SELECTION MUST NOT KEY ON SIM
+        # GROWTH; lift/auc are the regime-independent numbers.
         "sim_top1_growth": round(sim_top1, 4),
         "sim_top5_growth": round(sim_top5, 4),
+        "sim_top1_growth_by_fold": fold_top1_growth,
         "test_rows": int(len(labels)),
         "test_days": len(daily_hits),
         "folds": folds_run,

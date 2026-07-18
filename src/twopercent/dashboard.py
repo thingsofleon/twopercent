@@ -190,19 +190,30 @@ def _tiles(
         f'<span class="cmp">market base {overall_b:.0%}</span></div>'
     )
     if picks.days:
+        # Live days only: backfilled days must never inflate the money tiles.
         p1 = picks.precision_at_1()
         g1 = picks.growth("top1_return")
         g5 = picks.growth("topn_return")
-        tiles += (
-            f'<div class="tile"><span class="label">Top pick hit rate</span>'
-            f"<b>{p1:.0%}</b>"
-            f'<span class="cmp">{int(picks.daily["top1_hit"].sum())}/{picks.days} days'
-            f" did +2%</span></div>"
-            f'<div class="tile"><span class="label">$1 → top pick daily</span>'
-            f'<b class="{"up" if g1 >= 1 else ""}">${g1:.3f}</b>'
-            f'<span class="cmp">top-5: ${g5:.3f} · net of '
-            f"{track.COST_ROUND_TRIP:.1%}/day assumed costs</span></div>"
-        )
+        late_note = f" · excludes {picks.late_days} backfilled" if picks.late_days else ""
+        if g1 is not None:
+            live = picks.live
+            tiles += (
+                f'<div class="tile"><span class="label">Top pick hit rate (live)</span>'
+                f"<b>{p1:.0%}</b>"
+                f'<span class="cmp">{int(live["top1_hit"].sum())}/{len(live)} days'
+                f" did +2%{late_note}</span></div>"
+                f'<div class="tile"><span class="label">$1 → top pick daily (live)</span>'
+                f'<b class="{"up" if g1 >= 1 else ""}">${g1:.3f}</b>'
+                f'<span class="cmp">top-5: ${g5:.3f} · net of '
+                f"{track.COST_ROUND_TRIP:.1%}/day assumed costs{late_note}</span></div>"
+            )
+        else:
+            tiles += (
+                f'<div class="tile"><span class="label">$1 → top pick daily (live)</span>'
+                f"<b>—</b>"
+                f'<span class="cmp">all {picks.late_days} scored days were backfilled — '
+                f"live record starts with the next scheduled run</span></div>"
+            )
     tiles += (
         f'<div class="tile"><span class="label">Candidates today</span>'
         f"<b>{n_candidates}</b>"
@@ -275,9 +286,10 @@ def build_html(
             if p is None:
                 return "<td>—</td>"
             cls = "pos" if p.top1_return >= 0 else "neg"
+            marker = " †" if p.late else ""
             return (
                 f'<td><span class="sym">{html.escape(p.top1_symbol)}</span> '
-                f'<span class="{cls}">{p.top1_return:+.1%}</span></td>'
+                f'<span class="{cls}">{p.top1_return:+.1%}</span>{marker}</td>'
             )
 
         trs = "".join(
@@ -293,7 +305,8 @@ def build_html(
         if record.late_days:
             late_note = (
                 f'<p class="sub"><b>{record.late_days} of {len(record.scored)} days '
-                "were backfilled after the fact</b> — not live forecasting skill.</p>"
+                "were backfilled after the fact</b> (marked †) — not live forecasting "
+                "skill, and excluded from the money tiles above.</p>"
             )
         body = late_note + (
             f"<div class='card'>{_chart_svg(record.scored)}</div>"

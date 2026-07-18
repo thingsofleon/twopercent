@@ -49,6 +49,7 @@ def run_benchmark(
     all_probs: list[pd.Series] = []
     all_labels: list[pd.Series] = []
     daily_hits: list[float] = []
+    fold_drops: dict[dt.date, frozenset[str]] = {}
     folds_run = 0
     floored_row_days = 0
     unscoreable_days = 0
@@ -66,6 +67,7 @@ def run_benchmark(
         folds_run += 1
         strategy = strategies.get(strategy_name)
         strategy.fit(train)
+        fold_drops[month_start] = frozenset(getattr(strategy, "dropped_columns", ()))
         probs = strategy.predict_proba(test)
         all_probs.append(probs)
         all_labels.append(test["did_2pct_next"])
@@ -97,6 +99,17 @@ def run_benchmark(
             unscoreable_days,
         )
 
+    dropped_columns = sorted(set().union(*fold_drops.values()))
+    if len(set(fold_drops.values())) > 1:
+        logger.warning(
+            "benchmark mixed structurally different fits — dropped feature columns "
+            "differ across folds: %s",
+            "; ".join(
+                f"{start}: {', '.join(sorted(cols)) or 'none'}"
+                for start, cols in sorted(fold_drops.items())
+            ),
+        )
+
     probs = pd.concat(all_probs)
     labels = pd.concat(all_labels).astype(int)
     base_rate = labels.mean()
@@ -116,7 +129,12 @@ def run_benchmark(
         store.record_experiment(
             con,
             strategy=strategy_name,
-            params={"months": months, "top_n": top_n, "selection": "liquidity_floor_100k"},
+            params={
+                "months": months,
+                "top_n": top_n,
+                "selection": "liquidity_floor_100k",
+                "dropped_columns": dropped_columns,
+            },
             train_start=labeled["target_date"].min(),
             test_start=folds[0][0],
             test_end=folds[-1][1],

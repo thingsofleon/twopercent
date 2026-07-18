@@ -67,3 +67,31 @@ def test_save_predictions_idempotent(con):
     _save(con, day, ["HIT1", "HIT2", "MISS"])
     count = con.execute("SELECT count(*) FROM predictions").fetchone()[0]
     assert count == 3
+
+
+def test_save_predictions_rerun_replaces_whole_slice(con):
+    # A re-run that scores FEWER symbols (liquidity floor kicked one out) must
+    # not leave the dropped symbol behind as a phantom rank from the first save.
+    day = dt.date(2026, 2, 5)
+
+    def ranked(symbols: list[str]) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "symbol": symbols,
+                "prob": [1 - i / 100 for i in range(len(symbols))],
+                "rank": range(1, len(symbols) + 1),
+            }
+        )
+
+    twenty = [f"S{i:02d}" for i in range(20)]
+    store.save_predictions(con, "s", day, ranked(twenty))
+    store.save_predictions(con, "s", day, ranked(twenty[1:]))  # S00 now excluded
+
+    rows = con.execute(
+        "SELECT symbol, rank FROM predictions WHERE strategy = 's' AND signal_date = ? "
+        "ORDER BY rank",
+        [day],
+    ).df()
+    assert len(rows) == 19
+    assert "S00" not in set(rows["symbol"])
+    assert rows["rank"].tolist() == list(range(1, 20))  # contiguous, no phantom rank 1

@@ -332,6 +332,70 @@ def test_repair_splits_deletes_exactly_the_artifact(with_artifact, caplog):
     assert store.price_row_count(with_artifact) == before - 1
 
 
+def test_repair_splits_cascades_to_fixpoint(con, caplog):
+    # Reviewer reproduction: deleting an artifact can newly expose its
+    # neighbor — the neighbor's prev close becomes the original-scale bar, so
+    # a single detect+delete pass leaves a fresh artifact behind.
+    dates = pd.bdate_range("2026-01-05", periods=3).date
+    store.upsert_prices(
+        con,
+        pd.DataFrame(
+            {
+                "symbol": "CASC",
+                "date": dates,
+                "open": [10.0, 100.0, 31.0],
+                "high": [10.0, 100.0, 50.0],
+                "low": [10.0, 30.0, 31.0],
+                "close": [10.0, 30.0, 50.0],
+                "adj_close": [10.0, 30.0, 50.0],
+                "volume": [1_000_000] * 3,
+            }
+        ),
+    )
+    seed_history(con, {"OKAY": [0.01] * 3})
+
+    # one detection pass only sees the first artifact...
+    single = doctor.split_artifacts(con)
+    assert [(r.symbol, r.date.date()) for r in single.itertuples()] == [("CASC", dates[1])]
+
+    # ...the repair loops to the fixpoint and catches the exposed neighbor too
+    removed = doctor.repair_splits(con)
+    assert [(r.symbol, r.date.date()) for r in removed.itertuples()] == [
+        ("CASC", dates[1]),
+        ("CASC", dates[2]),
+    ]
+    assert "2 split-artifact bars deleted" in caplog.text
+    assert "2 passes" in caplog.text
+    left = con.execute("SELECT date FROM prices WHERE symbol = 'CASC'").fetchall()
+    assert [r[0] for r in left] == [dates[0]]
+    assert doctor.repair_splits(con).empty  # fixpoint reached: re-run finds nothing
+
+
+def test_split_artifacts_fp_boundary_at_non_round_open(con):
+    # Exactly +50% at open 5.70 with a 10x scale break must NOT be flagged
+    # (strict >, epsilon-guarded); a hair over still is. Mirrors the pandas-side
+    # boundary test so both implementations agree at the boundary.
+    dates = pd.bdate_range("2026-01-05", periods=2).date
+
+    def two_bar(symbol: str, o2: float, c2: float) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "symbol": symbol,
+                "date": dates,
+                "open": [0.57, o2],
+                "high": [0.57, max(o2, c2)],
+                "low": [0.57, min(o2, c2)],
+                "close": [0.57, c2],
+                "adj_close": [0.57, c2],
+                "volume": [1_000_000] * 2,
+            }
+        )
+
+    store.upsert_prices(con, two_bar("EDGE", 5.70, 8.55))  # exactly +50%
+    store.upsert_prices(con, two_bar("OVER", 5.70, 8.56))  # +50.2%
+    assert doctor.split_artifacts(con)["symbol"].tolist() == ["OVER"]
+
+
 def test_cli_doctor_without_flag_is_read_only(with_artifact, tmp_path):
     before = store.price_row_count(with_artifact)
     with_artifact.close()

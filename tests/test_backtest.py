@@ -50,6 +50,26 @@ def test_planted_signal_is_detected_and_recorded(con, monkeypatch):
     assert json.loads(experiments["metrics"].iloc[0])["lift"] == metrics["lift"]
 
 
+def test_benchmark_top_n_applies_liquidity_floor_selection_only(con, monkeypatch, caplog):
+    monkeypatch.setattr(backtest, "MIN_TRAIN_ROWS", 500)
+    seed_planted(con)
+    # Every runner is below the floor: the top-N selection must be unable to
+    # pick them (precision collapses to the flats' zero hit rate) while the
+    # scoring and label populations still contain them (AUC and base_rate
+    # unchanged) — the benchmark now selects exactly like the shipped product.
+    con.execute("UPDATE prices SET volume = 50_000 WHERE symbol LIKE 'RUN%'")
+    with caplog.at_level("WARNING", logger="twopercent.backtest"):
+        metrics = backtest.run_benchmark(con, "logreg_v1", months=2, top_n=5)
+
+    assert metrics["auc"] > 0.9  # all-names scoring population still sees runners
+    assert 0.3 < metrics["base_rate"] < 0.7  # all-names label population too
+    assert metrics["precision_at_n"] == 0.0  # selection could only pick flats
+    assert "liquidity floor" in caplog.text
+
+    params = json.loads(store.list_experiments(con)["params"].iloc[0])
+    assert params["selection"] == "liquidity_floor_100k"
+
+
 def test_month_folds_shape():
     dates = pd.Series(pd.bdate_range("2026-01-05", periods=90).date)
     folds = backtest.month_folds(dates, months=2)

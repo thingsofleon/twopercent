@@ -14,34 +14,15 @@ from twopercent.features import feature_frame
 
 logger = logging.getLogger(__name__)
 
-# Liquidity floor, applied at PREDICTION time only (issue #25): symbols whose
-# median volume over the last LIQUIDITY_WINDOW_BARS bars ending at signal_date
-# is below LIQUIDITY_MIN_MEDIAN_VOLUME shares are too thin to trade and are
-# excluded from the ranking and the saved rows. Labels and training keep
+# Liquidity floor, applied at selection time only (issue #25): symbols whose
+# trailing median volume (the median_vol_20 metadata column from features.py,
+# 20 bars ending at signal_date) is below LIQUIDITY_MIN_MEDIAN_VOLUME shares
+# are too thin to trade and are excluded from the ranking and the saved rows.
+# The benchmark applies the same floor to its top-N selection (backtest.py)
+# so reported precision matches the shipped product. Labels and training keep
 # illiquid names — see predict_for's docstring for the asymmetry.
 LIQUIDITY_WINDOW_BARS = 20
 LIQUIDITY_MIN_MEDIAN_VOLUME = 100_000
-
-_MEDIAN_VOLUME_SQL = """
-WITH recent AS (
-    SELECT symbol, volume,
-           row_number() OVER (PARTITION BY symbol ORDER BY date DESC) AS rn
-    FROM prices
-    WHERE date <= ?
-)
-SELECT symbol, median(volume) AS median_volume
-FROM recent
-WHERE rn <= ?
-GROUP BY symbol
-"""
-
-
-def _median_volumes(con: duckdb.DuckDBPyConnection, signal_date: dt.date) -> dict[str, float]:
-    """Median volume per symbol over the last LIQUIDITY_WINDOW_BARS bars with
-    date <= signal_date. Trailing bars only — never reads past the signal date,
-    so backfilled predictions stay walk-forward honest."""
-    rows = con.execute(_MEDIAN_VOLUME_SQL, [signal_date, LIQUIDITY_WINDOW_BARS]).fetchall()
-    return dict(rows)
 
 
 @dataclass
@@ -65,15 +46,17 @@ def predict_for(
     target_date <= signal_date — what was knowable at that day's close —
     so backfilled predictions stay walk-forward honest.
 
-    Liquidity floor (prediction time ONLY): after scoring, symbols whose
-    median volume over the last LIQUIDITY_WINDOW_BARS bars ending at
-    signal_date is below LIQUIDITY_MIN_MEDIAN_VOLUME shares are excluded
-    from the ranking AND the saved rows — too thin to trade at any size.
-    This is deliberately asymmetric: labels and training keep illiquid
-    names (their moves are real observations that would otherwise bias the
-    base rate), so trained probabilities include names the ranking will
-    never surface. The window is strictly trailing (date <= signal_date) —
-    no lookahead.
+    Liquidity floor (selection time ONLY): after scoring, symbols whose
+    median_vol_20 (trailing median volume over the LIQUIDITY_WINDOW_BARS
+    bars ending at signal_date, computed in features.py) is below
+    LIQUIDITY_MIN_MEDIAN_VOLUME shares are excluded from the ranking AND
+    the saved rows — too thin to trade at any size. This is deliberately
+    asymmetric: labels and training keep illiquid names (their moves are
+    real observations that would otherwise bias the base rate), so trained
+    probabilities include names the ranking will never surface. The window
+    is strictly trailing — no lookahead — and the benchmark's top-N
+    selection applies the same floor (backtest.py), so reported precision
+    describes the list this function actually ships.
     """
     frame = feature_frame(con)
     if frame.empty:
@@ -95,8 +78,7 @@ def predict_for(
     strategy.fit(train)
     scored = rows.assign(prob=strategy.predict_proba(rows))
 
-    median_volume = scored["symbol"].map(_median_volumes(con, signal_date))
-    liquid = median_volume >= LIQUIDITY_MIN_MEDIAN_VOLUME  # NaN median -> excluded
+    liquid = scored["median_vol_20"] >= LIQUIDITY_MIN_MEDIAN_VOLUME  # NaN median -> excluded
     if (~liquid).any():
         logger.warning(
             "%d of %d symbols excluded from ranking and saved predictions: median "

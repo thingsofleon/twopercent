@@ -43,6 +43,12 @@ FEATURE_COLUMNS = [
     "sector_excess",
 ]
 
+# Metadata, NOT a feature: trailing median volume over the last 20 bars
+# through signal_date. Prediction and benchmark top-N selection apply the
+# liquidity floor to it (see predict.py); models must never train on it, so
+# it stays out of FEATURE_COLUMNS.
+METADATA_COLUMNS = ["median_vol_20"]
+
 _SQL = """
 WITH per_symbol AS (
     SELECT
@@ -51,6 +57,7 @@ WITH per_symbol AS (
         close / nullif(LAG(close, 5) OVER w, 0) - 1 AS ret_5d,
         stddev_samp(oc_return) OVER w20 AS vol_20d,
         volume / nullif(avg(volume) OVER w20, 0) AS volume_ratio,
+        median(volume) OVER w20 AS median_vol_20,
         CASE WHEN high > low THEN (close - low) / (high - low) END AS close_pos,
         sum(CASE WHEN oc_return >= ? THEN 1 ELSE 0 END) OVER w20 AS cnt_2pct_20d,
         LEAD(date) OVER w AS target_date,
@@ -99,6 +106,7 @@ SELECT
     ln(u.market_cap) AS log_mcap,
     sd.sector_breadth,
     s.oc_return - sd.sector_mean_oc AS sector_excess,
+    s.median_vol_20,
     s.history_days
 FROM per_symbol s
 JOIN market m ON s.date = m.date

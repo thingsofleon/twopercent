@@ -22,3 +22,4 @@ models/*.joblib
 .DS_Store
 dashboard.html
 .claude/worktrees/
+logs/

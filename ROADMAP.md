@@ -116,5 +116,17 @@ truth for *decisions and plan shape*; GitHub is the source of truth for
   follow-ups filed: #24 point-in-time sectors, #25 split-artifact labels,
   #26 GBM all-NaN guard). Live results: doctor found 1,399 real data
   problems; GBM vs logreg within noise (lift 2.05 vs 2.06), champion holds.
-- Level 3 — Supervised autonomy: routines and loops #9
+- Level 3 — Supervised autonomy: **COMPLETE 2026-07-17** (#9). Data fixes
+  first (#25 split artifacts + prediction liquidity floor, #26 champion
+  all-NaN guard — PRs #29/#30), then `twopercent routine` (#28): the daily
+  cycle as one gated command — market-hours guard, doctor baseline, tail
+  ingest, freshness + corruption gates, champion predict, dashboard,
+  exception-report summary (exit 0/1/2). Three live shakedown runs each
+  found a real failure mode tests couldn't (dead tickers as chronic
+  failures → dormant class #32/#33; provider rate-limit empties → retained
+  refetches #34); run three was clean: 13/20 hit on Jul 17 (65% vs 22%
+  base, 2.95× lift). Scheduled via systemd user timer, weekdays 06:00
+  Denver (08:00 ET, pre-open), Persistent=true. Caveats: WSL must be
+  running and lingering enabled for unattended fire; predictions/track
+  record now record universe snapshots and flag backfilled (late) days.
 - Level 4 — AI-native: scheduled cloud agents + closed loop #10

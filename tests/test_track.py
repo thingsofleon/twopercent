@@ -196,6 +196,25 @@ def test_daily_rank_outcomes_missing_rank_is_absent_not_phantom(con):
     assert frame["hit"].tolist() == [1, 0]
 
 
+def test_late_flag_any_late_wins_on_merged_target_days(con):
+    # Friday and Saturday signals both resolve to Monday (weekend gap). The
+    # Friday save was live; the Saturday one is a backfill. A day is live only
+    # if EVERY prediction for it beat the open — the merged day must be late,
+    # regardless of which signal date the lookup happens to see last.
+    _seed(con)
+    fri, sat, mon = dt.date(2026, 1, 9), dt.date(2026, 1, 10), dt.date(2026, 1, 12)
+    _save(con, fri, ["HIT1", "HIT2", "MISS"])
+    _save(con, sat, ["HIT2", "HIT1", "MISS"])
+    con.execute(
+        "UPDATE predictions SET created_ts = ? WHERE strategy = 'test_strat' AND signal_date = ?",
+        [dt.datetime.combine(mon, dt.time(6, 0)), fri],  # before Monday's 09:30 ET open
+    )
+    frame = track.daily_rank_outcomes(con, "test_strat")
+    merged = frame[[pd.Timestamp(d).date() == mon for d in frame["target_date"]]]
+    assert len(merged) == 6  # both signal dates' picks landed on Monday
+    assert merged["late"].all()  # half-backfilled day can never pass as live
+
+
 def test_daily_rank_outcomes_late_flag_on_backfill(con):
     dates = _seed(con)
     _save(con, dates[-2], ["HIT2", "HIT1", "MISS"])  # created now, target long past

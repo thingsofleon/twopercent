@@ -12,6 +12,7 @@ from __future__ import annotations
 import html
 import json
 import math
+from decimal import ROUND_HALF_UP, Decimal
 
 import duckdb
 import pandas as pd
@@ -239,12 +240,27 @@ _SIM_CAVEAT = (
     "round-trip cost and perfect open/close fills; picks require a next-day "
     "bar and today's universe is applied to history, so delisted names can "
     "never contribute their final catastrophic day — the dollar figures are "
-    "biased up. The live record above is the clean test."
+    "biased up. Browsing basket and window combinations is itself a form of "
+    "selection — a good-looking cell found by flipping views is partly luck, "
+    "and compounded growth over short windows is dominated by a handful of "
+    "days. The live record above is the clean test."
 )
 
 BASKET_CHOICES = [1, 5, 10, 15, 20]
 BASKET_DEFAULT = 5
 WINDOW_DEFAULT = 126  # "6 months" in track.SIM_WINDOW_SPECS
+
+
+def _embed_json(payload: dict) -> str:
+    """Serialize the payload into its inline script tag, breakout-proof.
+
+    json.dumps leaves "<" unescaped; today no field carries free-form text,
+    but the obvious future addition (symbols per pick) would let a literal
+    "</script>" end the tag early. \\u003c/\\u003e are valid JSON escapes that
+    JSON.parse restores, so escaping costs nothing. NaN must fail loudly."""
+    text = json.dumps(payload, separators=(",", ":"), allow_nan=False)
+    text = text.replace("<", "\\u003c").replace(">", "\\u003e")
+    return f'<script type="application/json" id="tp-data">{text}</script>'
 
 
 def _payload_days(frame: pd.DataFrame, bases: dict, ret_col: str, late: bool = False) -> list[dict]:
@@ -274,11 +290,16 @@ def _summarize_days(days: list[dict], n: int) -> dict:
     means, growth compounds net of COST_ROUND_TRIP. Non-finite days are
     counted as corrupt, never silently averaged around."""
     growth, hit_sum, base_sum = 1.0, 0.0, 0.0
-    base_known = short = corrupt = 0
+    base_known = short = subst = corrupt = 0
     for day in days:
         picks = day["picks"][:n]
         if len(picks) < n:
             short += 1
+        if any(p[0] != i + 1 for i, p in enumerate(picks)):
+            # The basket traded lower-ranked names in place of missing picks —
+            # the same event daily_pick_performance warns about (a missing
+            # rank may hide exactly the catastrophic day). Count and disclose.
+            subst += 1
         ret = sum(p[1] for p in picks) / len(picks)
         hit = sum(p[2] for p in picks) / len(picks)
         if not (math.isfinite(ret) and math.isfinite(hit)):
@@ -297,8 +318,27 @@ def _summarize_days(days: list[dict], n: int) -> dict:
         "base": base_sum / base_known if base_known else None,
         "days": len(days),
         "short": short,
+        "subst": subst,
+        "base_days": base_known,
+        "clean": clean,
         "corrupt": corrupt,
     }
+
+
+def _row_notes(prefix: str, s: dict, n: int) -> list[str]:
+    """Per-row disclosures — mirrors JS rowNotes(). Generic for SIM and LIVE:
+    sim ranks are contiguous by construction so substitution can only fire for
+    live frames today, but the check is not special-cased."""
+    notes: list[str] = []
+    if s["short"]:
+        notes.append(f"{prefix}: {s['short']} day(s) had fewer than {n} picks")
+    if s["subst"]:
+        notes.append(
+            f"{prefix}: {s['subst']} day(s) substituted lower-ranked names for missing picks"
+        )
+    if s["base_days"] and s["base_days"] < s["clean"]:
+        notes.append(f"{prefix}: base rate from {s['base_days']} of {s['clean']} day(s)")
+    return notes
 
 
 def _explorer_state(
@@ -309,7 +349,8 @@ def _explorer_state(
     Honesty rules enforced identically on both sides: a SIM window renders
     only when that many sim days exist; LIVE uses live-only days and says
     "all M live day(s)" when short of the window instead of pretending;
-    short-picks days and corrupt days are disclosed, never silent."""
+    short-picks days, within-basket substitutions, partial base-rate coverage,
+    and corrupt days are disclosed, never silent."""
     notes: list[str] = []
     sim_s = None
     if not sim_days:
@@ -322,8 +363,7 @@ def _explorer_state(
             notes.append(f"SIM: {s['corrupt']} corrupt day(s) in window — data error")
         else:
             sim_s = s
-            if s["short"]:
-                notes.append(f"SIM: {s['short']} day(s) had fewer than {n} picks")
+            notes.extend(_row_notes("SIM", s, n))
     live = [d for d in live_days if not d["late"]]
     live_s = None
     if not live:
@@ -336,9 +376,25 @@ def _explorer_state(
             live_s = s
             if len(live) < w:
                 notes.append(f"LIVE: all {len(live)} live day(s) — fewer than the {w}-day window")
-            if s["short"]:
-                notes.append(f"LIVE: {s['short']} day(s) had fewer than {n} picks")
+            notes.extend(_row_notes("LIVE", s, n))
     return sim_s, live_s, notes
+
+
+def _pct_half_up(x: float) -> str:
+    """Percent rounded half-UP, matching JS Math.round — Python's :.0% rounds
+    half-even (0.125 → "12%") and would visibly flicker to the JS "13%" on the
+    first select change."""
+    return f"{math.floor(100 * x + 0.5)}%"
+
+
+def _fixed_half_up(x: float, digits: int) -> str:
+    """Non-negative x to fixed decimals, exactly matching JS toFixed.
+
+    toFixed rounds the double's EXACT decimal value, ties away from zero —
+    Decimal(x) carries that exact value. Multiply-then-floor would inject its
+    own FP error and disagree on values like 1.0005 (×1000 rounds UP to
+    1000.5 in binary while the double itself sits below the half)."""
+    return str(Decimal(x).quantize(Decimal(1).scaleb(-digits), rounding=ROUND_HALF_UP))
 
 
 def _explorer_cells(prefix: str, s: dict | None) -> str:
@@ -348,12 +404,12 @@ def _explorer_cells(prefix: str, s: dict | None) -> str:
             for col in ("growth", "hit", "base", "lift", "days")
         )
     base = s["base"]
-    base_txt = f"{base:.0%}" if base is not None else "—"
-    lift_txt = f"{s['hit'] / base:.2f}×" if base else "—"
+    base_txt = _pct_half_up(base) if base is not None else "—"
+    lift_txt = f"{_fixed_half_up(s['hit'] / base, 2)}×" if base else "—"
     cls = "pos" if s["growth"] >= 1 else "neg"
     return (
-        f'<td id="tp-{prefix}-growth" class="{cls}">${s["growth"]:.3f}</td>'
-        f'<td id="tp-{prefix}-hit">{s["hit"]:.0%}</td>'
+        f'<td id="tp-{prefix}-growth" class="{cls}">${_fixed_half_up(s["growth"], 3)}</td>'
+        f'<td id="tp-{prefix}-hit">{_pct_half_up(s["hit"])}</td>'
         f'<td id="tp-{prefix}-base">{base_txt}</td>'
         f'<td id="tp-{prefix}-lift">{lift_txt}</td>'
         f'<td id="tp-{prefix}-days">{s["days"]}</td>'
@@ -423,12 +479,17 @@ _JS = """
   var data = JSON.parse(dataEl.textContent);
   var DASH = "\\u2014";
   function summarize(days, n, cost) {
-    var growth = 1, hitSum = 0, baseSum = 0, baseKnown = 0, shortDays = 0, corrupt = 0;
+    var growth = 1, hitSum = 0, baseSum = 0;
+    var baseKnown = 0, shortDays = 0, substDays = 0, corrupt = 0;
     for (var i = 0; i < days.length; i++) {
       var picks = days[i].picks.slice(0, n);
       if (picks.length < n) shortDays += 1;
-      var ret = 0, hit = 0;
-      for (var j = 0; j < picks.length; j++) { ret += picks[j][1]; hit += picks[j][2]; }
+      var ret = 0, hit = 0, sub = false;
+      for (var j = 0; j < picks.length; j++) {
+        ret += picks[j][1]; hit += picks[j][2];
+        if (picks[j][0] !== j + 1) sub = true;
+      }
+      if (sub) substDays += 1;
       ret /= picks.length; hit /= picks.length;
       if (!isFinite(ret) || !isFinite(hit)) { corrupt += 1; continue; }
       growth *= 1 + ret - cost;
@@ -439,7 +500,18 @@ _JS = """
     var clean = days.length - corrupt;
     return { growth: growth, hit: clean ? hitSum / clean : NaN,
              base: baseKnown ? baseSum / baseKnown : null,
-             days: days.length, shortDays: shortDays, corrupt: corrupt };
+             days: days.length, shortDays: shortDays, substDays: substDays,
+             baseDays: baseKnown, clean: clean, corrupt: corrupt };
+  }
+  function rowNotes(prefix, s, n) {
+    var notes = [];
+    if (s.shortDays) notes.push(prefix + ": " + s.shortDays +
+                                " day(s) had fewer than " + n + " picks");
+    if (s.substDays) notes.push(prefix + ": " + s.substDays +
+                                " day(s) substituted lower-ranked names for missing picks");
+    if (s.baseDays && s.baseDays < s.clean) notes.push(prefix + ": base rate from " +
+                                                       s.baseDays + " of " + s.clean + " day(s)");
+    return notes;
   }
   function setRow(prefix, s) {
     var g = el("tp-" + prefix + "-growth");
@@ -479,8 +551,7 @@ _JS = """
         notes.push("SIM: " + s.corrupt + " corrupt day(s) in window " + DASH + " data error");
       } else {
         setRow("sim", s);
-        if (s.shortDays) notes.push("SIM: " + s.shortDays +
-                                    " day(s) had fewer than " + n + " picks");
+        notes = notes.concat(rowNotes("SIM", s, n));
       }
     }
     var live = [];
@@ -495,8 +566,7 @@ _JS = """
         setRow("live", s2);
         if (live.length < w) notes.push("LIVE: all " + live.length + " live day(s) " + DASH +
                                         " fewer than the " + w + "-day window");
-        if (s2.shortDays) notes.push("LIVE: " + s2.shortDays +
-                                     " day(s) had fewer than " + n + " picks");
+        notes = notes.concat(rowNotes("LIVE", s2, n));
       }
     }
     el("tp-note").textContent = notes.join(" \\u00b7 ");
@@ -615,12 +685,7 @@ def build_html(
     sim_days = _payload_days(sim[1], bases, "ret") if sim is not None else []
     live_days = _payload_days(outcomes, bases, "oc_return", late=True) if len(outcomes) else []
     explorer = _record_explorer(sim[0] if sim is not None else None, sim_days, live_days)
-    payload = json.dumps(
-        {"cost": track.COST_ROUND_TRIP, "sim": sim_days, "live": live_days},
-        separators=(",", ":"),
-        allow_nan=False,  # a NaN reaching the payload must fail the render, loudly
-    )
-    data_tag = f'<script type="application/json" id="tp-data">{payload}</script>'
+    data_tag = _embed_json({"cost": track.COST_ROUND_TRIP, "sim": sim_days, "live": live_days})
 
     return (
         head

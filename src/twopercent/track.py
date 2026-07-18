@@ -89,6 +89,12 @@ class SimWindows:
 def sim_windows(daily: pd.DataFrame, n: int) -> SimWindows:
     """Growth of $1 and hit rates of the top-`n` basket over trailing windows.
 
+    CONTIGUOUS RANKS ONLY: baskets by `rank <= n`, which equals the
+    dashboard's first-n-available rule only when each day's ranks are
+    1..k with no gaps — true for experiment_daily rows by construction.
+    Never feed live-style frames (missing ranks) here; use the dashboard
+    summarizer, whose first-n rule IS the substitution semantics.
+
     `daily` is a per-rank experiment_daily frame (ordered by target_date,
     rank) with columns target_date, rank, ret, hit. Each day's basket return
     is the mean ret of ranks <= n present that day; days with fewer than n
@@ -160,12 +166,18 @@ def _late_lookup(con: duckdb.DuckDBPyConnection, strategy: str):
 
     A prediction is LIVE only if created before the target day's open
     (09:30 ET). Date-granularity comparison would count an evening-of-target
-    save — outcome fully known — as live. Unknown target dates are late."""
+    save — outcome fully known — as live. When multiple signal dates resolve
+    to ONE target date (missing intermediate bars), the day takes the max
+    created_ts across all of them: any-late means late, so a half-backfilled
+    day can never pass as live. Unknown target dates are late."""
     created = dict(
         con.execute(
-            "SELECT min(d.date), max(pr.created_ts) FROM predictions pr "
-            "JOIN (SELECT DISTINCT date FROM daily_returns) d ON d.date > pr.signal_date "
-            "WHERE pr.strategy = ? GROUP BY pr.signal_date",
+            "SELECT target_date, max(created_ts) FROM ("
+            "  SELECT min(d.date) AS target_date, max(pr.created_ts) AS created_ts"
+            "  FROM predictions pr"
+            "  JOIN (SELECT DISTINCT date FROM daily_returns) d ON d.date > pr.signal_date"
+            "  WHERE pr.strategy = ? GROUP BY pr.signal_date"
+            ") GROUP BY target_date",
             [strategy],
         ).fetchall()
     )

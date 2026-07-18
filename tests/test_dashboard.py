@@ -108,8 +108,9 @@ def test_dashboard_explorer_defaults_match_python_math(modeled, tmp_path):
     _, daily = store.latest_experiment_daily(modeled, "baseline_gbm_v1")
     summary = track.sim_windows(daily, n=5)
     w126 = next(w for w in summary.windows if w["days"] == 126)
-    assert f'id="tp-sim-growth" class="pos">${w126["growth"]:.3f}</td>' in content
-    assert f'<td id="tp-sim-hit">{w126["hit_rate"]:.0%}</td>' in content
+    growth_txt = dashboard._fixed_half_up(w126["growth"], 3)
+    assert f'id="tp-sim-growth" class="pos">${growth_txt}</td>' in content
+    assert f'<td id="tp-sim-hit">{dashboard._pct_half_up(w126["hit_rate"])}</td>' in content
     assert '<td id="tp-sim-days">126</td>' in content  # selection day count visible
 
     assert 'class="badge-sim">SIM</span>' in content
@@ -123,8 +124,10 @@ def test_dashboard_explorer_defaults_match_python_math(modeled, tmp_path):
     assert "SIM test span" in content and "months=12" in content
     assert "simulated <b" in content
     assert '<span class="mono">130</span> sim days available' in content
-    # Strengthened survivorship caveat, verbatim tail.
+    # Strengthened survivorship + multiple-comparisons caveats, verbatim tails.
     assert "delisted names can never contribute their final catastrophic day" in content
+    assert "itself a form of selection" in content
+    assert "dominated by a handful of days" in content
     assert "The live record above is the clean test." in content
     assert '<meta charset="utf-8">' in content
 
@@ -188,11 +191,85 @@ def test_summarize_days_first_available_substitution_and_short_days():
     assert abs(s1["growth"] - expected) < 1e-12
     assert s1["hit"] == 1.0
     assert s1["short"] == 0
+    assert s1["subst"] == 1  # ...but the substitution is counted, never silent
     assert abs(s1["base"] - 0.2) < 1e-12
 
     s2 = dashboard._summarize_days(days, 2)
     assert s2["short"] == 1  # day b has only one pick for a 2-basket
+    assert s2["subst"] == 1  # day a's 2-basket is ranks (2, 3), not (1, 2)
     assert abs(s2["hit"] - (0.5 + 1.0) / 2) < 1e-12
+
+
+def test_explorer_substitution_and_base_coverage_notes():
+    days = [
+        {"d": "a", "late": False, "base": 0.25, "picks": [[2, 0.0203, 1]]},  # rank 1 missing
+        {"d": "b", "late": False, "base": None, "picks": [[1, 0.011, 0]]},  # base unknown
+    ]
+    _, live_s, notes = dashboard._explorer_state([], days, 1, 5)
+    assert live_s is not None
+    assert "LIVE: 1 day(s) substituted lower-ranked names for missing picks" in notes
+    assert "LIVE: base rate from 1 of 2 day(s)" in notes
+    # A contiguous full-coverage frame emits neither disclosure.
+    clean_days = [
+        {"d": "a", "late": False, "base": 0.25, "picks": [[1, 0.0203, 1]]},
+        {"d": "b", "late": False, "base": 0.25, "picks": [[1, 0.011, 0]]},
+    ]
+    _, _, clean_notes = dashboard._explorer_state([], clean_days, 1, 5)
+    assert not any("substituted" in n or "base rate from" in n for n in clean_notes)
+
+
+def test_dashboard_renders_live_substitution_note(modeled, tmp_path):
+    import datetime as dt
+
+    dates = sorted(pd.bdate_range("2026-01-05", periods=60).date)
+    predict_for(modeled, "baseline_gbm_v1", signal_date=dates[-2], save=True)
+    # Stamp the save live (created before the target day's open)...
+    modeled.execute(
+        "UPDATE predictions SET created_ts = ?",
+        [dt.datetime.combine(dates[-1], dt.time(6, 0))],
+    )
+    # ...then remove the rank-2 pick's target-day bar: the top-5 basket
+    # becomes ranks 1,3,4,5,6 and the default view must disclose it.
+    rank2 = modeled.execute("SELECT symbol FROM predictions WHERE rank = 2").fetchone()[0]
+    modeled.execute("DELETE FROM prices WHERE symbol = ? AND date = ?", [rank2, dates[-1]])
+
+    out = tmp_path / "dash.html"
+    dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5)
+    content = out.read_text()
+    assert "LIVE: 1 day(s) substituted lower-ranked names for missing picks" in content
+
+
+def test_half_up_formatting_matches_js():
+    # 0.125 is an exact half: Python's :.0% gives "12%" (half-even) while JS
+    # Math.round gives 13 — the server must render the JS answer or the cell
+    # visibly flickers on the first select change.
+    assert f"{0.125:.0%}" == "12%"  # the trap this guards against
+    assert dashboard._pct_half_up(0.125) == "13%"
+    assert dashboard._fixed_half_up(0.125, 2) == "0.13"
+    assert f"{0.125:.2f}" == "0.12"  # ditto for lift-style fixed decimals
+    # Non-representable "halves" follow the stored double, exactly like toFixed
+    # (both verified against node): naive multiply-then-floor gets BOTH wrong.
+    assert dashboard._fixed_half_up(1.2345, 3) == "1.234"  # double sits below the half
+    assert dashboard._fixed_half_up(1.0005, 3) == "1.000"  # ditto, ×1000 FP rounds up
+    cells = dashboard._explorer_cells(
+        "sim",
+        {"growth": 1.5, "hit": 0.125, "base": 0.125, "days": 8, "short": 0, "corrupt": 0},
+    )
+    assert '<td id="tp-sim-hit">13%</td>' in cells
+    assert '<td id="tp-sim-base">13%</td>' in cells
+    assert '<td id="tp-sim-lift">1.00×</td>' in cells
+
+
+def test_embed_json_is_breakout_proof():
+    import json
+
+    prefix = '<script type="application/json" id="tp-data">'
+    tag = dashboard._embed_json({"cost": 0.003, "note": "</script><b>x</b>"})
+    assert tag.startswith(prefix) and tag.endswith("</script>")
+    inner = tag[len(prefix) : -len("</script>")]
+    assert "<" not in inner and ">" not in inner  # nothing can end the tag early
+    assert tag.count("</script>") == 1  # only the real closer
+    assert json.loads(inner) == {"cost": 0.003, "note": "</script><b>x</b>"}
 
 
 def test_summarize_days_counts_corrupt_never_averages_around():

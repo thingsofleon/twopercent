@@ -166,12 +166,19 @@ def run(
     try:
         result = ingest.ingest(con, symbols)
         accounted = (
-            len(result.symbols_ok) + len(result.symbols_skipped) + len(result.symbols_failed)
+            len(result.symbols_ok)
+            + len(result.symbols_skipped)
+            + len(result.symbols_failed)
+            + len(result.symbols_dormant)
         )
         n_failed = len(result.symbols_failed)
+        # Dormant (delisted/halted) names are excluded from the live pool —
+        # counting them as failures would trip this gate every day forever.
+        live_pool = max(1, len(symbols) - len(result.symbols_dormant))
         detail = (
             f"{result.rows_written} rows, {len(result.symbols_ok)} fetched, "
-            f"{len(result.symbols_skipped)} current, {n_failed} failed"
+            f"{len(result.symbols_skipped)} current, {n_failed} failed, "
+            f"{len(result.symbols_dormant)} dormant"
         )
         if accounted != len(symbols):
             report.add(
@@ -180,7 +187,7 @@ def run(
                 detail + f" — {len(symbols) - accounted} symbols unaccounted for (silent loss)",
             )
             return report
-        if n_failed / len(symbols) > INGEST_FAIL_FRACTION:
+        if n_failed / live_pool > INGEST_FAIL_FRACTION:
             report.add("ingest", FAIL, detail + " (failure rate over threshold)")
             return report
         report.add("ingest", WARN if n_failed else OK, detail)

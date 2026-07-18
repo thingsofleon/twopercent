@@ -244,7 +244,8 @@ def test_ingest_historical_window_ignores_todays_freshness(con, download_calls):
 def test_ingest_fetches_tail_including_last_bar(con, download_calls):
     # Covered-from-start but stale symbols fetch from their LAST stored bar
     # (inclusive) — refetching it heals partial bars from mid-session runs.
-    last = dt.date.today() - dt.timedelta(days=30)
+    # (10 days: stale enough to tail-fetch, inside the 30-day dormancy window.)
+    last = dt.date.today() - dt.timedelta(days=10)
     _seed_price(con, "AAPL", last)
     store.record_ingest_from(con, ["AAPL"], dt.date(2000, 1, 1))
 
@@ -280,3 +281,30 @@ def test_ingest_records_failed_batch(con, monkeypatch):
 
     assert sorted(result.symbols_failed) == ["AAPL", "NVDA"]
     assert result.rows_written == 0
+
+
+def test_ingest_dormant_symbols_excluded_loudly(con, download_calls, caplog):
+    # A delisted name (last bar months ago, fully covered) must not be fetched
+    # or counted as failed — it would trip the routine's failure gate forever.
+    old = dt.date.today() - dt.timedelta(days=90)
+    _seed_price(con, "DEAD", old)
+    store.record_ingest_from(con, ["DEAD"], dt.date(2000, 1, 1))
+
+    result = ingest.ingest(con, ["DEAD", "NVDA"], years=1)
+
+    assert result.symbols_dormant == ["DEAD"]
+    assert result.symbols_failed == []
+    assert [c[0] for c in download_calls] == [["NVDA"]]  # DEAD never requested
+    assert "dormant" in caplog.text
+
+
+def test_ingest_dormant_still_backfills_without_coverage(con, download_calls):
+    # Dormancy only applies to COVERED symbols: a fresh backfill (no
+    # ingest_meta) must still fetch the full window even for an old last bar.
+    old = dt.date.today() - dt.timedelta(days=90)
+    _seed_price(con, "DEAD", old)
+
+    result = ingest.ingest(con, ["DEAD"], years=1)
+
+    assert result.symbols_dormant == []
+    assert [c[0] for c in download_calls] == [["DEAD"]]

@@ -19,9 +19,11 @@ logger = logging.getLogger(__name__)
 BATCH_SIZE = 150
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 5.0
-# A symbol is considered current when its last stored bar is at least this
-# close to the requested window end.
-CURRENT_WITHIN_DAYS = 4
+# A symbol is skipped only when its last stored bar is essentially at the
+# window end (same-day rerun). Anything older refetches from its LAST stored
+# bar — not last+1 — so a partial bar written by a mid-session run is healed
+# by the next run's overwrite (upserts are idempotent).
+CURRENT_WITHIN_DAYS = 1
 
 
 @dataclass
@@ -133,7 +135,7 @@ def ingest(
         if covers_start and last is not None and last >= end_cutoff:
             result.symbols_skipped.append(sym)
         elif covers_start and last is not None:
-            plan.append((sym, last + dt.timedelta(days=1)))
+            plan.append((sym, last))  # include the last bar: heals partials
         else:
             plan.append((sym, start))
     # Sort by fetch start so tail-fetches batch together instead of dragging a

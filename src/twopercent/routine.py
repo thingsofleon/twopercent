@@ -1,9 +1,24 @@
-"""The morning routine: the daily cycle as one doctor-gated command.
+"""The morning routine: the daily cycle as one gated command.
 
 Level-3 shape: a deterministic pipeline that runs unattended and reports by
-exception. Hard data problems (invalid bars, coverage holes) abort BEFORE the
-model runs; soft problems (gaps, staleness, suspicious bars) degrade the run
-to a warning but let it finish. The summary is the exception report.
+exception. Gate design (rebuilt after quant-skeptic review of the first
+draft):
+
+- **Market-hours guard first.** A mid-session run would ingest today's
+  partial bar, fabricating features AND the prior day's label. The routine
+  refuses to run during US market hours. (Defense in depth: ingest also
+  refetches each symbol's last stored bar, so a partial bar written by a
+  bypassed run is overwritten by the next legitimate one.)
+- **Wall-clock staleness gate.** A store whose newest bar is old produces
+  "predictions" for days that already happened; those must never enter the
+  track record.
+- **The real corruption gate runs AFTER ingest**, on what ingest could
+  actually introduce: newly extreme bars, new zero-volume runs, new invalid
+  rows (symbol-set difference vs the pre-ingest baseline). Pre-existing
+  problems warn; new ones abort before the model trains.
+- Coverage holes (universe symbols without prices) only WARN — the ingest
+  step each morning is exactly what heals them, so hard-failing on them
+  before ingest would deadlock the routine permanently.
 """
 
 from __future__ import annotations
@@ -12,8 +27,10 @@ import datetime as dt
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import duckdb
+import pandas as pd
 
 from twopercent import champion, dashboard, doctor, ingest, store, track, universe
 from twopercent.predict import predict_for
@@ -22,9 +39,23 @@ logger = logging.getLogger(__name__)
 
 UNIVERSE_MAX_AGE_DAYS = 7
 INGEST_FAIL_FRACTION = 0.05  # more than this share of symbols failing = step failure
+MAX_STORE_AGE_DAYS = 5  # newest bar older than this = predictions would be stale
+
+_EASTERN = ZoneInfo("America/New_York")
 
 OK, WARN, FAIL = "ok", "warn", "fail"
 _RANK = {OK: 0, WARN: 1, FAIL: 2}
+
+
+def _now_eastern() -> dt.datetime:
+    return dt.datetime.now(tz=_EASTERN)
+
+
+def _market_is_open(now: dt.datetime) -> bool:
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    return dt.time(9, 25) <= t < dt.time(16, 15)
 
 
 @dataclass
@@ -63,20 +94,8 @@ class RoutineReport:
         return lines
 
 
-def _doctor_gate(report: doctor.DoctorReport) -> tuple[str, str]:
-    """Invalid bars and coverage holes are hard failures; the rest degrade."""
-    hard = len(report.invalid) + len(report.universe_missing_prices)
-    soft = (
-        len(report.gaps)
-        + len(report.stale)
-        + len(report.extreme)
-        + len(report.zero_runs)
-        + len(report.prices_missing_meta)
-    )
-    detail = f"{hard} hard / {soft} soft problems"
-    if hard:
-        return FAIL, detail + " (invalid bars or coverage holes — aborting before model)"
-    return (WARN if soft else OK), detail
+def _symbols(frame: pd.DataFrame) -> set[str]:
+    return set(frame["symbol"]) if not frame.empty and "symbol" in frame.columns else set()
 
 
 def run(
@@ -86,6 +105,18 @@ def run(
     universe_max_age_days: int = UNIVERSE_MAX_AGE_DAYS,
 ) -> RoutineReport:
     report = RoutineReport()
+
+    now = _now_eastern()
+    if _market_is_open(now):
+        report.add(
+            "clock",
+            FAIL,
+            f"US market is open ({now:%H:%M} ET) — a run now would ingest a partial "
+            "bar and fabricate labels; run pre-open or post-close",
+        )
+        return report
+    report.add("clock", OK, f"{now:%a %H:%M} ET, market closed")
+
     try:
         con = store.connect(db_path)
     except duckdb.IOException as exc:
@@ -93,37 +124,54 @@ def run(
         return report
 
     pre = doctor.run(con)
-    status, detail = _doctor_gate(pre)
-    report.add("doctor", status, detail)
-    if status == FAIL:
-        return report
+    pre_problems = pre.problem_count
+    report.add(
+        "doctor", WARN if pre_problems else OK, f"{pre_problems} pre-existing problems (baseline)"
+    )
 
-    try:
-        uni = store.latest_universe(con)
-        age = (dt.date.today() - uni["as_of"].iloc[0].date()).days if not uni.empty else 10**6
-        if age > universe_max_age_days:
+    uni = store.latest_universe(con)
+    if uni.empty:
+        try:
             fresh = universe.refresh_universe()
             n = store.upsert_universe(con, fresh, as_of=dt.date.today())
-            report.add("universe", OK, f"refreshed: {n} symbols (was {age}d old)")
+            report.add("universe", OK, f"bootstrapped: {n} symbols")
+        except Exception as exc:
+            report.add("universe", FAIL, f"no universe stored and refresh failed: {exc}")
+            return report
+    else:
+        age = (dt.date.today() - uni["as_of"].iloc[0].date()).days
+        if age > universe_max_age_days:
+            try:
+                fresh = universe.refresh_universe()
+                n = store.upsert_universe(con, fresh, as_of=dt.date.today())
+                report.add("universe", OK, f"refreshed: {n} symbols (was {age}d old)")
+            except Exception as exc:
+                report.add("universe", WARN, f"refresh failed, using {age}d-old snapshot: {exc}")
         else:
             report.add("universe", OK, f"current ({age}d old, {len(uni)} symbols)")
-    except Exception as exc:
-        # A stale-but-present universe is usable; refresh failure degrades only.
-        report.add("universe", WARN, f"refresh failed, using existing: {exc}")
 
+    symbols = store.all_universe_symbols(con)
+    if not symbols:
+        report.add("ingest", FAIL, "no symbols to ingest — empty universe")
+        return report
     try:
-        result = ingest.ingest(con, store.all_universe_symbols(con))
-        n_failed, n_total = (
-            len(result.symbols_failed),
-            max(
-                1, len(result.symbols_ok) + len(result.symbols_skipped) + len(result.symbols_failed)
-            ),
+        result = ingest.ingest(con, symbols)
+        accounted = (
+            len(result.symbols_ok) + len(result.symbols_skipped) + len(result.symbols_failed)
         )
+        n_failed = len(result.symbols_failed)
         detail = (
             f"{result.rows_written} rows, {len(result.symbols_ok)} fetched, "
             f"{len(result.symbols_skipped)} current, {n_failed} failed"
         )
-        if n_failed / n_total > INGEST_FAIL_FRACTION:
+        if accounted != len(symbols):
+            report.add(
+                "ingest",
+                FAIL,
+                detail + f" — {len(symbols) - accounted} symbols unaccounted for (silent loss)",
+            )
+            return report
+        if n_failed / len(symbols) > INGEST_FAIL_FRACTION:
             report.add("ingest", FAIL, detail + " (failure rate over threshold)")
             return report
         report.add("ingest", WARN if n_failed else OK, detail)
@@ -132,14 +180,39 @@ def run(
         return report
 
     post = doctor.run(con)
-    new_invalid = len(post.invalid) - len(pre.invalid)
-    if new_invalid > 0:
-        report.add("recheck", FAIL, f"today's ingest introduced {new_invalid} invalid-bar rows")
+    max_date = post.max_date
+    if max_date is None or (dt.date.today() - max_date).days > MAX_STORE_AGE_DAYS:
+        report.add(
+            "freshness",
+            FAIL,
+            f"newest bar is {max_date} — too old to predict from; "
+            "predictions for elapsed days must not enter the track record",
+        )
         return report
-    report.add("recheck", OK, "no new invalid bars from today's ingest")
+    report.add("freshness", OK, f"newest bar {max_date}")
 
+    new_extreme = _symbols(post.extreme) - _symbols(pre.extreme)
+    new_invalid = _symbols(post.invalid) - _symbols(pre.invalid)
+    new_zero = _symbols(post.zero_runs) - _symbols(pre.zero_runs)
+    if new_extreme or new_invalid:
+        examples = ", ".join(sorted(new_extreme | new_invalid)[:5])
+        report.add(
+            "recheck",
+            FAIL,
+            f"today's ingest introduced corruption ({len(new_extreme)} extreme, "
+            f"{len(new_invalid)} invalid symbols: {examples}) — aborting before the model",
+        )
+        return report
+    coverage_holes = len(post.universe_missing_prices)
+    recheck_detail = "no new corruption from today's ingest"
+    if new_zero:
+        recheck_detail += f"; {len(new_zero)} new zero-volume symbols"
+    if coverage_holes:
+        recheck_detail += f"; {coverage_holes} universe symbols still without prices"
+    report.add("recheck", WARN if (new_zero or coverage_holes) else OK, recheck_detail)
+
+    name = champion.get_champion()
     try:
-        name = champion.get_champion()
         prediction = predict_for(con, name, save=True)
         head = prediction.scored.head(5)
         report.top_candidates = list(zip(head["symbol"], head["prob"], strict=True))
@@ -154,16 +227,20 @@ def run(
         return report
 
     try:
-        dashboard.render(con, name, out_path, top=top)
+        dashboard.render(con, name, out_path, top=top, result=prediction)
         report.add("dashboard", OK, f"written to {out_path}")
     except Exception as exc:
         report.add("dashboard", WARN, f"render failed (predictions are logged): {exc}")
 
-    scored = track.score_predictions(con, name, top_n=top).scored
-    if not scored.empty:
-        last = scored.iloc[-1]
-        report.last_scored = (
-            f"{last['target_date']}: {int(last['hits'])}/{int(last['n_scored'])} hit "
-            f"({last['precision']:.0%} vs base {last['base_rate']:.0%})"
-        )
+    try:
+        scored = track.score_predictions(con, name, top_n=top).scored
+        if not scored.empty:
+            last = scored.iloc[-1]
+            report.last_scored = (
+                f"{last['target_date']}: {int(last['hits'])}/{int(last['n_scored'])} hit "
+                f"({last['precision']:.0%} vs base {last['base_rate']:.0%})"
+            )
+        report.add("scoring", OK, f"{len(scored)} days in track record")
+    except Exception as exc:
+        report.add("scoring", WARN, f"track-record scoring failed: {exc}")
     return report

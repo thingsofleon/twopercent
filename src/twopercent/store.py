@@ -59,8 +59,10 @@ CREATE TABLE IF NOT EXISTS predictions (
     prob DOUBLE NOT NULL,
     rank INTEGER NOT NULL,
     created_ts TIMESTAMP NOT NULL,
+    universe_as_of DATE,
     PRIMARY KEY (strategy, signal_date, symbol)
 );
+ALTER TABLE predictions ADD COLUMN IF NOT EXISTS universe_as_of DATE;
 CREATE OR REPLACE VIEW latest_universe AS
     SELECT symbol, name, market_cap, as_of, sector
     FROM universe
@@ -177,12 +179,17 @@ def save_predictions(
     rows = df[["symbol", "prob", "rank"]].copy()
     rows.insert(0, "strategy", strategy)
     rows.insert(1, "signal_date", signal_date)
+    # Which universe snapshot the features were built against: without this,
+    # a logged prediction can't be reproduced after the next refresh (feature
+    # values are snapshot-dependent — see features.py docstring).
+    as_of = con.execute("SELECT max(as_of) FROM universe").fetchone()[0]
     con.register("predictions_in", rows)
     con.execute(
         """
         INSERT OR REPLACE INTO predictions
-        SELECT strategy, signal_date, symbol, prob, rank, now() FROM predictions_in
-        """
+        SELECT strategy, signal_date, symbol, prob, rank, now(), ? FROM predictions_in
+        """,
+        [as_of],
     )
     con.unregister("predictions_in")
     return len(rows)

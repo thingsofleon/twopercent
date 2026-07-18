@@ -281,8 +281,11 @@ def render(
     strategy_name: str,
     out_path: str,
     top: int = 20,
+    result: PredictResult | None = None,
 ) -> str:
-    result = predict_for(con, strategy_name, save=True)
+    """Render the dashboard; pass a precomputed PredictResult to avoid retraining."""
+    if result is None:
+        result = predict_for(con, strategy_name, save=True)
     content = build_html(con, result, top=top)
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(content)

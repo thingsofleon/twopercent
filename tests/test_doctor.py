@@ -258,6 +258,172 @@ def test_missing_universe_warns_but_does_not_fail(con):
     assert "no universe stored" in text
 
 
+@pytest.fixture
+def with_artifact(con):
+    """A store with exactly one split artifact plus decoys the rule must skip.
+
+    - SPLITX: mid-history bar rewritten to open=1000/close=101 — open 10x the
+      prior close AND -90% intraday → the one true artifact
+    - WILD:   genuine +60% bar with a continuous open → extreme, not an artifact
+    - FIRSTX: FIRST bar rewritten to the same broken shape — no prior close,
+      so it must never be flagged
+    """
+    wild = [0.01] * 10
+    wild[5] = 0.60
+    seed_history(
+        con, {"OKAY": [0.01] * 10, "WILD": wild, "SPLITX": [0.01] * 10, "FIRSTX": [0.01] * 10}
+    )
+    con.execute(
+        """
+        UPDATE prices SET open = 1000.0, high = 1000.0, low = 100.0, close = 101.0
+        WHERE symbol = 'SPLITX' AND date = DATE '2026-01-12'
+        """
+    )
+    con.execute(
+        """
+        UPDATE prices SET open = 1000.0, high = 1000.0, low = 100.0, close = 101.0
+        WHERE symbol = 'FIRSTX' AND date = DATE '2026-01-05'
+        """
+    )
+    return con
+
+
+def test_split_artifacts_flags_scale_break_only(with_artifact):
+    flagged = doctor.split_artifacts(with_artifact)
+    assert len(flagged) == 1
+    row = flagged.iloc[0]
+    assert row["symbol"] == "SPLITX"
+    assert row["date"].date() == dt.date(2026, 1, 12)
+    assert row["oc_return"] == pytest.approx(-0.899)
+    # decoys stayed invisible: genuine extreme move and first-bar-of-symbol
+    assert "WILD" not in flagged["symbol"].tolist()
+    assert "FIRSTX" not in flagged["symbol"].tolist()
+
+
+def test_split_artifacts_nan_prev_close_not_flagged(with_artifact):
+    # DuckDB total ordering: NaN/prev_close > 2 is TRUE without an isfinite
+    # guard — a NaN prior close must not flag the (genuine) bar after it.
+    with_artifact.execute(
+        """
+        UPDATE prices SET close = CAST('nan' AS DOUBLE)
+        WHERE symbol = 'WILD' AND date = DATE '2026-01-09'
+        """
+    )
+    flagged = doctor.split_artifacts(with_artifact)
+    assert flagged["symbol"].tolist() == ["SPLITX"]
+
+
+def test_repair_splits_deletes_exactly_the_artifact(with_artifact, caplog):
+    before = store.price_row_count(with_artifact)
+    removed = doctor.repair_splits(with_artifact)
+
+    assert removed["symbol"].tolist() == ["SPLITX"]
+    assert store.price_row_count(with_artifact) == before - 1
+    gone = with_artifact.execute(
+        "SELECT count(*) FROM prices WHERE symbol = 'SPLITX' AND date = DATE '2026-01-12'"
+    ).fetchone()[0]
+    assert gone == 0
+    assert "1 split-artifact bars deleted" in caplog.text
+    # the genuine extreme bar survived the repair
+    ext = doctor.extreme_bars(with_artifact)
+    assert ("WILD", dt.date(2026, 1, 12)) in {(r.symbol, r.date.date()) for r in ext.itertuples()}
+    # idempotent: nothing left to find or delete
+    assert doctor.repair_splits(with_artifact).empty
+    assert store.price_row_count(with_artifact) == before - 1
+
+
+def test_repair_splits_cascades_to_fixpoint(con, caplog):
+    # Reviewer reproduction: deleting an artifact can newly expose its
+    # neighbor — the neighbor's prev close becomes the original-scale bar, so
+    # a single detect+delete pass leaves a fresh artifact behind.
+    dates = pd.bdate_range("2026-01-05", periods=3).date
+    store.upsert_prices(
+        con,
+        pd.DataFrame(
+            {
+                "symbol": "CASC",
+                "date": dates,
+                "open": [10.0, 100.0, 31.0],
+                "high": [10.0, 100.0, 50.0],
+                "low": [10.0, 30.0, 31.0],
+                "close": [10.0, 30.0, 50.0],
+                "adj_close": [10.0, 30.0, 50.0],
+                "volume": [1_000_000] * 3,
+            }
+        ),
+    )
+    seed_history(con, {"OKAY": [0.01] * 3})
+
+    # one detection pass only sees the first artifact...
+    single = doctor.split_artifacts(con)
+    assert [(r.symbol, r.date.date()) for r in single.itertuples()] == [("CASC", dates[1])]
+
+    # ...the repair loops to the fixpoint and catches the exposed neighbor too
+    removed = doctor.repair_splits(con)
+    assert [(r.symbol, r.date.date()) for r in removed.itertuples()] == [
+        ("CASC", dates[1]),
+        ("CASC", dates[2]),
+    ]
+    assert "2 split-artifact bars deleted" in caplog.text
+    assert "2 passes" in caplog.text
+    left = con.execute("SELECT date FROM prices WHERE symbol = 'CASC'").fetchall()
+    assert [r[0] for r in left] == [dates[0]]
+    assert doctor.repair_splits(con).empty  # fixpoint reached: re-run finds nothing
+
+
+def test_split_artifacts_fp_boundary_at_non_round_open(con):
+    # Exactly +50% at open 5.70 with a 10x scale break must NOT be flagged
+    # (strict >, epsilon-guarded); a hair over still is. Mirrors the pandas-side
+    # boundary test so both implementations agree at the boundary.
+    dates = pd.bdate_range("2026-01-05", periods=2).date
+
+    def two_bar(symbol: str, o2: float, c2: float) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "symbol": symbol,
+                "date": dates,
+                "open": [0.57, o2],
+                "high": [0.57, max(o2, c2)],
+                "low": [0.57, min(o2, c2)],
+                "close": [0.57, c2],
+                "adj_close": [0.57, c2],
+                "volume": [1_000_000] * 2,
+            }
+        )
+
+    store.upsert_prices(con, two_bar("EDGE", 5.70, 8.55))  # exactly +50%
+    store.upsert_prices(con, two_bar("OVER", 5.70, 8.56))  # +50.2%
+    assert doctor.split_artifacts(con)["symbol"].tolist() == ["OVER"]
+
+
+def test_cli_doctor_without_flag_is_read_only(with_artifact, tmp_path):
+    before = store.price_row_count(with_artifact)
+    with_artifact.close()
+    db = str(tmp_path / "test.duckdb")
+    result = runner.invoke(app, ["doctor", "--db", db])
+    assert result.exit_code == 1  # artifact shows up as an extreme bar
+    assert "repair-splits" not in result.output
+    con = store.connect(db)
+    assert store.price_row_count(con) == before
+
+
+def test_cli_doctor_repair_splits_prints_and_deletes(with_artifact, tmp_path):
+    before = store.price_row_count(with_artifact)
+    with_artifact.close()
+    db = str(tmp_path / "test.duckdb")
+    result = runner.invoke(app, ["doctor", "--db", db, "--repair-splits"])
+    assert "repair-splits: deleted 1 split-artifact bars:" in result.output
+    assert "SPLITX" in result.output
+    assert "2026-01-12" in result.output
+    assert "-89.9%" in result.output
+    con = store.connect(db)
+    assert store.price_row_count(con) == before - 1
+    con.close()
+    # second run: nothing left, loudly says so
+    again = runner.invoke(app, ["doctor", "--db", db, "--repair-splits"])
+    assert "repair-splits: no split artifacts found" in again.output
+
+
 def test_cli_exits_1_and_reports_on_defects(defective, tmp_path):
     defective.close()
     result = runner.invoke(app, ["doctor", "--db", str(tmp_path / "test.duckdb")])

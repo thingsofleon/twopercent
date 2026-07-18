@@ -1,10 +1,29 @@
 import datetime as dt
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from tests.conftest import make_yf_frame
 from twopercent import ingest, store
+
+
+def _yf_frame_from_bars(symbol: str, bars: list[tuple[float, float]]) -> pd.DataFrame:
+    """Single-symbol yf.download-shaped frame from explicit (open, close) bars."""
+    opens = np.array([b[0] for b in bars])
+    closes = np.array([b[1] for b in bars])
+    frame = pd.DataFrame(
+        {
+            "Open": opens,
+            "High": np.maximum(opens, closes),
+            "Low": np.minimum(opens, closes),
+            "Close": closes,
+            "Adj Close": closes,
+            "Volume": np.full(len(bars), 1_000_000.0),
+        },
+        index=pd.bdate_range("2026-01-05", periods=len(bars)),
+    )
+    return pd.concat({symbol: frame}, axis=1)
 
 
 def _seed_price(con, symbol: str, date: dt.date) -> None:
@@ -65,6 +84,101 @@ def test_frames_to_rows_drops_invalid_opens_loudly(caplog):
     rows = ingest.frames_to_rows(frame, {"AAPL": "AAPL"})
     assert len(rows) == 3  # zero-open row rejected at ingest, not just hidden by the view
     assert "dropped for invalid open/close" in caplog.text
+
+
+def test_frames_to_rows_drops_split_artifacts_loudly_both_directions(caplog):
+    # Bar 2: open 10x the prior close (pre-split scale), -90% "intraday".
+    # Bar 4: open at a tenth of the prior close, +940% "intraday".
+    bars = [
+        (10.0, 10.1),
+        (102.0, 10.2),
+        (10.2, 10.3),
+        (1.0, 10.4),
+    ]
+    rows = ingest.frames_to_rows(_yf_frame_from_bars("SPLITX", bars), {"SPLITX": "SPLITX"})
+    assert len(rows) == 2
+    assert rows["open"].tolist() == [10.0, 10.2]
+    assert "2 bars dropped as split artifacts" in caplog.text
+    assert "SPLITX" in caplog.text
+
+
+def test_frames_to_rows_keeps_genuine_extreme_move_with_continuous_open(caplog):
+    # +60% open-to-close, but the open agrees with the prior close: real move.
+    bars = [(10.0, 10.1), (10.1, 16.16)]
+    rows = ingest.frames_to_rows(_yf_frame_from_bars("MOON", bars), {"MOON": "MOON"})
+    assert len(rows) == 2
+    assert rows["close"].tolist() == [10.1, 16.16]
+    assert "split artifact" not in caplog.text
+
+
+def test_frames_to_rows_never_flags_first_bar_of_symbol(caplog):
+    # First bar has no prior close to disagree with — even a +300% bar stays.
+    bars = [(10.0, 40.0), (40.0, 40.4)]
+    rows = ingest.frames_to_rows(_yf_frame_from_bars("IPO", bars), {"IPO": "IPO"})
+    assert len(rows) == 2
+    assert "split artifact" not in caplog.text
+
+
+def test_single_bar_tail_fetch_drops_artifact_via_store_seeded_prev_close(caplog):
+    # Daily tail fetches are single-bar frames with no in-frame prior bar —
+    # without the store-seeded prev_close the artifact rule is blind on exactly
+    # the path that will ever see a NEW artifact (reviewer reproduction).
+    frame = _yf_frame_from_bars("DRUG", [(102.0, 10.2)])
+    rows = ingest.frames_to_rows(frame, {"DRUG": "DRUG"}, {"DRUG": (dt.date(2026, 1, 2), 10.15)})
+    assert rows.empty
+    assert "1 bars dropped as split artifacts" in caplog.text
+    assert "DRUG" in caplog.text
+
+
+def test_single_bar_tail_fetch_keeps_continuous_bar(caplog):
+    frame = _yf_frame_from_bars("OKAY", [(10.2, 10.3)])
+    rows = ingest.frames_to_rows(frame, {"OKAY": "OKAY"}, {"OKAY": (dt.date(2026, 1, 2), 10.15)})
+    assert len(rows) == 1
+    assert "split artifact" not in caplog.text
+
+
+def test_seed_ignored_when_frame_starts_at_last_stored_bar(caplog):
+    # In-flight change makes tail fetches start AT the last stored bar: the
+    # re-fetched first bar must not use its own stored close as prev_close —
+    # the seed applies only strictly after the stored date.
+    frame = _yf_frame_from_bars("OVLP", [(102.0, 10.2), (10.2, 10.3)])
+    last_bars = {"OVLP": (dt.date(2026, 1, 5), 10.2)}  # first frame bar IS the stored bar
+    rows = ingest.frames_to_rows(frame, {"OVLP": "OVLP"}, last_bars)
+    assert len(rows) == 2  # no usable prev for the overlap bar; second bar continuous
+    assert "split artifact" not in caplog.text
+
+
+def test_seed_with_invalid_stored_close_is_ignored(caplog):
+    # A NaN stored close cannot establish a scale — conservative keep, no crash.
+    frame = _yf_frame_from_bars("BADC", [(102.0, 10.2)])
+    rows = ingest.frames_to_rows(
+        frame, {"BADC": "BADC"}, {"BADC": (dt.date(2026, 1, 2), float("nan"))}
+    )
+    assert len(rows) == 1
+    assert "split artifact" not in caplog.text
+
+
+def test_split_thresholds_not_flipped_by_fp_at_non_round_prices(caplog):
+    # CLAUDE.md FP-boundary rule: exactly-at-threshold bars must never be
+    # flagged, whichever side double arithmetic lands them on.
+    exact_oc = _yf_frame_from_bars("EDGEOC", [(0.57, 0.57), (5.70, 8.55)])  # +50% at 10x scale
+    assert len(ingest.frames_to_rows(exact_oc, {"EDGEOC": "EDGEOC"})) == 2
+    exact_scale = _yf_frame_from_bars("EDGESC", [(5.70, 5.70), (11.40, 2.85)])  # 2.0x, -75%
+    assert len(ingest.frames_to_rows(exact_scale, {"EDGESC": "EDGESC"})) == 2
+    assert "split artifact" not in caplog.text
+    # just past BOTH thresholds still flags
+    over = _yf_frame_from_bars("OVER", [(0.57, 0.57), (5.70, 8.56)])  # +50.2% at 10x scale
+    assert len(ingest.frames_to_rows(over, {"OVER": "OVER"})) == 1
+    assert "1 bars dropped as split artifacts" in caplog.text
+
+
+def test_frames_to_rows_keeps_scale_gap_without_extreme_oc_move(caplog):
+    # An open off-scale vs prior close but a calm intraday bar (a real split
+    # with clean OHLC, or a huge overnight gap) must NOT be dropped.
+    bars = [(100.0, 101.0), (10.1, 10.2)]
+    rows = ingest.frames_to_rows(_yf_frame_from_bars("REV", bars), {"REV": "REV"})
+    assert len(rows) == 2
+    assert "split artifact" not in caplog.text
 
 
 def test_frames_to_rows_accepts_flat_columns_for_single_symbol():
@@ -143,11 +257,11 @@ def test_ingest_continues_after_postprocessing_error(con, monkeypatch, download_
     original = ingest.frames_to_rows
     failed_once = []
 
-    def flaky(data, yf_map):
+    def flaky(data, yf_map, last_bars=None):
         if not failed_once:
             failed_once.append(True)
             raise KeyError("malformed batch")
-        return original(data, yf_map)
+        return original(data, yf_map, last_bars)
 
     monkeypatch.setattr(ingest, "frames_to_rows", flaky)
     result = ingest.ingest(con, ["AAPL", "NVDA"], years=1, batch_size=1)

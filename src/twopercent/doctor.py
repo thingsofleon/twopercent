@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from dataclasses import dataclass
 
 import duckdb
 import pandas as pd
 
 from twopercent import scan
+from twopercent.ingest import _SPLIT_EPSILON, SPLIT_ARTIFACT_OC, SPLIT_ARTIFACT_SCALE
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_STALE_DAYS = 2
 EXTREME_RETURN_THRESHOLD = 0.5
@@ -100,6 +104,82 @@ def extreme_bars(
         """,
         [threshold],
     ).df()
+
+
+def split_artifacts(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """Bars matching the ingest split-artifact rule already sitting in `prices`.
+
+    Same rule as ingest.frames_to_rows: extreme open-to-close move AND an open
+    on a different price scale than the PRIOR bar's close (prior-bar only — no
+    lookahead). Reads the raw prices table, not the daily_returns view, and
+    guards every float comparison with isfinite() (DuckDB total ordering:
+    NaN > x is TRUE). Thresholds carry the same FP epsilon as ingest so both
+    implementations agree at exact boundaries.
+    """
+    return con.execute(
+        """
+        WITH seq AS (
+            SELECT symbol, date, open, close,
+                   LAG(close) OVER (PARTITION BY symbol ORDER BY date) AS prev_close
+            FROM prices
+        )
+        SELECT symbol, date, (close - open) / open AS oc_return
+        FROM seq
+        WHERE open > 0 AND isfinite(open) AND isfinite(close)
+          AND abs((close - open) / open) > ?
+          AND prev_close > 0 AND isfinite(prev_close)
+          AND (open / prev_close > ? OR open / prev_close < ?)
+        ORDER BY symbol, date
+        """,
+        [
+            SPLIT_ARTIFACT_OC + _SPLIT_EPSILON,
+            SPLIT_ARTIFACT_SCALE + _SPLIT_EPSILON,
+            1 / SPLIT_ARTIFACT_SCALE - _SPLIT_EPSILON,
+        ],
+    ).df()
+
+
+def _delete_bars(con: duckdb.DuckDBPyConnection, flagged: pd.DataFrame) -> None:
+    con.register("split_artifacts_in", flagged[["symbol", "date"]])
+    con.execute(
+        """
+        DELETE FROM prices
+        WHERE (symbol, date) IN (SELECT symbol, date::DATE FROM split_artifacts_in)
+        """
+    )
+    con.unregister("split_artifacts_in")
+
+
+def repair_splits(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """Delete split-artifact bars from `prices` to a FIXPOINT; returns all deletions.
+
+    Deleting a bar can newly expose its neighbor (the neighbor's prev close
+    becomes an earlier bar on the original price scale), so detection and
+    deletion loop until a pass finds nothing. The fixpoint makes the repair
+    idempotent — a subsequent call finds and deletes nothing — and it stays
+    recoverable: a re-ingest of the affected symbols restores the bars if any
+    deletion was ever wrong. The only mutating doctor operation; everything
+    else is read-only.
+    """
+    flagged = split_artifacts(con)
+    passes: list[pd.DataFrame] = []
+    while not flagged.empty:
+        _delete_bars(con, flagged)
+        passes.append(flagged)
+        flagged = split_artifacts(con)
+    if not passes:
+        return flagged  # empty, correctly-shaped
+    removed = (
+        pd.concat(passes, ignore_index=True).sort_values(["symbol", "date"]).reset_index(drop=True)
+    )
+    logger.warning(
+        "%d split-artifact bars deleted from prices across %d symbols in %d passes "
+        "(re-ingest restores)",
+        len(removed),
+        removed["symbol"].nunique(),
+        len(passes),
+    )
+    return removed
 
 
 def zero_volume_runs(

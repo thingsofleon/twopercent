@@ -142,6 +142,20 @@ def last_price_dates(con: duckdb.DuckDBPyConnection) -> dict[str, dt.date]:
     return dict(rows)
 
 
+def last_price_bars(con: duckdb.DuckDBPyConnection) -> dict[str, tuple[dt.date, float | None]]:
+    """Map each stored symbol to (last price date, close on that date).
+
+    One query serving both the ingest resume logic and the split-artifact
+    prev_close seed: a tail fetch's first bar has no in-frame prior bar, so
+    without the stored close the artifact rule is blind on exactly the daily
+    updates that will ever see a new artifact.
+    """
+    rows = con.execute(
+        "SELECT symbol, max(date), arg_max(close, date) FROM prices GROUP BY symbol"
+    ).fetchall()
+    return {sym: (last, close) for sym, last, close in rows}
+
+
 def ingest_from_dates(con: duckdb.DuckDBPyConnection) -> dict[str, dt.date]:
     """Map each symbol to the earliest window start it was ever ingested from."""
     rows = con.execute("SELECT symbol, from_date FROM ingest_meta").fetchall()
@@ -173,7 +187,16 @@ def price_row_count(con: duckdb.DuckDBPyConnection) -> int:
 def save_predictions(
     con: duckdb.DuckDBPyConnection, strategy: str, signal_date: dt.date, df: pd.DataFrame
 ) -> int:
-    """Idempotently store scored rows (columns: symbol, prob, rank) for a signal date."""
+    """Replace the (strategy, signal_date) slice with `df` (columns: symbol, prob, rank).
+
+    Delete-then-insert, not upsert: a re-run that scores FEWER symbols (e.g.
+    the liquidity floor now excludes one) must not leave the missing symbols
+    behind as phantom ranks from an earlier save.
+    """
+    con.execute(
+        "DELETE FROM predictions WHERE strategy = ? AND signal_date = ?",
+        [strategy, signal_date],
+    )
     if df.empty:
         return 0
     rows = df[["symbol", "prob", "rank"]].copy()
@@ -186,7 +209,7 @@ def save_predictions(
     con.register("predictions_in", rows)
     con.execute(
         """
-        INSERT OR REPLACE INTO predictions
+        INSERT INTO predictions
         SELECT strategy, signal_date, symbol, prob, rank, now(), ? FROM predictions_in
         """,
         [as_of],

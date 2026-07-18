@@ -5,7 +5,7 @@ import pandas as pd
 
 from tests.conftest import seed_history
 from twopercent import store
-from twopercent.features import FEATURE_COLUMNS, feature_frame
+from twopercent.features import FEATURE_COLUMNS, METADATA_COLUMNS, feature_frame
 
 
 def _varied(n: int, seed: int) -> list[float]:
@@ -32,12 +32,13 @@ def test_lookahead_canary(con):
     Covers the sector features too: both symbols share a sector, so
     sector_breadth/sector_excess are live values, not incidental NaNs.
     """
+    watched = FEATURE_COLUMNS + METADATA_COLUMNS  # metadata must be trailing-only too
     seed_history(con, {"AAA": _varied(60, 1), "BBB": _varied(60, 2)})
     _seed_universe(con, {"AAA": "Technology", "BBB": "Technology"})
     before = feature_frame(con)
     dates = sorted(before["signal_date"].unique())
     cutoff = dates[len(dates) // 2]
-    vec_before = before[before["signal_date"] == cutoff].set_index("symbol")[FEATURE_COLUMNS]
+    vec_before = before[before["signal_date"] == cutoff].set_index("symbol")[watched]
     # The canary must actually exercise the sector features, not compare NaN to NaN.
     assert vec_before["sector_breadth"].notna().all()
     assert vec_before["sector_excess"].notna().all()
@@ -47,7 +48,7 @@ def test_lookahead_canary(con):
         [cutoff],
     )
     after = feature_frame(con)
-    vec_after = after[after["signal_date"] == cutoff].set_index("symbol")[FEATURE_COLUMNS]
+    vec_after = after[after["signal_date"] == cutoff].set_index("symbol")[watched]
 
     assert vec_before.equals(vec_after)  # features untouched by the future
     # ...while the label DID change (it is the future, explicitly):
@@ -142,6 +143,24 @@ def test_sector_features_nan_when_no_universe(con, caplog):
     assert frame["sector_breadth"].isna().all()
     assert frame["sector_excess"].isna().all()
     assert "no sector data" in caplog.text
+
+
+def test_median_vol_20_is_trailing_metadata_not_a_feature(con):
+    # Models must never train on it: it is metadata, not a feature.
+    assert "median_vol_20" in METADATA_COLUMNS
+    assert "median_vol_20" not in FEATURE_COLUMNS
+
+    seed_history(con, {"AAA": _varied(30, 8)}, vary_volume=True)
+    frame = feature_frame(con).set_index("signal_date")
+    volumes = con.execute("SELECT volume FROM prices WHERE symbol = 'AAA' ORDER BY date").df()[
+        "volume"
+    ]
+    rolling = volumes.rolling(20).median()
+    # Each signal date's value is the median of the 20 bars ENDING there —
+    # trailing by construction (checked mid-history, not just at the frame end).
+    idx = sorted(frame.index)  # frame rows start at the 20th bar (thin history dropped)
+    for pos, bar in ((0, 19), (5, 24), (10, 29)):
+        assert frame.loc[idx[pos], "median_vol_20"] == rolling.iloc[bar]
 
 
 def test_thin_history_dropped_loudly(con, caplog):

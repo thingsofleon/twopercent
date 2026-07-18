@@ -61,6 +61,57 @@ class PickPerformance:
         return float((1 + frame[column] - COST_ROUND_TRIP).prod())
 
 
+# Trailing windows for the simulated walk-forward record, in TRADING days.
+SIM_WINDOW_SPECS = [
+    ("1 week", 5),
+    ("1 month", 21),
+    ("3 months", 63),
+    ("6 months", 126),
+    ("1 year", 252),
+]
+
+
+@dataclass
+class SimWindows:
+    """Trailing-window summary of a benchmark's per-day sim record.
+
+    `days_available` is always reported, even when every window is omitted,
+    so callers can say "N sim days available" instead of silently showing
+    nothing (a window is NEVER computed on a shorter span than requested).
+    """
+
+    days_available: int
+    windows: list[dict]  # label, days, top1_growth, top5_growth,
+    # top1_hit_rate, top5_hit_rate
+
+
+def sim_windows(daily: pd.DataFrame) -> SimWindows:
+    """Growth of $1 and hit rates over standard trailing windows of sim days.
+
+    `daily` is an experiment_daily frame (target_date-ordered) with columns
+    top1_ret, top1_hit, top5_ret, top5_hits. Growth compounds each day net of
+    COST_ROUND_TRIP, same formula as PickPerformance.growth. Hits were
+    computed at benchmark time with the epsilon-guarded threshold — no
+    re-derivation here. Windows longer than the available history are omitted.
+    """
+    windows: list[dict] = []
+    for label, n in SIM_WINDOW_SPECS:
+        if len(daily) < n:
+            continue
+        tail = daily.iloc[-n:]
+        windows.append(
+            {
+                "label": label,
+                "days": n,
+                "top1_growth": float((1 + tail["top1_ret"] - COST_ROUND_TRIP).prod()),
+                "top5_growth": float((1 + tail["top5_ret"] - COST_ROUND_TRIP).prod()),
+                "top1_hit_rate": float(tail["top1_hit"].mean()),
+                "top5_hit_rate": float(tail["top5_hits"].mean()),
+            }
+        )
+    return SimWindows(days_available=len(daily), windows=windows)
+
+
 def daily_pick_performance(
     con: duckdb.DuckDBPyConnection, strategy: str, top_n: int = 5
 ) -> PickPerformance:

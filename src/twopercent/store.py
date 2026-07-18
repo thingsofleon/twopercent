@@ -52,6 +52,15 @@ CREATE TABLE IF NOT EXISTS experiments (
     test_end DATE,
     metrics TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS experiment_daily (
+    seq BIGINT NOT NULL,
+    target_date DATE NOT NULL,
+    top1_ret DOUBLE,
+    top1_hit INTEGER,
+    top5_ret DOUBLE,
+    top5_hits DOUBLE,
+    PRIMARY KEY (seq, target_date)
+);
 CREATE TABLE IF NOT EXISTS predictions (
     strategy TEXT NOT NULL,
     signal_date DATE NOT NULL,
@@ -234,15 +243,80 @@ def record_experiment(
     test_start: dt.date,
     test_end: dt.date,
     metrics: dict,
-) -> None:
-    con.execute(
+) -> int:
+    """Insert an experiments row and return its id (the seq daily rows key on)."""
+    return con.execute(
         """
         INSERT INTO experiments (run_ts, strategy, params, train_start, test_start,
                                  test_end, metrics)
         VALUES (now(), ?, ?, ?, ?, ?, ?)
+        RETURNING id
         """,
         [strategy, json.dumps(params), train_start, test_start, test_end, json.dumps(metrics)],
+    ).fetchone()[0]
+
+
+def record_experiment_daily(con: duckdb.DuckDBPyConnection, seq: int, rows: pd.DataFrame) -> int:
+    """Store a benchmark's per-day pick outcomes keyed to its experiments row.
+
+    Expects columns: target_date, top1_ret, top1_hit, top5_ret, top5_hits.
+    """
+    if rows.empty:
+        return 0
+    daily = rows[["target_date", "top1_ret", "top1_hit", "top5_ret", "top5_hits"]].copy()
+    daily["target_date"] = pd.to_datetime(daily["target_date"])
+    daily.insert(0, "seq", seq)
+    con.register("experiment_daily_in", daily)
+    con.execute(
+        """
+        INSERT OR REPLACE INTO experiment_daily
+        SELECT seq, CAST(target_date AS DATE), top1_ret, top1_hit, top5_ret, top5_hits
+        FROM experiment_daily_in
+        """
     )
+    con.unregister("experiment_daily_in")
+    return len(daily)
+
+
+def latest_experiment_daily(
+    con: duckdb.DuckDBPyConnection, strategy: str
+) -> tuple[dict, pd.DataFrame] | None:
+    """The most recent experiment for `strategy` that HAS daily rows, plus those rows.
+
+    Returns (experiment metadata dict, daily frame ordered by target_date), or
+    None when no experiment of this strategy recorded daily rows — experiments
+    predating the experiment_daily table have aggregates only.
+    """
+    row = con.execute(
+        """
+        SELECT e.id, e.run_ts, e.params, e.test_start, e.test_end
+        FROM experiments e
+        WHERE e.strategy = ? AND EXISTS (
+            SELECT 1 FROM experiment_daily d WHERE d.seq = e.id
+        )
+        ORDER BY e.run_ts DESC, e.id DESC
+        LIMIT 1
+        """,
+        [strategy],
+    ).fetchone()
+    if row is None:
+        return None
+    seq, run_ts, params, test_start, test_end = row
+    daily = con.execute(
+        """
+        SELECT target_date, top1_ret, top1_hit, top5_ret, top5_hits
+        FROM experiment_daily WHERE seq = ? ORDER BY target_date
+        """,
+        [seq],
+    ).df()
+    meta = {
+        "seq": seq,
+        "run_ts": run_ts,
+        "params": json.loads(params) if params else {},
+        "test_start": test_start,
+        "test_end": test_end,
+    }
+    return meta, daily
 
 
 def list_experiments(con: duckdb.DuckDBPyConnection, limit: int = 20) -> pd.DataFrame:

@@ -70,6 +70,46 @@ def test_benchmark_top_n_applies_liquidity_floor_selection_only(con, monkeypatch
     assert params["selection"] == "liquidity_floor_100k"
 
 
+def test_benchmark_persists_daily_sim_rows(con, monkeypatch):
+    monkeypatch.setattr(backtest, "MIN_TRAIN_ROWS", 500)
+    seed_planted(con)
+    metrics = backtest.run_benchmark(con, "baseline_gbm_v1", months=2, top_n=5)
+
+    experiments = store.list_experiments(con)
+    seq = int(experiments["id"].iloc[0])
+    daily = con.execute(
+        "SELECT * FROM experiment_daily WHERE seq = ? ORDER BY target_date", [seq]
+    ).df()
+    # One row per scored test day, all inside the recorded test window.
+    assert len(daily) == metrics["test_days"]
+    dates = [pd.Timestamp(d).date() for d in daily["target_date"]]
+    assert dates == sorted(set(dates))  # unique, ordered — one row per day
+    assert dates[0] >= pd.Timestamp(experiments["test_start"].iloc[0]).date()
+    assert dates[-1] <= pd.Timestamp(experiments["test_end"].iloc[0]).date()
+    # The persisted rows recompound to exactly the recorded aggregate.
+    from twopercent import track
+
+    growth = float((1 + daily["top1_ret"] - track.COST_ROUND_TRIP).prod())
+    assert abs(round(growth, 4) - metrics["sim_top1_growth"]) < 1e-9
+
+    result = store.latest_experiment_daily(con, "baseline_gbm_v1")
+    assert result is not None
+    meta, latest_daily = result
+    assert meta["seq"] == seq
+    assert len(latest_daily) == len(daily)
+    # Metrics JSON stays aggregate-only — per-day rows live in their own table.
+    recorded = json.loads(experiments["metrics"].iloc[0])
+    assert "daily" not in recorded and "daily_picks" not in recorded
+
+
+def test_benchmark_unrecorded_run_persists_nothing(con, monkeypatch):
+    monkeypatch.setattr(backtest, "MIN_TRAIN_ROWS", 500)
+    seed_planted(con)
+    backtest.run_benchmark(con, "baseline_gbm_v1", months=2, top_n=5, record=False)
+    assert store.list_experiments(con).empty
+    assert con.execute("SELECT count(*) FROM experiment_daily").fetchone()[0] == 0
+
+
 def test_month_folds_shape():
     dates = pd.Series(pd.bdate_range("2026-01-05", periods=90).date)
     folds = backtest.month_folds(dates, months=2)

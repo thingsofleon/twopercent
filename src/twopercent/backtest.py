@@ -53,7 +53,7 @@ def run_benchmark(
     folds_run = 0
     floored_row_days = 0
     unscoreable_days = 0
-    daily_picks: list[tuple[float, int, float, float]] = []
+    daily_picks: list[tuple[dt.date, float, int, float, float]] = []
     fold_top1_growth: list[float] = []
 
     for month_start, month_end in folds:
@@ -74,7 +74,7 @@ def run_benchmark(
         probs = strategy.predict_proba(test)
         all_probs.append(probs)
         all_labels.append(test["did_2pct_next"])
-        for _, day_rows in test.assign(prob=probs).groupby("target_date"):
+        for target_date, day_rows in test.assign(prob=probs).groupby("target_date"):
             # Same liquidity floor the shipped predictions apply (predict.py):
             # only the top-N SELECTION filters — training and the AUC/brier
             # populations above stay all-names, matching the label definition.
@@ -89,6 +89,7 @@ def run_benchmark(
             top1 = top5.iloc[0]
             daily_picks.append(
                 (
+                    target_date,
                     float(top1["next_oc_return"]),
                     int(top1["did_2pct_next"]),
                     float(top5["next_oc_return"].mean()),
@@ -96,7 +97,7 @@ def run_benchmark(
                 )
             )
         fold_growth = 1.0
-        for ret, _, _, _ in daily_picks[fold_pick_start:]:
+        for _, ret, _, _, _ in daily_picks[fold_pick_start:]:
             fold_growth *= 1 + ret - track.COST_ROUND_TRIP
         fold_top1_growth.append(round(fold_growth, 4))
         logger.info("fold %s..%s: %d train, %d test", month_start, month_end, len(train), len(test))
@@ -131,7 +132,9 @@ def run_benchmark(
     labels = pd.concat(all_labels).astype(int)
     base_rate = labels.mean()
     precision_at_n = float(pd.Series(daily_hits).mean())
-    picks = pd.DataFrame(daily_picks, columns=["top1_ret", "top1_hit", "top5_ret", "top5_hits"])
+    picks = pd.DataFrame(
+        daily_picks, columns=["target_date", "top1_ret", "top1_hit", "top5_ret", "top5_hits"]
+    )
     sim_top1 = float((1 + picks["top1_ret"] - track.COST_ROUND_TRIP).prod())
     sim_top5 = float((1 + picks["top5_ret"] - track.COST_ROUND_TRIP).prod())
     metrics = {
@@ -160,7 +163,7 @@ def run_benchmark(
         "folds": folds_run,
     }
     if record:
-        store.record_experiment(
+        seq = store.record_experiment(
             con,
             strategy=strategy_name,
             params={
@@ -174,4 +177,7 @@ def run_benchmark(
             test_end=folds[-1][1],
             metrics=metrics,
         )
+        # Per-day pick outcomes land in experiment_daily (dashboard SIM panel),
+        # never in the metrics JSON above.
+        store.record_experiment_daily(con, seq, picks)
     return metrics

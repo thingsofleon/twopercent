@@ -69,6 +69,74 @@ def test_save_predictions_idempotent(con):
     assert count == 3
 
 
+def _sim_daily(top1_ret, top1_hit, top5_ret, top5_hits):
+    dates = sorted(pd.bdate_range("2026-01-05", periods=len(top1_ret)).date)
+    return pd.DataFrame(
+        {
+            "target_date": dates,
+            "top1_ret": top1_ret,
+            "top1_hit": top1_hit,
+            "top5_ret": top5_ret,
+            "top5_hits": top5_hits,
+        }
+    )
+
+
+def test_sim_windows_exact_week_math():
+    # Adversarial (non-round) returns; hits as stored at benchmark time.
+    daily = _sim_daily(
+        top1_ret=[0.0203, -0.0117, 0.0329, 0.004, -0.0009],
+        top1_hit=[1, 0, 1, 0, 0],
+        top5_ret=[0.0041, -0.0023, 0.0107, 0.0013, -0.0051],
+        top5_hits=[0.2, 0.0, 0.4, 0.2, 0.0],
+    )
+    summary = track.sim_windows(daily)
+    assert summary.days_available == 5
+    assert [w["label"] for w in summary.windows] == ["1 week"]
+    week = summary.windows[0]
+    assert week["days"] == 5
+    # Hand-derived per-day multipliers: 1 + ret − COST_ROUND_TRIP (0.003).
+    expected_top1 = 1.0173 * 0.9853 * 1.0299 * 1.001 * 0.9961
+    expected_top5 = 1.0011 * 0.9947 * 1.0077 * 0.9983 * 0.9919
+    assert abs(week["top1_growth"] - expected_top1) < 1e-9
+    assert abs(week["top5_growth"] - expected_top5) < 1e-9
+    assert abs(week["top1_hit_rate"] - 2 / 5) < 1e-12
+    assert abs(week["top5_hit_rate"] - 0.16) < 1e-12
+
+
+def test_sim_windows_too_few_days_omits_but_reports_count():
+    daily = _sim_daily(
+        top1_ret=[0.0203, -0.0117, 0.0329, 0.004],
+        top1_hit=[1, 0, 1, 0],
+        top5_ret=[0.0041, -0.0023, 0.0107, 0.0013],
+        top5_hits=[0.2, 0.0, 0.4, 0.2],
+    )
+    summary = track.sim_windows(daily)
+    assert summary.windows == []  # 4 < 5: no window computed on a shorter span
+    assert summary.days_available == 4  # ...but the available count is still reported
+
+
+def test_sim_windows_use_trailing_rows_only():
+    # 21 days: 16 loud early days, then 5 quiet ones. The 1-week window must
+    # reflect ONLY the trailing 5, or it is silently a different window.
+    n_early = 16
+    daily = _sim_daily(
+        top1_ret=[0.0517] * n_early + [0.0007] * 5,
+        top1_hit=[1] * n_early + [0] * 5,
+        top5_ret=[0.0208] * n_early + [0.0003] * 5,
+        top5_hits=[0.8] * n_early + [0.0] * 5,
+    )
+    summary = track.sim_windows(daily)
+    assert summary.days_available == 21
+    assert [w["label"] for w in summary.windows] == ["1 week", "1 month"]
+    week = next(w for w in summary.windows if w["label"] == "1 week")
+    assert abs(week["top1_growth"] - (1 + 0.0007 - track.COST_ROUND_TRIP) ** 5) < 1e-9
+    assert week["top1_hit_rate"] == 0.0
+    month = next(w for w in summary.windows if w["label"] == "1 month")
+    assert week["top1_growth"] < 1 < month["top1_growth"]
+    assert abs(month["top5_hit_rate"] - (0.8 * 16) / 21) < 1e-12
+
+
 def test_save_predictions_rerun_replaces_whole_slice(con):
     # A re-run that scores FEWER symbols (liquidity floor kicked one out) must
     # not leave the dropped symbol behind as a phantom rank from the first save.

@@ -121,6 +121,72 @@ def test_all_universe_symbols_unions_snapshots(con):
     assert symbols[0] == "NVDA"  # largest cap first
 
 
+def _experiment(con, strategy="s", test_start=dt.date(2026, 1, 5), test_end=dt.date(2026, 2, 27)):
+    return store.record_experiment(
+        con,
+        strategy=strategy,
+        params={"months": 2},
+        train_start=dt.date(2025, 1, 2),
+        test_start=test_start,
+        test_end=test_end,
+        metrics={"lift": 1.5},
+    )
+
+
+def _daily_frame(dates, top1_ret):
+    n = len(dates)
+    return pd.DataFrame(
+        {
+            "target_date": dates,
+            "top1_ret": top1_ret,
+            "top1_hit": [1 if r >= 0.02 else 0 for r in top1_ret],
+            "top5_ret": [r / 2 for r in top1_ret],
+            "top5_hits": [0.2] * n,
+        }
+    )
+
+
+def test_record_experiment_returns_seq(con):
+    seq1 = _experiment(con)
+    seq2 = _experiment(con)
+    assert isinstance(seq1, int)
+    assert seq2 > seq1
+
+
+def test_latest_experiment_daily_none_when_no_daily_rows(con):
+    _experiment(con)  # aggregates only — predates the experiment_daily table
+    assert store.latest_experiment_daily(con, "s") is None
+
+
+def test_experiment_daily_roundtrip_picks_newest_with_rows(con):
+    dates = sorted(pd.bdate_range("2026-01-05", periods=3).date)
+    old_seq = _experiment(con)
+    store.record_experiment_daily(con, old_seq, _daily_frame(dates, [0.011, 0.024, -0.007]))
+    new_seq = _experiment(con)
+    store.record_experiment_daily(con, new_seq, _daily_frame(dates, [0.031, -0.013, 0.022]))
+    _experiment(con)  # newest of all, but no daily rows — must be skipped
+    other_seq = _experiment(con, strategy="other")
+    store.record_experiment_daily(con, other_seq, _daily_frame(dates, [0.09, 0.09, 0.09]))
+
+    result = store.latest_experiment_daily(con, "s")
+    assert result is not None
+    meta, daily = result
+    assert meta["seq"] == new_seq
+    assert meta["test_start"] == dt.date(2026, 1, 5)
+    assert meta["test_end"] == dt.date(2026, 2, 27)
+    assert meta["params"]["months"] == 2
+    assert len(daily) == 3
+    assert [pd.Timestamp(d).date() for d in daily["target_date"]] == dates
+    assert daily["top1_ret"].tolist() == [0.031, -0.013, 0.022]
+    assert daily["top1_hit"].tolist() == [1, 0, 1]
+
+
+def test_record_experiment_daily_empty_frame_is_noop(con):
+    seq = _experiment(con)
+    assert store.record_experiment_daily(con, seq, pd.DataFrame()) == 0
+    assert store.latest_experiment_daily(con, "s") is None
+
+
 def test_record_ingest_from_keeps_earliest(con):
     store.record_ingest_from(con, ["AAPL"], dt.date(2024, 1, 1))
     store.record_ingest_from(con, ["AAPL"], dt.date(2025, 1, 1))  # later; must not regress

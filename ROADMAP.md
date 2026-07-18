@@ -94,12 +94,34 @@ quality checks ran — and you only read the exception report.
 
 At solo scale: scheduled autonomy, not thousand-agent fleets.
 
-- Scheduled cloud agents (`/schedule`): pre-market run (~8:00 ET) produces the
-  day's dashboard; post-close run scores the day and appends to the track
-  record — no laptop open.
-- Closed loop: when the post-close scorer detects the model underperforming
-  its baseline for N days, it kicks off an investigation agent (feature
-  drift? data issue? regime change?) and files findings for review.
+Locked decisions (v1, 2026-07-18):
+
+- **Local systemd scheduling, not cloud runs.** The DuckDB store lives on
+  this box, so a cloud agent can't reach the data; scheduled cloud runs are
+  deferred until the data is off-box (revisit alongside a paid data API).
+- **Two-run cadence:** predict run weekdays 06:00 America/Denver (08:00 ET,
+  pre-open, `twopercent routine`); score run weekdays 14:45 America/Denver
+  (16:45 ET, post-close, `twopercent routine --mode score`). Score mode
+  refuses before 16:15 ET on weekdays; weekends may run — scoring time never
+  affects the live/late flag (that depends only on prediction creation time
+  vs the target day's 09:30 ET open).
+- **Degradation definition:** scored days of the top-20 daily basket (pinned
+  — a `--top` override never changes what the detector measures) with
+  `late == false`, ordered by target_date; with ≥5 such live days, DEGRADED
+  iff the mean lift over the most recent 5 is < 1.0 (epsilon-guarded:
+  strictly below by more than 1e-9, so FP noise at the boundary never fires
+  it). Fewer than 5 live days → the detector loudly reports it is not yet
+  armed. NULL-lift days (zero base rate) are excluded with a warning. The
+  per-day below-1.0 count is always disclosed alongside the mean (a single
+  lucky spike day can carry the mean past 1.0).
+- **Closed loop:** on DEGRADED the score run exits 2 and auto-files a GitHub
+  issue labeled `auto-degradation` (deduped — one open at a time) carrying
+  the evidence bundle (last 10 scored days, trailing-5 live lift, champion
+  benchmark metrics, universe age, doctor counts). The `investigator`
+  charter (.claude/agents/investigator.md) responds: read-only diagnosis,
+  classification (data problem / feature drift / regime change / genuine
+  model decay), findings as an issue comment plus scoped fix issues; it
+  never edits champion.json or the referee.
 - Your role: "keep prediction quality above X, keep data clean, surface
   anything unusual" — monitor by exception.
 
@@ -129,4 +151,8 @@ truth for *decisions and plan shape*; GitHub is the source of truth for
   Denver (08:00 ET, pre-open), Persistent=true. Caveats: WSL must be
   running and lingering enabled for unattended fire; predictions/track
   record now record universe snapshots and flag backfilled (late) days.
-- Level 4 — AI-native: scheduled cloud agents + closed loop #10
+- Level 4 — AI-native: **IN PROGRESS 2026-07-18** (#10). Shipped: `routine
+  --mode score` (post-close scoring run), trailing-5 live-lift degradation
+  detector, auto-filed `auto-degradation` investigation issue, investigator
+  agent charter. Exit criterion: a real degradation → investigation cycle
+  observed, or at minimum both timers proven live — NOT complete yet.

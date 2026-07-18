@@ -98,6 +98,13 @@ def benchmark_cmd(
     strategy: str = typer.Argument(None, help="Strategy name (default: champion)."),
     months: int = typer.Option(12, help="Test months (walk-forward, monthly retrain)."),
     top: int = typer.Option(20, help="Daily top-N for precision@N."),
+    record: bool = typer.Option(
+        True,
+        "--record/--no-record",
+        help="Record an experiments row. Use --no-record for diagnostic reruns "
+        "(e.g. degradation investigation) so they never pollute the table the "
+        "referee and auto-issues quote.",
+    ),
     db: Path = DbOption,
 ) -> None:
     """Walk-forward benchmark of a strategy; records an experiments row."""
@@ -109,7 +116,7 @@ def benchmark_cmd(
         typer.echo(f"Unknown strategy {name!r}. Available: {', '.join(strategies.names())}")
         raise typer.Exit(2)
     con = store.connect(db)
-    metrics = backtest.run_benchmark(con, name, months=months, top_n=top)
+    metrics = backtest.run_benchmark(con, name, months=months, top_n=top, record=record)
     typer.echo(f"Benchmark {name} over last {months} months (top-{top} daily):")
     for key, value in metrics.items():
         typer.echo(f"  {key:>15}: {value}")
@@ -233,18 +240,27 @@ def dashboard_cmd(
 
 @app.command("routine")
 def routine_cmd(
+    mode: str = typer.Option(
+        "predict",
+        "--mode",
+        help="predict = pre-open cycle (default); score = post-close scoring, "
+        "degradation detector, auto-filed investigation issue.",
+    ),
     out: Path = OutOption,
     top: int = typer.Option(20, help="Candidates for dashboard/scoring."),
     db: Path = DbOption,
 ) -> None:
-    """Run the morning cycle: doctor gate, ingest, predict, dashboard, summary.
+    """Run the daily cycle: doctor gate, ingest, then predict (pre-open) or score (post-close).
 
     Exit codes: 0 clean, 1 degraded (ran with warnings), 2 failed/aborted.
     """
     from twopercent import routine as routine_mod
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    report = routine_mod.run(db_path=db, out_path=str(out), top=top)
+    if mode not in ("predict", "score"):
+        typer.echo(f"Invalid --mode {mode!r}: expected 'predict' or 'score'.")
+        raise typer.Exit(2)
+    report = routine_mod.run(db_path=db, out_path=str(out), top=top, mode=mode)
     for line in report.summary_lines():
         typer.echo(line)
     raise typer.Exit(report.exit_code)

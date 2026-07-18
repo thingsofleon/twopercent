@@ -1,4 +1,5 @@
 import datetime as dt
+import logging
 
 import pandas as pd
 
@@ -248,3 +249,103 @@ def test_save_predictions_rerun_replaces_whole_slice(con):
     assert len(rows) == 19
     assert "S00" not in set(rows["symbol"])
     assert rows["rank"].tolist() == list(range(1, 20))  # contiguous, no phantom rank 1
+
+
+# --- degradation detector -----------------------------------------------------
+
+
+def _scored_frame(lifts, late=None, start="2026-06-01"):
+    """Craft a score_predictions-shaped frame with the given lifts, in
+    target_date order (NaN lift = zero-base-rate day)."""
+    n = len(lifts)
+    dates = pd.bdate_range(start, periods=n)
+    return pd.DataFrame(
+        {
+            "signal_date": dates - pd.tseries.offsets.BDay(1),
+            "target_date": dates,
+            "hits": [1] * n,
+            "n_scored": [20] * n,
+            "precision": [0.05] * n,
+            "base_rate": [0.10] * n,
+            "lift": lifts,
+            "late": [False] * n if late is None else late,
+        }
+    )
+
+
+def test_detector_fires_at_exactly_five_live_days():
+    verdict = track.degradation_verdict(_scored_frame([0.99] * 5))
+    assert verdict.degraded and verdict.armed
+    assert verdict.live_days == 5
+    assert abs(verdict.trailing_mean_lift - 0.99) < 1e-12
+    assert "DEGRADED" in verdict.detail
+
+
+def test_detector_epsilon_boundary_adversarial():
+    # Comparison rule (track._LIFT_DEGRADE_EPSILON): DEGRADED iff
+    # mean lift < 1.0 - 1e-9. A mean 1e-7 below 1.0 fires (far outside FP
+    # noise); a mean above never does; exactly 1.0 or within epsilon below
+    # resolves to NOT degraded — the detector never fires on rounding error.
+    assert track.degradation_verdict(_scored_frame([0.9999999] * 5)).degraded
+    assert not track.degradation_verdict(_scored_frame([1.0000001] * 5)).degraded
+    assert not track.degradation_verdict(_scored_frame([1.0] * 5)).degraded
+    assert not track.degradation_verdict(_scored_frame([1.0 - 1e-12] * 5)).degraded
+    # Pin the guard band itself: 2e-9 below 1.0 is strictly outside the 1e-9
+    # epsilon and fires; 0.5e-9 below is inside the band and must not.
+    assert track.degradation_verdict(_scored_frame([1.0 - 2e-9] * 5)).degraded
+    assert not track.degradation_verdict(_scored_frame([1.0 - 0.5e-9] * 5)).degraded
+
+
+def test_detector_not_armed_below_five_live_days():
+    verdict = track.degradation_verdict(_scored_frame([0.5] * 4))
+    assert not verdict.degraded and not verdict.armed
+    assert verdict.live_days == 4
+    assert verdict.trailing_mean_lift is None
+    assert "armed after 1 more live day" in verdict.detail  # loud, never silent
+
+
+def test_detector_excludes_late_days_from_window():
+    # 5 awful live days then 3 stellar LATE days (most recent) — a backfill
+    # with known outcomes must never mask a live degradation.
+    verdict = track.degradation_verdict(
+        _scored_frame([0.5] * 5 + [5.0] * 3, late=[False] * 5 + [True] * 3)
+    )
+    assert verdict.degraded and verdict.live_days == 5
+
+    # And late days never count TOWARD arming either: 3 live + 4 late = unarmed.
+    verdict = track.degradation_verdict(
+        _scored_frame(
+            [0.5, 5.0, 0.5, 5.0, 0.5, 5.0, 5.0],
+            late=[False, True, False, True, False, True, True],
+        )
+    )
+    assert not verdict.armed and verdict.live_days == 3
+
+
+def test_detector_discloses_days_below_one_when_mean_survives():
+    # False-negative mode of the mean: one lucky low-base-rate spike day
+    # (lift 5.0) carries four zero days to a mean of exactly 1.0. The locked
+    # trigger stays quiet — but the per-day count must not let it hide.
+    verdict = track.degradation_verdict(_scored_frame([0.0, 0.0, 0.0, 0.0, 5.0]))
+    assert not verdict.degraded and verdict.armed
+    assert verdict.days_below_1 == 4
+    assert "4 of 5 window day(s) below 1.0" in verdict.detail
+
+
+def test_detector_excludes_null_lift_days_with_warning(caplog):
+    # Most recent live day has NULL lift (zero base rate): excluded loudly,
+    # the window falls back to the 5 defined-lift days.
+    frame = _scored_frame([0.5] * 5 + [float("nan")])
+    with caplog.at_level(logging.WARNING, logger="twopercent.track"):
+        verdict = track.degradation_verdict(frame)
+    assert verdict.degraded and verdict.live_days == 5
+    assert verdict.excluded_null_lift == 1
+    assert "NULL lift" in caplog.text
+    assert "zero-base-rate" in verdict.detail
+
+
+def test_detector_empty_track_record_reports_unarmed():
+    verdict = track.degradation_verdict(pd.DataFrame())
+    assert not verdict.degraded and not verdict.armed
+    assert verdict.live_days == 0
+    assert "armed after 5 more live day" in verdict.detail

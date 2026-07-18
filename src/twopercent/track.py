@@ -10,6 +10,89 @@ import pandas as pd
 from twopercent import store
 from twopercent.scan import _THRESHOLD_EPSILON, DEFAULT_THRESHOLD
 
+# Assumed round-trip trading cost (entry + exit) per daily position, applied
+# to every simulated day. 30 bps is a deliberate, documented GUESS pitched for
+# liquid-ish small caps at open/close; real spreads on thin names can be far
+# worse. The simulation is an upper bound on execution quality, not a promise.
+COST_ROUND_TRIP = 0.003
+
+
+@dataclass
+class PickPerformance:
+    """Per-day realized outcomes of the top-ranked picks, plus summaries."""
+
+    daily: pd.DataFrame  # target_date, top1_symbol, top1_return, top1_hit,
+    # topn_return (equal-weight over available ranks), topn_hits, n_avail, late
+
+    @property
+    def days(self) -> int:
+        return len(self.daily)
+
+    def precision_at_1(self) -> float | None:
+        return float(self.daily["top1_hit"].mean()) if self.days else None
+
+    def growth(self, column: str = "top1_return") -> float | None:
+        """Growth of $1 compounding `column` daily, net of COST_ROUND_TRIP."""
+        if not self.days:
+            return None
+        return float((1 + self.daily[column] - COST_ROUND_TRIP).prod())
+
+
+def daily_pick_performance(
+    con: duckdb.DuckDBPyConnection, strategy: str, top_n: int = 5
+) -> PickPerformance:
+    """Realized open-to-close returns of the logged rank-1 and top-N picks.
+
+    A pick whose target-day bar is missing (delisted/halted/repaired) is
+    excluded from that day's basket; `top1` means the best-ranked pick that
+    ACTUALLY TRADED (a trader finding rank 1 halted at the open takes the
+    next name). n_avail records how many of the top-N traded; days with no
+    tradeable picks are dropped from the simulation."""
+    threshold = DEFAULT_THRESHOLD - _THRESHOLD_EPSILON
+    daily = con.execute(
+        """
+        WITH days AS (SELECT DISTINCT date FROM daily_returns),
+        resolved AS (
+            SELECT p.signal_date, min(d.date) AS target_date
+            FROM (SELECT DISTINCT signal_date FROM predictions WHERE strategy = ?) p
+            JOIN days d ON d.date > p.signal_date GROUP BY p.signal_date
+        ),
+        picks AS (
+            SELECT r.target_date, pr.rank, pr.symbol, dr.oc_return
+            FROM predictions pr
+            JOIN resolved r ON pr.signal_date = r.signal_date
+            JOIN daily_returns dr ON dr.symbol = pr.symbol AND dr.date = r.target_date
+            WHERE pr.strategy = ? AND pr.rank <= ?
+        )
+        SELECT
+            target_date,
+            arg_min(symbol, rank) AS top1_symbol,
+            arg_min(oc_return, rank) AS top1_return,
+            CASE WHEN arg_min(oc_return, rank) >= ? THEN 1 ELSE 0 END AS top1_hit,
+            avg(oc_return) AS topn_return,
+            sum(CASE WHEN oc_return >= ? THEN 1 ELSE 0 END) AS topn_hits,
+            count(*) AS n_avail
+        FROM picks
+        GROUP BY target_date
+        ORDER BY target_date
+        """,
+        [strategy, strategy, top_n, threshold, threshold],
+    ).df()
+    if not daily.empty:
+        created = dict(
+            con.execute(
+                "SELECT min(d.date), max(pr.created_ts) FROM predictions pr "
+                "JOIN (SELECT DISTINCT date FROM daily_returns) d ON d.date > pr.signal_date "
+                "WHERE pr.strategy = ? GROUP BY pr.signal_date",
+                [strategy],
+            ).fetchall()
+        )
+        daily["late"] = [
+            created.get(pd.Timestamp(td).date(), pd.Timestamp.min).date() > pd.Timestamp(td).date()
+            for td in daily["target_date"]
+        ]
+    return PickPerformance(daily=daily)
+
 
 @dataclass
 class TrackRecord:

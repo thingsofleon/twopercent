@@ -15,7 +15,7 @@ import duckdb
 import pandas as pd
 from sklearn.metrics import brier_score_loss, roc_auc_score
 
-from twopercent import store, strategies
+from twopercent import store, strategies, track
 from twopercent.features import feature_frame
 from twopercent.predict import LIQUIDITY_MIN_MEDIAN_VOLUME
 
@@ -53,6 +53,7 @@ def run_benchmark(
     folds_run = 0
     floored_row_days = 0
     unscoreable_days = 0
+    daily_picks: list[tuple[float, int, float, float]] = []
 
     for month_start, month_end in folds:
         train = labeled[labeled["target_date"] < month_start]
@@ -82,6 +83,16 @@ def run_benchmark(
                 continue
             top = eligible.nlargest(top_n, "prob")
             daily_hits.append(top["did_2pct_next"].mean())
+            top5 = eligible.nlargest(5, "prob")
+            top1 = top5.iloc[0]
+            daily_picks.append(
+                (
+                    float(top1["next_oc_return"]),
+                    int(top1["did_2pct_next"]),
+                    float(top5["next_oc_return"].mean()),
+                    float(top5["did_2pct_next"].mean()),
+                )
+            )
         logger.info("fold %s..%s: %d train, %d test", month_start, month_end, len(train), len(test))
 
     if not all_probs:
@@ -114,6 +125,9 @@ def run_benchmark(
     labels = pd.concat(all_labels).astype(int)
     base_rate = labels.mean()
     precision_at_n = float(pd.Series(daily_hits).mean())
+    picks = pd.DataFrame(daily_picks, columns=["top1_ret", "top1_hit", "top5_ret", "top5_hits"])
+    sim_top1 = float((1 + picks["top1_ret"] - track.COST_ROUND_TRIP).prod())
+    sim_top5 = float((1 + picks["top5_ret"] - track.COST_ROUND_TRIP).prod())
     metrics = {
         "precision_at_n": round(precision_at_n, 4),
         "top_n": top_n,
@@ -121,6 +135,14 @@ def run_benchmark(
         "lift": round(precision_at_n / base_rate, 3) if base_rate > 0 else None,
         "auc": round(float(roc_auc_score(labels, probs)), 4) if labels.nunique() > 1 else None,
         "brier": round(float(brier_score_loss(labels, probs)), 5),
+        "precision_at_1": round(float(picks["top1_hit"].mean()), 4),
+        "precision_at_5": round(float(picks["top5_hits"].mean()), 4),
+        # Growth of $1 trading the daily pick(s) open-to-close over the whole
+        # test window, net of track.COST_ROUND_TRIP per day. An execution
+        # upper bound (assumed costs, perfect fills at open/close) — see
+        # track.py for the cost caveat.
+        "sim_top1_growth": round(sim_top1, 4),
+        "sim_top5_growth": round(sim_top5, 4),
         "test_rows": int(len(labels)),
         "test_days": len(daily_hits),
         "folds": folds_run,

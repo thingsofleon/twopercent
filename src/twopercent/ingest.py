@@ -22,6 +22,15 @@ RETRY_BACKOFF_SECONDS = 5.0
 # A symbol is considered current when its last stored bar is at least this
 # close to the requested window end.
 CURRENT_WITHIN_DAYS = 4
+# Split-artifact rejection (issue #25): yfinance sometimes serves a bar whose
+# open is on the pre-split price scale while the close is post-split (e.g.
+# DRUG 2024-10-15, +1369% "intraday"). A bar is rejected when BOTH its
+# open-to-close move is extreme AND its open sits on a different price scale
+# than the PRIOR bar's close. Deliberately conservative: a genuine extreme
+# move with a continuous open is never touched; only same-bar and prior-bar
+# data are consulted (no lookahead).
+SPLIT_ARTIFACT_OC = 0.5
+SPLIT_ARTIFACT_SCALE = 2.0
 
 
 @dataclass
@@ -46,11 +55,27 @@ def frames_to_rows(data: pd.DataFrame, yf_to_symbol: dict[str, str]) -> pd.DataF
             raise ValueError("expected group_by='ticker' MultiIndex columns")
     out: list[pd.DataFrame] = []
     dropped_invalid = 0
+    dropped_split = 0
+    split_symbols: list[str] = []
     for yf_sym in data.columns.get_level_values(0).unique():
         sub = data[yf_sym].dropna(subset=["Open", "Close"], how="any")
         valid = (sub["Open"] > 0) & np.isfinite(sub["Open"]) & np.isfinite(sub["Close"])
         dropped_invalid += int((~valid).sum())
         sub = sub[valid]
+        if sub.empty:
+            continue
+        oc_return = (sub["Close"] - sub["Open"]) / sub["Open"]
+        prev_close = sub["Close"].shift(1)
+        scale = sub["Open"] / prev_close
+        artifact = (
+            (oc_return.abs() > SPLIT_ARTIFACT_OC)
+            & (prev_close > 0)
+            & ((scale > SPLIT_ARTIFACT_SCALE) | (scale < 1 / SPLIT_ARTIFACT_SCALE))
+        )
+        if artifact.any():
+            dropped_split += int(artifact.sum())
+            split_symbols.append(yf_to_symbol[yf_sym])
+            sub = sub[~artifact]
         if sub.empty:
             continue
         frame = pd.DataFrame(
@@ -69,6 +94,14 @@ def frames_to_rows(data: pd.DataFrame, yf_to_symbol: dict[str, str]) -> pd.DataF
     if dropped_invalid:
         logger.warning(
             "%d rows dropped for invalid open/close (<=0 or non-finite)", dropped_invalid
+        )
+    if dropped_split:
+        logger.warning(
+            "%d bars dropped as split artifacts (|oc_return| > %.0f%% with open "
+            "off-scale vs prior close): %s",
+            dropped_split,
+            SPLIT_ARTIFACT_OC * 100,
+            ", ".join(sorted(split_symbols)),
         )
     if not out:
         return pd.DataFrame(

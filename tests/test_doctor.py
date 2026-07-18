@@ -258,6 +258,108 @@ def test_missing_universe_warns_but_does_not_fail(con):
     assert "no universe stored" in text
 
 
+@pytest.fixture
+def with_artifact(con):
+    """A store with exactly one split artifact plus decoys the rule must skip.
+
+    - SPLITX: mid-history bar rewritten to open=1000/close=101 — open 10x the
+      prior close AND -90% intraday → the one true artifact
+    - WILD:   genuine +60% bar with a continuous open → extreme, not an artifact
+    - FIRSTX: FIRST bar rewritten to the same broken shape — no prior close,
+      so it must never be flagged
+    """
+    wild = [0.01] * 10
+    wild[5] = 0.60
+    seed_history(
+        con, {"OKAY": [0.01] * 10, "WILD": wild, "SPLITX": [0.01] * 10, "FIRSTX": [0.01] * 10}
+    )
+    con.execute(
+        """
+        UPDATE prices SET open = 1000.0, high = 1000.0, low = 100.0, close = 101.0
+        WHERE symbol = 'SPLITX' AND date = DATE '2026-01-12'
+        """
+    )
+    con.execute(
+        """
+        UPDATE prices SET open = 1000.0, high = 1000.0, low = 100.0, close = 101.0
+        WHERE symbol = 'FIRSTX' AND date = DATE '2026-01-05'
+        """
+    )
+    return con
+
+
+def test_split_artifacts_flags_scale_break_only(with_artifact):
+    flagged = doctor.split_artifacts(with_artifact)
+    assert len(flagged) == 1
+    row = flagged.iloc[0]
+    assert row["symbol"] == "SPLITX"
+    assert row["date"].date() == dt.date(2026, 1, 12)
+    assert row["oc_return"] == pytest.approx(-0.899)
+    # decoys stayed invisible: genuine extreme move and first-bar-of-symbol
+    assert "WILD" not in flagged["symbol"].tolist()
+    assert "FIRSTX" not in flagged["symbol"].tolist()
+
+
+def test_split_artifacts_nan_prev_close_not_flagged(with_artifact):
+    # DuckDB total ordering: NaN/prev_close > 2 is TRUE without an isfinite
+    # guard — a NaN prior close must not flag the (genuine) bar after it.
+    with_artifact.execute(
+        """
+        UPDATE prices SET close = CAST('nan' AS DOUBLE)
+        WHERE symbol = 'WILD' AND date = DATE '2026-01-09'
+        """
+    )
+    flagged = doctor.split_artifacts(with_artifact)
+    assert flagged["symbol"].tolist() == ["SPLITX"]
+
+
+def test_repair_splits_deletes_exactly_the_artifact(with_artifact, caplog):
+    before = store.price_row_count(with_artifact)
+    removed = doctor.repair_splits(with_artifact)
+
+    assert removed["symbol"].tolist() == ["SPLITX"]
+    assert store.price_row_count(with_artifact) == before - 1
+    gone = with_artifact.execute(
+        "SELECT count(*) FROM prices WHERE symbol = 'SPLITX' AND date = DATE '2026-01-12'"
+    ).fetchone()[0]
+    assert gone == 0
+    assert "1 split-artifact bars deleted" in caplog.text
+    # the genuine extreme bar survived the repair
+    ext = doctor.extreme_bars(with_artifact)
+    assert ("WILD", dt.date(2026, 1, 12)) in {(r.symbol, r.date.date()) for r in ext.itertuples()}
+    # idempotent: nothing left to find or delete
+    assert doctor.repair_splits(with_artifact).empty
+    assert store.price_row_count(with_artifact) == before - 1
+
+
+def test_cli_doctor_without_flag_is_read_only(with_artifact, tmp_path):
+    before = store.price_row_count(with_artifact)
+    with_artifact.close()
+    db = str(tmp_path / "test.duckdb")
+    result = runner.invoke(app, ["doctor", "--db", db])
+    assert result.exit_code == 1  # artifact shows up as an extreme bar
+    assert "repair-splits" not in result.output
+    con = store.connect(db)
+    assert store.price_row_count(con) == before
+
+
+def test_cli_doctor_repair_splits_prints_and_deletes(with_artifact, tmp_path):
+    before = store.price_row_count(with_artifact)
+    with_artifact.close()
+    db = str(tmp_path / "test.duckdb")
+    result = runner.invoke(app, ["doctor", "--db", db, "--repair-splits"])
+    assert "repair-splits: deleted 1 split-artifact bars:" in result.output
+    assert "SPLITX" in result.output
+    assert "2026-01-12" in result.output
+    assert "-89.9%" in result.output
+    con = store.connect(db)
+    assert store.price_row_count(con) == before - 1
+    con.close()
+    # second run: nothing left, loudly says so
+    again = runner.invoke(app, ["doctor", "--db", db, "--repair-splits"])
+    assert "repair-splits: no split artifacts found" in again.output
+
+
 def test_cli_exits_1_and_reports_on_defects(defective, tmp_path):
     defective.close()
     result = runner.invoke(app, ["doctor", "--db", str(tmp_path / "test.duckdb")])

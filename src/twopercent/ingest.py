@@ -36,12 +36,16 @@ SPLIT_ARTIFACT_SCALE = 2.0
 _SPLIT_EPSILON = 1e-9
 
 
+DORMANT_AFTER_DAYS = 30
+
+
 @dataclass
 class IngestResult:
     rows_written: int = 0
     symbols_ok: list[str] = field(default_factory=list)
     symbols_skipped: list[str] = field(default_factory=list)
     symbols_failed: list[str] = field(default_factory=list)
+    symbols_dormant: list[str] = field(default_factory=list)
 
 
 def to_yf_symbol(symbol: str) -> str:
@@ -188,17 +192,32 @@ def ingest(
     last_dates = {sym: bar[0] for sym, bar in last_bars.items()}
     covered_from = store.ingest_from_dates(con)
 
+    dormant_cutoff = end - dt.timedelta(days=DORMANT_AFTER_DAYS)
     plan: list[tuple[str, dt.date]] = []  # (symbol, fetch start)
     for sym in symbols:
         last = last_dates.get(sym)
         covers_start = covered_from.get(sym) is not None and covered_from[sym] <= start
-        if covers_start and last is not None:
+        if covers_start and last is not None and last < dormant_cutoff:
+            # Delisted/halted names kept for history: requesting their empty
+            # tail every day would count as a "failure" forever and train
+            # operators to ignore the failure-rate gate. Excluded loudly; a
+            # full backfill (fresh ingest_meta) still refetches them.
+            result.symbols_dormant.append(sym)
+        elif covers_start and last is not None:
             # Always refetch from the LAST stored bar inclusive — never skip.
             # The one bar a same-day skip would preserve is exactly the one
             # that can be a partial (mid-session) bar; refetching heals it.
             plan.append((sym, last))
         else:
             plan.append((sym, start))
+    if result.symbols_dormant:
+        logger.warning(
+            "%d symbols dormant (no bar in %d days) — not fetched: %s%s",
+            len(result.symbols_dormant),
+            DORMANT_AFTER_DAYS,
+            ", ".join(result.symbols_dormant[:10]),
+            " ..." if len(result.symbols_dormant) > 10 else "",
+        )
     # Sort by fetch start so tail-fetches batch together instead of dragging a
     # full-history window for the whole batch.
     plan.sort(key=lambda item: item[1])

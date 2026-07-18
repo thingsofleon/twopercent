@@ -309,6 +309,86 @@ def daily_pick_performance(
     return PickPerformance(daily=daily)
 
 
+# Trailing window (in LIVE scored days) for the degradation detector.
+DEGRADATION_WINDOW = 5
+# Comparison rule: DEGRADED iff mean lift < 1.0 − 1e-9 — strictly below the
+# baseline by more than FP noise. A mean within epsilon of 1.0 (or above)
+# is NOT degraded, so the detector never fires on rounding error alone.
+_LIFT_DEGRADE_EPSILON = 1e-9
+
+
+@dataclass
+class DegradationVerdict:
+    """Outcome of the post-close degradation check over the scored track record."""
+
+    degraded: bool
+    armed: bool  # enough live days for the window to be meaningful
+    live_days: int
+    window: int
+    trailing_mean_lift: float | None  # None until armed
+    excluded_null_lift: int
+    detail: str
+
+
+def degradation_verdict(
+    scored: pd.DataFrame, window: int = DEGRADATION_WINDOW
+) -> DegradationVerdict:
+    """Is the champion underperforming its baseline on recent LIVE days?
+
+    Live days only (`late == False`), ordered by target_date: late/backfilled
+    days have known outcomes, so including them would let a backfill mask or
+    manufacture a degradation. Days with NULL lift (zero base rate — lift is
+    undefined, not zero) are excluded with a loud warning. Fewer than `window`
+    live days means the detector is not yet armed and SAYS so — it never
+    silently reports healthy.
+    """
+    excluded = 0
+    if scored.empty:
+        live = scored
+    else:
+        ordered = scored.sort_values("target_date")
+        live = ordered[~ordered["late"].astype(bool)]
+        has_lift = live["lift"].notna()
+        excluded = int((~has_lift).sum())
+        if excluded:
+            logger.warning(
+                "degradation detector: excluded %d live day(s) with NULL lift "
+                "(zero base rate) from the trailing window",
+                excluded,
+            )
+        live = live[has_lift]
+    n = len(live)
+    suffix = f"; {excluded} zero-base-rate day(s) excluded" if excluded else ""
+    if n < window:
+        so_far = f", mean live lift so far {float(live['lift'].mean()):.7g}" if n else ""
+        return DegradationVerdict(
+            degraded=False,
+            armed=False,
+            live_days=n,
+            window=window,
+            trailing_mean_lift=None,
+            excluded_null_lift=excluded,
+            detail=(
+                f"armed after {window - n} more live day(s) — {n}/{window} live days "
+                f"scored{so_far}; detector cannot fire yet{suffix}"
+            ),
+        )
+    mean_lift = float(live["lift"].tail(window).astype(float).mean())
+    degraded = mean_lift < 1.0 - _LIFT_DEGRADE_EPSILON
+    state = "DEGRADED" if degraded else "not degraded"
+    return DegradationVerdict(
+        degraded=degraded,
+        armed=True,
+        live_days=n,
+        window=window,
+        trailing_mean_lift=mean_lift,
+        excluded_null_lift=excluded,
+        detail=(
+            f"{state}: trailing-{window} live mean lift {mean_lift:.7g} vs baseline 1.0{suffix}"
+        ),
+    )
+
+
 @dataclass
 class TrackRecord:
     scored: pd.DataFrame  # one row per scoreable signal_date; `late` column marks

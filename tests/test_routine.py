@@ -197,6 +197,15 @@ def test_predictions_record_universe_snapshot(ready):
     assert as_of == [(CLOSED.date(),)]
 
 
+def test_predict_mode_explicit_runs_predict_and_no_detector(ready):
+    # Level 4 regression: --mode predict (and bare routine, above) is the
+    # pre-open cycle — champion predict runs, score-mode steps never appear.
+    report = routine.run(db_path=_db(ready), mode="predict")
+    names = [s.name for s in report.steps]
+    assert "predict" in names
+    assert not {"score", "detector", "issue"} & set(names)
+
+
 def test_summary_lines_shape(ready):
     report = routine.run(db_path=_db(ready))
     lines = report.summary_lines()

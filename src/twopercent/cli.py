@@ -231,6 +231,25 @@ def dashboard_cmd(
     typer.echo(f"Dashboard written to {path}")
 
 
+@app.command("routine")
+def routine_cmd(
+    out: Path = OutOption,
+    top: int = typer.Option(20, help="Candidates for dashboard/scoring."),
+    db: Path = DbOption,
+) -> None:
+    """Run the morning cycle: doctor gate, ingest, predict, dashboard, summary.
+
+    Exit codes: 0 clean, 1 degraded (ran with warnings), 2 failed/aborted.
+    """
+    from twopercent import routine as routine_mod
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    report = routine_mod.run(db_path=db, out_path=str(out), top=top)
+    for line in report.summary_lines():
+        typer.echo(line)
+    raise typer.Exit(report.exit_code)
+
+
 @app.command("experiments")
 def experiments_cmd(
     limit: int = typer.Option(10, help="How many recent runs to show."),

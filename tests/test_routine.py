@@ -69,6 +69,7 @@ def test_market_hours_boundaries():
 
     def mk(d, h, m):
         return dt.datetime(d.year, d.month, d.day, h, m, tzinfo=routine._EASTERN)
+
     assert routine._market_is_open(mk(friday, 9, 25))
     assert routine._market_is_open(mk(friday, 16, 14))
     assert not routine._market_is_open(mk(friday, 9, 24))

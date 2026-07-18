@@ -17,10 +17,10 @@ def _db(con) -> str:
 def ready(con, monkeypatch):
     """A healthy seeded store, clock pre-open, network steps stubbed out."""
     seed_planted(con, n_each=10)
-    con.execute("UPDATE universe SET as_of = ?", [dt.date.today()])
-    # Keep the store's newest bar inside the freshness window.
-    span = (dt.date.today() - pd.Timestamp("2026-01-05").date()).days
-    con.execute(f"UPDATE prices SET date = date + INTERVAL {span - 141} DAY")
+    con.execute("UPDATE universe SET as_of = ?", [CLOSED.date()])
+    # Newest bar lands 3 days before the pinned clock — deterministic forever.
+    span = (CLOSED.date() - pd.Timestamp("2026-01-05").date()).days
+    con.execute(f"UPDATE prices SET date = date + INTERVAL {span - 137} DAY")
     monkeypatch.setattr(routine, "_now_eastern", lambda: CLOSED)
     monkeypatch.setattr(
         routine.ingest,
@@ -123,8 +123,8 @@ def test_routine_preexisting_problems_warn_but_run(ready):
 
 
 def test_routine_staleness_gate(ready):
-    # Age the store by dropping everything newer than 60 days ago.
-    ready.execute("DELETE FROM prices WHERE date > current_date - INTERVAL 60 DAY")
+    # Age the store by dropping everything newer than 60 days before the pinned clock.
+    ready.execute("DELETE FROM prices WHERE date > ?", [CLOSED.date() - dt.timedelta(days=60)])
     report = routine.run(db_path=_db(ready))
     assert report.status == "fail"
     assert report.steps[-1].name == "freshness"
@@ -161,7 +161,7 @@ def test_routine_unaccounted_symbols_fail(ready, monkeypatch):
 
 
 def test_routine_universe_refresh_failure_degrades_not_aborts(ready, monkeypatch):
-    ready.execute("UPDATE universe SET as_of = ?", [dt.date.today() - dt.timedelta(days=30)])
+    ready.execute("UPDATE universe SET as_of = ?", [CLOSED.date() - dt.timedelta(days=30)])
 
     def broken_refresh(**kw):
         raise RuntimeError("screener down")
@@ -176,7 +176,7 @@ def test_routine_universe_refresh_failure_degrades_not_aborts(ready, monkeypatch
 
 
 def test_routine_stale_universe_triggers_refresh(ready, monkeypatch):
-    ready.execute("UPDATE universe SET as_of = ?", [dt.date.today() - dt.timedelta(days=30)])
+    ready.execute("UPDATE universe SET as_of = ?", [CLOSED.date() - dt.timedelta(days=30)])
     called = {}
 
     def fake_refresh(**kw):
@@ -188,13 +188,13 @@ def test_routine_stale_universe_triggers_refresh(ready, monkeypatch):
     monkeypatch.setattr(routine.universe, "refresh_universe", fake_refresh)
     routine.run(db_path=_db(ready))
     assert called.get("yes")
-    assert store.latest_universe(ready)["as_of"].iloc[0].date() == dt.date.today()
+    assert store.latest_universe(ready)["as_of"].iloc[0].date() == CLOSED.date()
 
 
 def test_predictions_record_universe_snapshot(ready):
     routine.run(db_path=_db(ready))
     as_of = ready.execute("SELECT DISTINCT universe_as_of FROM predictions").fetchall()
-    assert as_of == [(dt.date.today(),)]
+    assert as_of == [(CLOSED.date(),)]
 
 
 def test_summary_lines_shape(ready):

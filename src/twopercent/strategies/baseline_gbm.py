@@ -22,6 +22,7 @@ class BaselineGBM:
             max_iter=150, learning_rate=0.1, random_state=42
         )
         self._columns: list[str] = list(FEATURE_COLUMNS)
+        self.dropped_columns: list[str] = []
 
     def fit(self, train: pd.DataFrame) -> None:
         empty = [col for col in FEATURE_COLUMNS if train[col].notna().sum() == 0]
@@ -38,6 +39,7 @@ class BaselineGBM:
                 len(empty),
                 ", ".join(empty),
             )
+        self.dropped_columns = empty
         self._columns = [col for col in FEATURE_COLUMNS if col not in empty]
         self._model.fit(train[self._columns], train["did_2pct_next"])
 

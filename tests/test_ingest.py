@@ -199,15 +199,17 @@ def test_ingest_writes_and_reports(con, download_calls):
     assert store.price_row_count(con) == 10
 
 
-def test_ingest_skips_only_fully_covered_symbols(con, download_calls):
+def test_ingest_always_refetches_last_bar_even_when_current(con, download_calls):
+    # No skip path: a same-day bar could be a partial from a mid-session run,
+    # so even a fully-covered current symbol refetches from its last bar.
     today = dt.date.today()
     _seed_price(con, "AAPL", today)
     store.record_ingest_from(con, ["AAPL"], dt.date(2000, 1, 1))
 
     result = ingest.ingest(con, ["AAPL", "NVDA"], years=1)
 
-    assert result.symbols_skipped == ["AAPL"]
-    assert [c[0] for c in download_calls] == [["NVDA"]]  # AAPL never re-downloaded
+    assert result.symbols_skipped == []
+    assert download_calls[0][0] == ["AAPL", "NVDA"]  # AAPL re-downloaded, not skipped
 
 
 def test_ingest_backfills_when_prior_run_was_shorter(con, download_calls):
@@ -239,16 +241,16 @@ def test_ingest_historical_window_ignores_todays_freshness(con, download_calls):
     )
 
 
-def test_ingest_fetches_only_missing_tail(con, download_calls):
-    # Covered-from-start but stale symbols fetch from their last bar forward,
-    # not the whole window again.
+def test_ingest_fetches_tail_including_last_bar(con, download_calls):
+    # Covered-from-start but stale symbols fetch from their LAST stored bar
+    # (inclusive) — refetching it heals partial bars from mid-session runs.
     last = dt.date.today() - dt.timedelta(days=30)
     _seed_price(con, "AAPL", last)
     store.record_ingest_from(con, ["AAPL"], dt.date(2000, 1, 1))
 
     ingest.ingest(con, ["AAPL"], years=1)
 
-    assert download_calls[0][1] == (last + dt.timedelta(days=1)).isoformat()
+    assert download_calls[0][1] == last.isoformat()
 
 
 def test_ingest_continues_after_postprocessing_error(con, monkeypatch, download_calls):

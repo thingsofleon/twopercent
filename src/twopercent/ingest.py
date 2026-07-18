@@ -19,9 +19,6 @@ logger = logging.getLogger(__name__)
 BATCH_SIZE = 150
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 5.0
-# A symbol is considered current when its last stored bar is at least this
-# close to the requested window end.
-CURRENT_WITHIN_DAYS = 4
 # Split-artifact rejection (issue #25): yfinance sometimes serves a bar whose
 # open is on the pre-split price scale while the close is post-split (e.g.
 # DRUG 2024-10-15, +1369% "intraday"). A bar is rejected when BOTH its
@@ -176,11 +173,12 @@ def ingest(
 ) -> IngestResult:
     """Download daily bars for `symbols` and upsert into the store.
 
-    A symbol is skipped only when its stored coverage spans the requested
-    window: ingested from at or before `start` (tracked in ingest_meta) AND
-    with a last bar close to `end`. Symbols covered from `start` but stale at
-    the end fetch only the missing tail; everything else fetches the full
-    window. Interrupted or shorter prior runs therefore never block a backfill.
+    Symbols covered from `start` (tracked in ingest_meta) tail-fetch from
+    their LAST stored bar inclusive — never skipped, so a partial bar from a
+    mid-session run is healed by the next run's overwrite. Everything else
+    fetches the full window; interrupted or shorter prior runs never block a
+    backfill. The last stored close per symbol seeds split-artifact detection
+    for the first bar of each tail fetch.
     """
     end = end or dt.date.today() + dt.timedelta(days=1)
     start = end - dt.timedelta(days=round(years * 365.25))
@@ -189,16 +187,16 @@ def ingest(
     last_bars = store.last_price_bars(con)
     last_dates = {sym: bar[0] for sym, bar in last_bars.items()}
     covered_from = store.ingest_from_dates(con)
-    end_cutoff = end - dt.timedelta(days=CURRENT_WITHIN_DAYS)
 
     plan: list[tuple[str, dt.date]] = []  # (symbol, fetch start)
     for sym in symbols:
         last = last_dates.get(sym)
         covers_start = covered_from.get(sym) is not None and covered_from[sym] <= start
-        if covers_start and last is not None and last >= end_cutoff:
-            result.symbols_skipped.append(sym)
-        elif covers_start and last is not None:
-            plan.append((sym, last + dt.timedelta(days=1)))
+        if covers_start and last is not None:
+            # Always refetch from the LAST stored bar inclusive — never skip.
+            # The one bar a same-day skip would preserve is exactly the one
+            # that can be a partial (mid-session) bar; refetching heals it.
+            plan.append((sym, last))
         else:
             plan.append((sym, start))
     # Sort by fetch start so tail-fetches batch together instead of dragging a

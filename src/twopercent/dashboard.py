@@ -255,7 +255,13 @@ def build_html(
             f'<td class="{"pos" if r.lift >= 1 else "neg"}">{r.lift:.2f}×</td></tr>'
             for r in record.scored.itertuples()
         )
-        body = (
+        late_note = ""
+        if record.late_days:
+            late_note = (
+                f'<p class="sub"><b>{record.late_days} of {len(record.scored)} days '
+                "were backfilled after the fact</b> — not live forecasting skill.</p>"
+            )
+        body = late_note + (
             f"<div class='card'>{_chart_svg(record.scored)}</div>"
             + "<div class='card'><table><tr><th>Day</th><th>Hits</th><th>Hit rate</th>"
             + f"<th>Base rate</th><th>Lift</th></tr>{trs}</table></div>"
@@ -281,8 +287,11 @@ def render(
     strategy_name: str,
     out_path: str,
     top: int = 20,
+    result: PredictResult | None = None,
 ) -> str:
-    result = predict_for(con, strategy_name, save=True)
+    """Render the dashboard; pass a precomputed PredictResult to avoid retraining."""
+    if result is None:
+        result = predict_for(con, strategy_name, save=True)
     content = build_html(con, result, top=top)
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(content)

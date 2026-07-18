@@ -222,6 +222,21 @@ def ingest(
     # full-history window for the whole batch.
     plan.sort(key=lambda item: item[1])
 
+    planned_start = dict(plan)
+
+    def classify_missing(syms: list[str]) -> None:
+        # A symbol that returned nothing but whose stored last bar already
+        # covers its requested start is current-with-retained-bar, not failed:
+        # refetch-empties happen in bursts (provider rate limiting reads as
+        # "possibly delisted") and would otherwise trip the routine's failure
+        # gate on healthy data. We keep the stored bar and count it loudly.
+        for s in syms:
+            last = last_dates.get(s)
+            if last is not None and last >= planned_start[s]:
+                result.symbols_skipped.append(s)
+            else:
+                result.symbols_failed.append(s)
+
     n_batches = -(-len(plan) // batch_size)
     for i in range(0, len(plan), batch_size):
         batch = plan[i : i + batch_size]
@@ -235,11 +250,11 @@ def ingest(
             got = set(rows["symbol"].unique())
         except Exception:
             logger.exception("batch %s..%s failed", batch_syms[0], batch_syms[-1])
-            result.symbols_failed.extend(batch_syms)
+            classify_missing(batch_syms)
             continue
         ok = [s for s in batch_syms if s in got]
         result.symbols_ok.extend(ok)
-        result.symbols_failed.extend(s for s in batch_syms if s not in got)
+        classify_missing([s for s in batch_syms if s not in got])
         store.record_ingest_from(con, ok, start)
         logger.info(
             "batch %d/%d: %d rows, %d/%d symbols",

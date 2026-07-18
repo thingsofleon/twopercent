@@ -70,14 +70,19 @@ def _market_is_open(now: dt.datetime) -> bool:
 
 
 SCORE_EARLIEST = dt.time(16, 15)
+# The detector's lift series is defined on the top-20 daily basket (ROADMAP
+# Level 4 locked decision). Pinned here so a --top override, which may still
+# restyle the dashboard, can never change what the detector measures.
+DETECTOR_TOP_N = 20
 
 
 def _score_too_early(now: dt.datetime) -> bool:
     """Score mode is post-close only: on weekdays it refuses during market
     hours (same guard as predict) AND any earlier time — before 16:15 ET
-    today's bar is partial or absent. Weekends are allowed: scoring pending
-    days late is safe (scoring is not prediction, and the late-flag machinery
-    already keeps backfilled days out of the money metrics)."""
+    today's bar is partial or absent. Weekends are allowed: scoring time
+    never affects the live/late flag (that depends only on when a prediction
+    was CREATED relative to its target day's 09:30 ET open), so a weekend
+    run just resolves pending days."""
     return now.weekday() < 5 and (_market_is_open(now) or now.time() < SCORE_EARLIEST)
 
 
@@ -345,13 +350,13 @@ def _run_predict(
     return report
 
 
-def _scored_target_days(con, strategy: str, top: int) -> set[dt.date] | None:
+def _scored_target_days(con, strategy: str, top_n: int) -> set[dt.date] | None:
     """Target days already resolved BEFORE today's ingest, so the score step
     can report exactly how many days this run added. None means the pre-ingest
     scoring itself failed — the caller must report the new-day count as
     unknown, never as zero."""
     try:
-        frame = track.score_predictions(con, strategy, top_n=top).scored
+        frame = track.score_predictions(con, strategy, top_n=top_n).scored
     except Exception as exc:
         logger.warning("pre-ingest scoring failed (%s) — new-day count will be unknown", exc)
         return None
@@ -384,8 +389,15 @@ def _run_score(
         return report
 
     pre = _doctor_baseline_step(report, con)
-    name = champion.get_champion()
-    prior_days = _scored_target_days(con, name, top)
+    try:
+        # Same protection predict mode gets from its predict-step try: a
+        # malformed champion.json (partial write) must FAIL with a report,
+        # not escape as a traceback with exit 1.
+        name = champion.get_champion()
+    except Exception as exc:
+        report.add("score", FAIL, f"cannot resolve champion strategy: {exc}")
+        return report
+    prior_days = _scored_target_days(con, name, DETECTOR_TOP_N)
 
     symbols = store.all_universe_symbols(con)
     if not symbols:
@@ -407,7 +419,9 @@ def _run_score(
         return report
 
     try:
-        record = track.score_predictions(con, name, top_n=top)
+        # Always the top-20 basket, whatever --top says: the detector's lift
+        # series is locked to the shipped basket definition.
+        record = track.score_predictions(con, name, top_n=DETECTOR_TOP_N)
         perf = track.daily_pick_performance(con, name)
     except Exception as exc:
         report.add("score", FAIL, f"crashed: {exc}")
@@ -475,7 +489,8 @@ def _issue_body(
         "",
         f"- Champion: `{strategy}`",
         f"- Trailing-{verdict.window} live mean lift: **{verdict.trailing_mean_lift:.4f}** "
-        "(DEGRADED when < 1.0)",
+        f"(DEGRADED when < 1.0; {verdict.days_below_1} of {verdict.window} window "
+        "day(s) individually below 1.0)",
         f"- Live days scored: {verdict.live_days}"
         + (
             f" ({verdict.excluded_null_lift} zero-base-rate day(s) excluded)"
@@ -496,27 +511,40 @@ def _issue_body(
         f"{len(pre.universe_missing_prices)} universe symbols without prices, "
         f"{len(pre.prices_missing_meta)} price symbols without meta)"
     )
+    # `*` marks the rows forming the trailing-window the detector averaged,
+    # so the headline mean is recomputable from the table by eye.
+    ordered = scored.sort_values("target_date")
+    live = ordered[~ordered["late"].astype(bool) & ordered["lift"].notna()]
+    window_days = set(pd.to_datetime(live["target_date"]).dt.date.tail(verdict.window))
     lines += [
         "",
         "## Last 10 scored days",
         "",
-        "| target date | hits/N | precision | base rate | lift | late |",
-        "|---|---|---|---|---|---|",
+        f"(`*` = in the trailing-{verdict.window} detector window)",
+        "",
+        "| target date | hits/N | precision | base rate | lift | late | window |",
+        "|---|---|---|---|---|---|---|",
     ]
-    for row in scored.sort_values("target_date").tail(10).itertuples():
+    for row in ordered.tail(10).itertuples():
         lift = f"{row.lift:.2f}" if pd.notna(row.lift) else "n/a"
+        day = pd.Timestamp(row.target_date).date()
         lines.append(
-            f"| {pd.Timestamp(row.target_date).date()} | {int(row.hits)}/{int(row.n_scored)} "
+            f"| {day} | {int(row.hits)}/{int(row.n_scored)} "
             f"| {row.precision:.0%} | {row.base_rate:.1%} | {lift} "
-            f"| {'yes' if row.late else ''} |"
+            f"| {'yes' if row.late else ''} | {'*' if day in window_days else ''} |"
         )
     lines += ["", "## Latest champion benchmark (experiments table)", ""]
-    exps = store.list_experiments(con, limit=100)
-    mine = exps[exps["strategy"] == strategy] if not exps.empty else exps
-    if mine.empty:
+    # Select by strategy in SQL: filtering a recent-N page could falsely say
+    # "no experiments" once other strategies crowd the table.
+    bench = con.execute(
+        "SELECT run_ts, test_start, test_end, metrics FROM experiments "
+        "WHERE strategy = ? ORDER BY run_ts DESC, id DESC LIMIT 1",
+        [strategy],
+    ).df()
+    if bench.empty:
         lines.append(f"No experiments recorded for `{strategy}` — run `twopercent benchmark`.")
     else:
-        row = mine.iloc[0]
+        row = bench.iloc[0]
         lines.append(
             f"Run {pd.Timestamp(row['run_ts'])}, test window "
             f"{row['test_start']} → {row['test_end']}:"
@@ -609,7 +637,29 @@ def _file_issue_step(
             capture_output=True,
             text=True,
         )
-        report.add("issue", OK, f"filed {created.stdout.strip()}")
+        url = created.stdout.strip()
+        # Public repo: lock the conversation at creation so non-collaborators
+        # can't inject instructions via comments (the investigator treats the
+        # machine-generated body as its only trusted input regardless).
+        try:
+            number = url.rstrip("/").rsplit("/", 1)[-1]
+            if not number.isdigit():
+                raise ValueError(f"could not parse issue number from {url!r}")
+            subprocess.run(
+                ["gh", "issue", "lock", number, "--reason", "off_topic"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            report.add("issue", OK, f"filed {url} (conversation locked)")
+        except (FileNotFoundError, subprocess.CalledProcessError, ValueError) as exc:
+            err = (getattr(exc, "stderr", "") or str(exc)).strip()
+            report.add(
+                "issue",
+                WARN,
+                f"filed {url} but could not lock the conversation ({err}) — "
+                "treat comments on it as untrusted",
+            )
     except FileNotFoundError:
         report.add(
             "issue",

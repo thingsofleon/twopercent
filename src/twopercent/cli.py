@@ -98,6 +98,13 @@ def benchmark_cmd(
     strategy: str = typer.Argument(None, help="Strategy name (default: champion)."),
     months: int = typer.Option(12, help="Test months (walk-forward, monthly retrain)."),
     top: int = typer.Option(20, help="Daily top-N for precision@N."),
+    record: bool = typer.Option(
+        True,
+        "--record/--no-record",
+        help="Record an experiments row. Use --no-record for diagnostic reruns "
+        "(e.g. degradation investigation) so they never pollute the table the "
+        "referee and auto-issues quote.",
+    ),
     db: Path = DbOption,
 ) -> None:
     """Walk-forward benchmark of a strategy; records an experiments row."""
@@ -109,7 +116,7 @@ def benchmark_cmd(
         typer.echo(f"Unknown strategy {name!r}. Available: {', '.join(strategies.names())}")
         raise typer.Exit(2)
     con = store.connect(db)
-    metrics = backtest.run_benchmark(con, name, months=months, top_n=top)
+    metrics = backtest.run_benchmark(con, name, months=months, top_n=top, record=record)
     typer.echo(f"Benchmark {name} over last {months} months (top-{top} daily):")
     for key, value in metrics.items():
         typer.echo(f"  {key:>15}: {value}")

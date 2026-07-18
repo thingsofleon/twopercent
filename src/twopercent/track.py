@@ -327,6 +327,11 @@ class DegradationVerdict:
     window: int
     trailing_mean_lift: float | None  # None until armed
     excluded_null_lift: int
+    # Window days individually below 1.0: the mean has a false-negative mode
+    # (one lucky low-base-rate spike day can carry four zero days past 1.0),
+    # so the per-day count is always disclosed even when the trigger stays
+    # quiet. Before arming, counted over the live days seen so far.
+    days_below_1: int
     detail: str
 
 
@@ -360,6 +365,7 @@ def degradation_verdict(
     n = len(live)
     suffix = f"; {excluded} zero-base-rate day(s) excluded" if excluded else ""
     if n < window:
+        below = int((live["lift"].astype(float) < 1.0 - _LIFT_DEGRADE_EPSILON).sum()) if n else 0
         so_far = f", mean live lift so far {float(live['lift'].mean()):.7g}" if n else ""
         return DegradationVerdict(
             degraded=False,
@@ -368,12 +374,15 @@ def degradation_verdict(
             window=window,
             trailing_mean_lift=None,
             excluded_null_lift=excluded,
+            days_below_1=below,
             detail=(
                 f"armed after {window - n} more live day(s) — {n}/{window} live days "
                 f"scored{so_far}; detector cannot fire yet{suffix}"
             ),
         )
-    mean_lift = float(live["lift"].tail(window).astype(float).mean())
+    window_lifts = live["lift"].tail(window).astype(float)
+    mean_lift = float(window_lifts.mean())
+    below = int((window_lifts < 1.0 - _LIFT_DEGRADE_EPSILON).sum())
     degraded = mean_lift < 1.0 - _LIFT_DEGRADE_EPSILON
     state = "DEGRADED" if degraded else "not degraded"
     return DegradationVerdict(
@@ -383,8 +392,10 @@ def degradation_verdict(
         window=window,
         trailing_mean_lift=mean_lift,
         excluded_null_lift=excluded,
+        days_below_1=below,
         detail=(
-            f"{state}: trailing-{window} live mean lift {mean_lift:.7g} vs baseline 1.0{suffix}"
+            f"{state}: trailing-{window} live mean lift {mean_lift:.7g} vs baseline 1.0 "
+            f"({below} of {window} window day(s) below 1.0){suffix}"
         ),
     )
 
@@ -392,8 +403,9 @@ def degradation_verdict(
 @dataclass
 class TrackRecord:
     scored: pd.DataFrame  # one row per scoreable signal_date; `late` column marks
-    # days whose predictions were logged AFTER the target date (backfills) —
-    # they are shown, but must never be read as live forecasting skill
+    # days whose predictions were created at/after the target day's 09:30 ET
+    # open (backfills AND evening-of-target saves, per _late_lookup) — they
+    # are shown, but must never be read as live forecasting skill
     pending: list  # signal_dates predicted but with no next trading day ingested yet
 
     @property
@@ -447,17 +459,14 @@ def score_predictions(
     ).df()
 
     if not scored.empty:
-        created = dict(
-            con.execute(
-                "SELECT signal_date, max(created_ts) FROM predictions "
-                "WHERE strategy = ? GROUP BY signal_date",
-                [strategy],
-            ).fetchall()
-        )
-        scored["late"] = [
-            created[pd.Timestamp(sd).date()].date() > pd.Timestamp(td).date()
-            for sd, td in zip(scored["signal_date"], scored["target_date"], strict=True)
-        ]
+        # ONE definition of live in the codebase: _late_lookup's 09:30-ET
+        # any-late rule, the same flag the money metrics use. A plain
+        # date-granularity comparison here would count an evening-of-target
+        # save (outcome fully known) as live — exactly the drift
+        # _late_lookup's docstring warns about — and would feed the
+        # degradation detector weaker evidence than the dashboard shows.
+        is_late = _late_lookup(con, strategy)
+        scored["late"] = [is_late(td) for td in scored["target_date"]]
     resolved = set(pd.to_datetime(scored["signal_date"]).dt.date) if not scored.empty else set()
     pending = [d for d in store.predicted_signal_dates(con, strategy) if d not in resolved]
     return TrackRecord(scored=scored, pending=pending)

@@ -35,11 +35,14 @@ exception (exit 0 clean / 1 ran-with-warnings / 2 failed-or-degraded):
 - **predict mode** (default, pre-open): market-hours guard → doctor baseline →
   universe refresh (if stale) → tail ingest → freshness + corruption gates →
   champion predict (logged) → dashboard → track-record scoring.
-- **score mode** (post-close): refuses before 16:15 ET on weekdays (weekends
-  may score pending days late — the late flag keeps them out of the money
-  metrics) → doctor baseline → tail ingest of today's final bars → freshness +
-  corruption gates → score pending predictions → **degradation detector** →
-  dashboard refresh. Score mode never writes to the predictions log and never
+- **score mode** (post-close): refuses before 16:15 ET on weekdays; weekends
+  may run — scoring time never affects the live/late flag, which depends only
+  on when a prediction was *created* relative to its target day's 09:30 ET
+  open (a Friday-created prediction scored on Saturday is still live; an
+  after-open backfill is late no matter when it gets scored). Then: doctor
+  baseline → tail ingest of today's final bars → freshness + corruption
+  gates → score pending predictions → **degradation detector** → dashboard
+  refresh. Score mode never writes to the predictions log and never
   refreshes the universe.
 
 **Degradation detector:** over scored days with `late == false` (ordered by
@@ -63,7 +66,12 @@ to `logs/routine.log`:
 | predict | `Mon..Fri 06:00 America/Denver` | 08:00 ET, pre-open | `uv run twopercent routine` |
 | score | `Mon..Fri 14:45 America/Denver` | 16:45 ET, post-close | `uv run twopercent routine --mode score` |
 
-Units live at `~/.config/systemd/user/twopercent-routine.{service,timer}` and
-`twopercent-score.{service,timer}` (same service shape, different ExecStart).
-On WSL the machine must be running with lingering enabled
-(`loginctl enable-linger`) for unattended fire.
+The predict timer is already installed at
+`~/.config/systemd/user/twopercent-routine.{service,timer}`. The score timer
+is a post-merge step — install it as follows: copy the routine units to
+`twopercent-score.{service,timer}`, change `ExecStart` to
+`.../uv run twopercent routine --mode score` and `OnCalendar` to
+`Mon..Fri 14:45 America/Denver`, then
+`systemctl --user daemon-reload && systemctl --user enable --now
+twopercent-score.timer`. On WSL the machine must be running with lingering
+enabled (`loginctl enable-linger`) for unattended fire.

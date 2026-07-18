@@ -210,7 +210,14 @@ def degraded(ready, monkeypatch):
     return ready
 
 
-def _gh_spy(monkeypatch, list_stdout: str = "[]", fail: Exception | None = None) -> list:
+def _gh_spy(
+    monkeypatch,
+    list_stdout: str = "[]",
+    fail: Exception | None = None,
+    fail_on: list | None = None,
+) -> list:
+    """Monkeypatch subprocess.run with a gh fake. `fail` raises on every call,
+    or only on calls whose args start with `fail_on` when that is given."""
     calls = []
 
     def fake_run(args, **kw):
@@ -218,7 +225,7 @@ def _gh_spy(monkeypatch, list_stdout: str = "[]", fail: Exception | None = None)
         # Security posture: argument LISTS only, never a shell string.
         assert isinstance(args, list)
         assert not kw.get("shell")
-        if fail is not None:
+        if fail is not None and (fail_on is None or args[: len(fail_on)] == fail_on):
             raise fail
         if args[:3] == ["gh", "issue", "list"]:
             return subprocess.CompletedProcess(args, 0, stdout=list_stdout, stderr="")
@@ -228,6 +235,8 @@ def _gh_spy(monkeypatch, list_stdout: str = "[]", fail: Exception | None = None)
             return subprocess.CompletedProcess(
                 args, 0, stdout="https://github.com/x/twopercent/issues/99\n", stderr=""
             )
+        if args[:3] == ["gh", "issue", "lock"]:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
         raise AssertionError(f"unexpected subprocess call: {args}")
 
     monkeypatch.setattr(routine.subprocess, "run", fake_run)
@@ -257,9 +266,15 @@ def test_degraded_files_issue_and_exits_2(degraded, monkeypatch):
     assert ".claude/agents/investigator.md" in body
     assert champion.get_champion() in body
     assert "2026-07-10" in body  # last of the 5 degraded target dates in the table
+    assert "| * |" in body  # trailing-window rows are marked in the table
+    assert "5 of 5 window day(s) individually below 1.0" in body
     # Label ensured idempotently before create.
     label = next(args for args, kw in calls if args[:3] == ["gh", "label", "create"])
     assert "--force" in label and "auto-degradation" in label
+    # Conversation locked at creation (public repo: comments are untrusted).
+    lock = next(args for args, kw in calls if args[:3] == ["gh", "issue", "lock"])
+    assert lock[3] == "99" and "--reason" in lock
+    assert "locked" in issue.detail
 
 
 def test_degraded_dedups_existing_open_issue(degraded, monkeypatch):
@@ -269,6 +284,91 @@ def test_degraded_dedups_existing_open_issue(degraded, monkeypatch):
     issue = next(s for s in report.steps if s.name == "issue")
     assert issue.status == "warn" and "#42" in issue.detail
     assert not any(args[:3] == ["gh", "issue", "create"] for args, _ in calls)
+
+
+def test_degraded_lock_failure_warns_but_issue_stands(degraded, monkeypatch):
+    # Lock is best-effort: its failure must not unfile the issue or be silent.
+    err = subprocess.CalledProcessError(1, ["gh"], stderr="lock forbidden")
+    calls = _gh_spy(monkeypatch, fail=err, fail_on=["gh", "issue", "lock"])
+    report = routine.run(db_path=_db(degraded), mode="score")
+    assert report.exit_code == 2
+    assert any(args[:3] == ["gh", "issue", "create"] for args, _ in calls)
+    issue = next(s for s in report.steps if s.name == "issue")
+    assert issue.status == "warn"
+    assert "issues/99" in issue.detail and "could not lock" in issue.detail
+
+
+def test_detector_pinned_to_top_20_regardless_of_cli_top(ready, monkeypatch):
+    # The lift series is locked to the top-20 basket (ROADMAP): a --top 5 run
+    # may restyle the dashboard but must never change what the detector sees.
+    seen = []
+
+    def fake_scores(con_, s, top_n=20):
+        seen.append(top_n)
+        return track.TrackRecord(scored=pd.DataFrame(), pending=[])
+
+    monkeypatch.setattr(routine.track, "score_predictions", fake_scores)
+    monkeypatch.setattr(
+        routine.track,
+        "daily_pick_performance",
+        lambda con_, s, top_n=5: track.PickPerformance(daily=pd.DataFrame()),
+    )
+    monkeypatch.setattr(routine, "predict_for", lambda *a, **kw: None)
+    monkeypatch.setattr(routine.dashboard, "render", lambda *a, **kw: "x")
+    routine.run(db_path=_db(ready), top=5, mode="score")
+    assert seen and all(n == 20 for n in seen)
+
+
+def test_score_mode_malformed_champion_fails_with_report(ready, monkeypatch):
+    # A partial champion.json write at the 14:45 timer must produce a FAIL
+    # summary line and exit 2 — never an uncaught traceback (exit 1, no report).
+    def boom(*a, **kw):
+        raise ValueError("champion.json is malformed")
+
+    monkeypatch.setattr(routine.champion, "get_champion", boom)
+    report = routine.run(db_path=_db(ready), mode="score")
+    assert report.exit_code == 2
+    assert report.steps[-1].name == "score" and report.steps[-1].status == "fail"
+    assert "champion" in report.steps[-1].detail
+
+
+def test_pre_ingest_snapshot_failure_reports_unknown_new_days(ready, monkeypatch):
+    # (a) The pre-ingest capture fails but post-ingest scoring works: the
+    # summary must say the new-day count is UNKNOWN and warn — never report
+    # a confident "0 new days" over a count it could not compute.
+    calls = {"n": 0}
+
+    def flaky_scores(con_, s, top_n=20):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("pre-ingest boom")
+        return _degraded_record(lift=1.5)  # healthy: detector must not fire
+
+    monkeypatch.setattr(routine.track, "score_predictions", flaky_scores)
+    monkeypatch.setattr(
+        routine.track,
+        "daily_pick_performance",
+        lambda con_, s, top_n=5: track.PickPerformance(daily=pd.DataFrame()),
+    )
+    monkeypatch.setattr(routine, "predict_for", lambda *a, **kw: None)
+    monkeypatch.setattr(routine.dashboard, "render", lambda *a, **kw: "x")
+    report = routine.run(db_path=_db(ready), mode="score")
+    score_step = next(s for s in report.steps if s.name == "score")
+    assert score_step.status == "warn"
+    assert "unknown new days" in score_step.detail
+    assert "0 new day(s)" not in score_step.detail
+
+
+def test_post_ingest_scoring_crash_fails_run(ready, monkeypatch):
+    # (b) Scoring itself crashes after ingest: score step FAIL, exit 2.
+    def broken(con_, s, top_n=20):
+        raise RuntimeError("scoring exploded")
+
+    monkeypatch.setattr(routine.track, "score_predictions", broken)
+    report = routine.run(db_path=_db(ready), mode="score")
+    score_step = next(s for s in report.steps if s.name == "score")
+    assert score_step.status == "fail" and "scoring exploded" in score_step.detail
+    assert report.exit_code == 2
 
 
 def test_degraded_gh_missing_warns_and_still_exits_2(degraded, monkeypatch):

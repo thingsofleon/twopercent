@@ -290,6 +290,10 @@ def test_detector_epsilon_boundary_adversarial():
     assert not track.degradation_verdict(_scored_frame([1.0000001] * 5)).degraded
     assert not track.degradation_verdict(_scored_frame([1.0] * 5)).degraded
     assert not track.degradation_verdict(_scored_frame([1.0 - 1e-12] * 5)).degraded
+    # Pin the guard band itself: 2e-9 below 1.0 is strictly outside the 1e-9
+    # epsilon and fires; 0.5e-9 below is inside the band and must not.
+    assert track.degradation_verdict(_scored_frame([1.0 - 2e-9] * 5)).degraded
+    assert not track.degradation_verdict(_scored_frame([1.0 - 0.5e-9] * 5)).degraded
 
 
 def test_detector_not_armed_below_five_live_days():
@@ -316,6 +320,16 @@ def test_detector_excludes_late_days_from_window():
         )
     )
     assert not verdict.armed and verdict.live_days == 3
+
+
+def test_detector_discloses_days_below_one_when_mean_survives():
+    # False-negative mode of the mean: one lucky low-base-rate spike day
+    # (lift 5.0) carries four zero days to a mean of exactly 1.0. The locked
+    # trigger stays quiet — but the per-day count must not let it hide.
+    verdict = track.degradation_verdict(_scored_frame([0.0, 0.0, 0.0, 0.0, 5.0]))
+    assert not verdict.degraded and verdict.armed
+    assert verdict.days_below_1 == 4
+    assert "4 of 5 window day(s) below 1.0" in verdict.detail
 
 
 def test_detector_excludes_null_lift_days_with_warning(caplog):

@@ -102,14 +102,18 @@ Locked decisions (v1, 2026-07-18):
 - **Two-run cadence:** predict run weekdays 06:00 America/Denver (08:00 ET,
   pre-open, `twopercent routine`); score run weekdays 14:45 America/Denver
   (16:45 ET, post-close, `twopercent routine --mode score`). Score mode
-  refuses before 16:15 ET on weekdays; weekends may score pending days late
-  (the late flag keeps them out of the money metrics).
-- **Degradation definition:** scored days with `late == false`, ordered by
-  target_date; with ≥5 such live days, DEGRADED iff the mean lift over the
-  most recent 5 is < 1.0 (epsilon-guarded: strictly below by more than 1e-9,
-  so FP noise at the boundary never fires it). Fewer than 5 live days → the
-  detector loudly reports it is not yet armed. NULL-lift days (zero base
-  rate) are excluded with a warning.
+  refuses before 16:15 ET on weekdays; weekends may run — scoring time never
+  affects the live/late flag (that depends only on prediction creation time
+  vs the target day's 09:30 ET open).
+- **Degradation definition:** scored days of the top-20 daily basket (pinned
+  — a `--top` override never changes what the detector measures) with
+  `late == false`, ordered by target_date; with ≥5 such live days, DEGRADED
+  iff the mean lift over the most recent 5 is < 1.0 (epsilon-guarded:
+  strictly below by more than 1e-9, so FP noise at the boundary never fires
+  it). Fewer than 5 live days → the detector loudly reports it is not yet
+  armed. NULL-lift days (zero base rate) are excluded with a warning. The
+  per-day below-1.0 count is always disclosed alongside the mean (a single
+  lucky spike day can carry the mean past 1.0).
 - **Closed loop:** on DEGRADED the score run exits 2 and auto-files a GitHub
   issue labeled `auto-degradation` (deduped — one open at a time) carrying
   the evidence bundle (last 10 scored days, trailing-5 live lift, champion

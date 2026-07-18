@@ -169,7 +169,9 @@ def _chart_svg(scored: pd.DataFrame) -> str:
     )
 
 
-def _tiles(record: track.TrackRecord, n_candidates: int, top: int) -> str:
+def _tiles(
+    record: track.TrackRecord, picks: track.PickPerformance, n_candidates: int, top: int
+) -> str:
     if record.scored.empty:
         return ""
     total_n = record.scored["n_scored"].sum()
@@ -178,7 +180,7 @@ def _tiles(record: track.TrackRecord, n_candidates: int, top: int) -> str:
     # inconsistent when day sizes / base rates differ.
     overall_b = (record.scored["base_rate"] * record.scored["n_scored"]).sum() / total_n
     lift = overall_p / overall_b if overall_b > 0 else float("nan")
-    return (
+    tiles = (
         '<div class="tiles">'
         f'<div class="tile"><span class="label">Cumulative lift</span>'
         f'<b class="{"up" if lift >= 1 else ""}">{lift:.2f}×</b>'
@@ -186,14 +188,39 @@ def _tiles(record: track.TrackRecord, n_candidates: int, top: int) -> str:
         f'<div class="tile"><span class="label">Hit rate (top {top})</span>'
         f"<b>{overall_p:.0%}</b>"
         f'<span class="cmp">market base {overall_b:.0%}</span></div>'
-        f'<div class="tile"><span class="label">Scored days</span>'
-        f"<b>{len(record.scored)}</b>"
-        f'<span class="cmp">{int(record.scored["hits"].sum())}/{int(total_n)} hit</span></div>'
+    )
+    if picks.days:
+        # Live days only: backfilled days must never inflate the money tiles.
+        p1 = picks.precision_at_1()
+        g1 = picks.growth("top1_return")
+        g5 = picks.growth("topn_return")
+        late_note = f" · excludes {picks.late_days} backfilled" if picks.late_days else ""
+        if g1 is not None:
+            live = picks.live
+            tiles += (
+                f'<div class="tile"><span class="label">Top pick hit rate (live)</span>'
+                f"<b>{p1:.0%}</b>"
+                f'<span class="cmp">{int(live["top1_hit"].sum())}/{len(live)} days'
+                f" did +2%{late_note}</span></div>"
+                f'<div class="tile"><span class="label">$1 → top pick daily (live)</span>'
+                f'<b class="{"up" if g1 >= 1 else ""}">${g1:.3f}</b>'
+                f'<span class="cmp">top-5: ${g5:.3f} · net of '
+                f"{track.COST_ROUND_TRIP:.1%}/day assumed costs{late_note}</span></div>"
+            )
+        else:
+            tiles += (
+                f'<div class="tile"><span class="label">$1 → top pick daily (live)</span>'
+                f"<b>—</b>"
+                f'<span class="cmp">all {picks.late_days} scored days were backfilled — '
+                f"live record starts with the next scheduled run</span></div>"
+            )
+    tiles += (
         f'<div class="tile"><span class="label">Candidates today</span>'
         f"<b>{n_candidates}</b>"
         f'<span class="cmp">ranked by probability</span></div>'
         "</div>"
     )
+    return tiles
 
 
 def build_html(
@@ -203,6 +230,12 @@ def build_html(
 ) -> str:
     """Render the dashboard for an already-computed prediction result."""
     record = track.score_predictions(con, result.strategy, top_n=top)
+    picks = track.daily_pick_performance(con, result.strategy)
+    pick_by_day = (
+        {pd.Timestamp(r.target_date).date(): r for r in picks.daily.itertuples()}
+        if picks.days
+        else {}
+    )
     uni = store.latest_universe(con).set_index("symbol")
     n_prices = store.price_row_count(con)
     max_prob = float(result.scored["prob"].max()) or 1.0
@@ -218,7 +251,7 @@ def build_html(
         + f"<b>{html.escape(result.strategy)}</b> · trained on "
         + f'<span class="mono">{result.trained_rows:,}</span> rows · '
         + f'<span class="mono">{n_prices:,}</span> price rows in store</p>'
-        + _tiles(record, len(result.scored), top)
+        + _tiles(record, picks, len(result.scored), top)
     )
 
     rows = []
@@ -247,9 +280,22 @@ def build_html(
             "outcomes appear here once the next trading day's data is ingested.</p>"
         )
     else:
+
+        def _pick_cell(day) -> str:
+            p = pick_by_day.get(day)
+            if p is None:
+                return "<td>—</td>"
+            cls = "pos" if p.top1_return >= 0 else "neg"
+            marker = " †" if p.late else ""
+            return (
+                f'<td><span class="sym">{html.escape(p.top1_symbol)}</span> '
+                f'<span class="{cls}">{p.top1_return:+.1%}</span>{marker}</td>'
+            )
+
         trs = "".join(
             f"<tr><td>{pd.Timestamp(r.target_date).date()}</td>"
-            f"<td>{int(r.hits)}/{int(r.n_scored)}</td>"
+            + _pick_cell(pd.Timestamp(r.target_date).date())
+            + f"<td>{int(r.hits)}/{int(r.n_scored)}</td>"
             f'<td class="{"pos" if r.precision >= r.base_rate else "neg"}">{r.precision:.0%}</td>'
             f"<td>{r.base_rate:.0%}</td>"
             f'<td class="{"pos" if r.lift >= 1 else "neg"}">{r.lift:.2f}×</td></tr>'
@@ -259,12 +305,13 @@ def build_html(
         if record.late_days:
             late_note = (
                 f'<p class="sub"><b>{record.late_days} of {len(record.scored)} days '
-                "were backfilled after the fact</b> — not live forecasting skill.</p>"
+                "were backfilled after the fact</b> (marked †) — not live forecasting "
+                "skill, and excluded from the money tiles above.</p>"
             )
         body = late_note + (
             f"<div class='card'>{_chart_svg(record.scored)}</div>"
-            + "<div class='card'><table><tr><th>Day</th><th>Hits</th><th>Hit rate</th>"
-            + f"<th>Base rate</th><th>Lift</th></tr>{trs}</table></div>"
+            + "<div class='card'><table><tr><th>Day</th><th>Top pick</th><th>Hits</th>"
+            + f"<th>Hit rate</th><th>Base rate</th><th>Lift</th></tr>{trs}</table></div>"
         )
     pending = ""
     if record.pending:

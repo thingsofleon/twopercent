@@ -48,6 +48,11 @@ FEATURE_COLUMNS = [
 # liquidity floor to it (see predict.py); models must never train on it, so
 # it stays out of FEATURE_COLUMNS.
 METADATA_COLUMNS = ["median_vol_20"]
+# Label-side columns (like did_2pct_next and target_date): FUTURE information.
+# next_oc_return is the label's magnitude — it exists for scoring/simulation
+# and must never appear in FEATURE_COLUMNS or METADATA_COLUMNS (the lookahead
+# canary deliberately excludes label columns, which legitimately change when
+# the future changes).
 
 _SQL = """
 WITH per_symbol AS (
@@ -95,6 +100,7 @@ SELECT
         WHEN s.next_oc_return >= ? THEN 1
         ELSE 0
     END AS did_2pct_next,
+    s.next_oc_return,
     s.oc_return AS oc_return_today,
     s.ret_5d,
     s.vol_20d,

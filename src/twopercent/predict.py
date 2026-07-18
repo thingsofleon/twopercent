@@ -89,7 +89,11 @@ def predict_for(
             LIQUIDITY_MIN_MEDIAN_VOLUME,
             ", ".join(sorted(scored.loc[~liquid, "symbol"])[:20]),
         )
-    scored = scored[liquid].sort_values("prob", ascending=False).reset_index(drop=True)
+    scored = (
+        scored[liquid]
+        .sort_values("prob", ascending=False, kind="mergesort")  # stable: ties match the referee
+        .reset_index(drop=True)
+    )
     scored["rank"] = range(1, len(scored) + 1)
     if save:
         store.save_predictions(con, strategy_name, signal_date, scored)

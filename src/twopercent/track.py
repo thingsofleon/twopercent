@@ -2,13 +2,152 @@
 
 from __future__ import annotations
 
+import datetime as dt
+import logging
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pandas as pd
 
 from twopercent import store
 from twopercent.scan import _THRESHOLD_EPSILON, DEFAULT_THRESHOLD
+
+logger = logging.getLogger(__name__)
+
+# Assumed round-trip trading cost (entry + exit) per daily position, applied
+# to every simulated day. 30 bps is a deliberate, documented GUESS pitched for
+# liquid-ish small caps at open/close; real spreads on thin names can be far
+# worse. The simulation is an upper bound on execution quality, not a promise.
+COST_ROUND_TRIP = 0.003
+
+
+@dataclass
+class PickPerformance:
+    """Per-day realized outcomes of the top-ranked picks, plus summaries.
+
+    `late` marks days whose predictions were NOT created before the target
+    day's market open (backfills, and evening-of-target saves) — those days
+    are excluded from the headline money metrics by default: a compounded
+    dollar figure that includes known outcomes is not forecasting skill.
+    """
+
+    daily: pd.DataFrame  # target_date, top1_symbol, top1_rank, top1_return,
+    # top1_hit, topn_return, topn_hits, n_avail, late
+
+    @property
+    def days(self) -> int:
+        return len(self.daily)
+
+    @property
+    def live(self) -> pd.DataFrame:
+        return self.daily[~self.daily["late"]] if self.days else self.daily
+
+    @property
+    def late_days(self) -> int:
+        return int(self.daily["late"].sum()) if self.days else 0
+
+    def precision_at_1(self, include_late: bool = False) -> float | None:
+        frame = self.daily if include_late else self.live
+        return float(frame["top1_hit"].mean()) if len(frame) else None
+
+    def growth(self, column: str = "top1_return", include_late: bool = False) -> float | None:
+        """Growth of $1 compounding `column` daily, net of COST_ROUND_TRIP.
+
+        Live days only by default — see class docstring."""
+        frame = self.daily if include_late else self.live
+        if not len(frame):
+            return None
+        return float((1 + frame[column] - COST_ROUND_TRIP).prod())
+
+
+def daily_pick_performance(
+    con: duckdb.DuckDBPyConnection, strategy: str, top_n: int = 5
+) -> PickPerformance:
+    """Realized open-to-close returns of the logged rank-1 and top-N picks.
+
+    A pick whose target-day bar is missing (delisted/halted/repaired) is
+    excluded from that day's basket; `top1` means the best-ranked pick that
+    ACTUALLY TRADED (a trader finding rank 1 halted at the open takes the
+    next name). n_avail records how many of the top-N traded; days with no
+    tradeable picks are dropped from the simulation."""
+    threshold = DEFAULT_THRESHOLD - _THRESHOLD_EPSILON
+    daily = con.execute(
+        """
+        WITH days AS (SELECT DISTINCT date FROM daily_returns),
+        resolved AS (
+            SELECT p.signal_date, min(d.date) AS target_date
+            FROM (SELECT DISTINCT signal_date FROM predictions WHERE strategy = ?) p
+            JOIN days d ON d.date > p.signal_date GROUP BY p.signal_date
+        ),
+        picks AS (
+            SELECT r.target_date, pr.rank, pr.symbol, dr.oc_return
+            FROM predictions pr
+            JOIN resolved r ON pr.signal_date = r.signal_date
+            JOIN daily_returns dr ON dr.symbol = pr.symbol AND dr.date = r.target_date
+            WHERE pr.strategy = ? AND pr.rank <= ?
+        )
+        SELECT
+            target_date,
+            arg_min(symbol, rank) AS top1_symbol,
+            min(rank) AS top1_rank,
+            arg_min(oc_return, rank) AS top1_return,
+            CASE WHEN arg_min(oc_return, rank) >= ? THEN 1 ELSE 0 END AS top1_hit,
+            avg(oc_return) AS topn_return,
+            sum(CASE WHEN oc_return >= ? THEN 1 ELSE 0 END) AS topn_hits,
+            count(*) AS n_avail
+        FROM picks
+        GROUP BY target_date
+        ORDER BY target_date
+        """,
+        [strategy, strategy, top_n, threshold, threshold],
+    ).df()
+    if not daily.empty:
+        created = dict(
+            con.execute(
+                "SELECT min(d.date), max(pr.created_ts) FROM predictions pr "
+                "JOIN (SELECT DISTINCT date FROM daily_returns) d ON d.date > pr.signal_date "
+                "WHERE pr.strategy = ? GROUP BY pr.signal_date",
+                [strategy],
+            ).fetchall()
+        )
+        # A prediction is LIVE only if created before the target day's open
+        # (09:30 ET). Date-granularity comparison would count an
+        # evening-of-target save — outcome fully known — as live.
+        eastern = ZoneInfo("America/New_York")
+        local = dt.datetime.now().astimezone().tzinfo
+
+        def _is_late(td) -> bool:
+            created_ts = created.get(pd.Timestamp(td).date())
+            if created_ts is None:
+                return True
+            open_et = dt.datetime.combine(pd.Timestamp(td).date(), dt.time(9, 30), tzinfo=eastern)
+            return created_ts.replace(tzinfo=local) > open_et
+
+        daily["late"] = [_is_late(td) for td in daily["target_date"]]
+
+        substituted = int((daily["top1_rank"] > 1).sum())
+        short_days = int((daily["n_avail"] < top_n).sum())
+        merged_days = int((daily["n_avail"] > top_n).sum())
+        if substituted or short_days:
+            logger.warning(
+                "pick performance for %s: %d day(s) with rank-1 pick untradeable "
+                "(substituted next available — a halted/delisted rank-1 may hide "
+                "exactly the catastrophic day), %d day(s) with fewer than %d "
+                "tradeable picks",
+                strategy,
+                substituted,
+                short_days,
+                top_n,
+            )
+        if merged_days:
+            logger.warning(
+                "pick performance for %s: %d day(s) merged picks from multiple "
+                "signal dates resolving to one target (missing intermediate bars)",
+                strategy,
+                merged_days,
+            )
+    return PickPerformance(daily=daily)
 
 
 @dataclass

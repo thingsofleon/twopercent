@@ -22,6 +22,8 @@ class LogReg:
     (class-balanced; ranking metrics comparable, brier not)."""
 
     def __init__(self) -> None:
+        # Always empty: unobserved columns are imputed as constants, never dropped.
+        self.dropped_columns: list[str] = []
         self._model = Pipeline(
             [
                 ("impute", SimpleImputer(strategy="median", keep_empty_features=True)),

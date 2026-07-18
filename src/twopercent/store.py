@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 from pathlib import Path
 
 import duckdb
+import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = Path("data/twopercent.duckdb")
 
@@ -55,11 +59,10 @@ CREATE TABLE IF NOT EXISTS experiments (
 CREATE TABLE IF NOT EXISTS experiment_daily (
     seq BIGINT NOT NULL,
     target_date DATE NOT NULL,
-    top1_ret DOUBLE,
-    top1_hit INTEGER,
-    top5_ret DOUBLE,
-    top5_hits DOUBLE,
-    PRIMARY KEY (seq, target_date)
+    rank INTEGER NOT NULL,
+    ret DOUBLE NOT NULL,
+    hit INTEGER NOT NULL,
+    PRIMARY KEY (seq, target_date, rank)
 );
 CREATE TABLE IF NOT EXISTS predictions (
     strategy TEXT NOT NULL,
@@ -79,10 +82,36 @@ CREATE OR REPLACE VIEW latest_universe AS
 """
 
 
+def _drop_pre_release_experiment_daily(con: duckdb.DuckDBPyConnection) -> None:
+    """Drop the short-lived per-aggregate experiment_daily shape (never released).
+
+    The table changed to per-rank rows while its introducing PR was still open;
+    a dev store that connected in that window has the old columns, which
+    CREATE TABLE IF NOT EXISTS would silently keep. Rows are regenerable by
+    rerunning `twopercent benchmark`. No other table is touched.
+    """
+    cols = {
+        r[0]
+        for r in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'experiment_daily'"
+        ).fetchall()
+    }
+    if cols and "rank" not in cols:
+        n_rows = con.execute("SELECT count(*) FROM experiment_daily").fetchone()[0]
+        logger.warning(
+            "experiment_daily has the pre-release aggregate shape — dropping it and "
+            "discarding %d sim row(s); rerun `twopercent benchmark` to regenerate them",
+            n_rows,
+        )
+        con.execute("DROP TABLE experiment_daily")
+
+
 def connect(db_path: Path | str = DEFAULT_DB_PATH) -> duckdb.DuckDBPyConnection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(path))
+    _drop_pre_release_experiment_daily(con)
     con.execute(_SCHEMA)
     return con
 
@@ -257,20 +286,29 @@ def record_experiment(
 
 
 def record_experiment_daily(con: duckdb.DuckDBPyConnection, seq: int, rows: pd.DataFrame) -> int:
-    """Store a benchmark's per-day pick outcomes keyed to its experiments row.
+    """Store a benchmark's per-day per-rank pick outcomes keyed to its experiments row.
 
-    Expects columns: target_date, top1_ret, top1_hit, top5_ret, top5_hits.
+    Expects columns: target_date, rank, ret, hit. Rows with a non-finite ret
+    or a null hit are REJECTED with ValueError — a benchmark producing corrupt
+    sim rows must die loudly, never persist quietly (a NaN would later vanish
+    into skipna aggregations looking like a clean shorter window).
     """
     if rows.empty:
         return 0
-    daily = rows[["target_date", "top1_ret", "top1_hit", "top5_ret", "top5_hits"]].copy()
+    daily = rows[["target_date", "rank", "ret", "hit"]].copy()
+    bad = int((~np.isfinite(daily["ret"].astype(float))).sum() + daily["hit"].isna().sum())
+    if bad:
+        raise ValueError(
+            f"refusing to record experiment_daily for seq {seq}: {bad} row(s) with "
+            "non-finite ret or null hit — corrupt sim rows must not be persisted"
+        )
     daily["target_date"] = pd.to_datetime(daily["target_date"])
     daily.insert(0, "seq", seq)
     con.register("experiment_daily_in", daily)
     con.execute(
         """
         INSERT OR REPLACE INTO experiment_daily
-        SELECT seq, CAST(target_date AS DATE), top1_ret, top1_hit, top5_ret, top5_hits
+        SELECT seq, CAST(target_date AS DATE), rank, ret, hit
         FROM experiment_daily_in
         """
     )
@@ -281,20 +319,25 @@ def record_experiment_daily(con: duckdb.DuckDBPyConnection, seq: int, rows: pd.D
 def latest_experiment_daily(
     con: duckdb.DuckDBPyConnection, strategy: str
 ) -> tuple[dict, pd.DataFrame] | None:
-    """The most recent experiment for `strategy` that HAS daily rows, plus those rows.
+    """The best-recorded experiment for `strategy` that HAS daily rows, plus those rows.
 
-    Returns (experiment metadata dict, daily frame ordered by target_date), or
-    None when no experiment of this strategy recorded daily rows — experiments
-    predating the experiment_daily table have aggregates only.
+    "Best" = most daily rows first, then newest run_ts: a later short run
+    (`benchmark --months 2`, a compare) must not silently displace the
+    12-month record the dashboard windows need. Returns (experiment metadata
+    dict, per-rank daily frame ordered by target_date, rank), or None when no
+    experiment of this strategy recorded daily rows — experiments predating
+    the experiment_daily table have aggregates only.
     """
     row = con.execute(
         """
         SELECT e.id, e.run_ts, e.params, e.test_start, e.test_end
         FROM experiments e
-        WHERE e.strategy = ? AND EXISTS (
-            SELECT 1 FROM experiment_daily d WHERE d.seq = e.id
-        )
-        ORDER BY e.run_ts DESC, e.id DESC
+        JOIN (
+            SELECT seq, count(DISTINCT target_date) AS n_days
+            FROM experiment_daily GROUP BY seq
+        ) d ON d.seq = e.id
+        WHERE e.strategy = ?
+        ORDER BY d.n_days DESC, e.run_ts DESC, e.id DESC
         LIMIT 1
         """,
         [strategy],
@@ -304,8 +347,8 @@ def latest_experiment_daily(
     seq, run_ts, params, test_start, test_end = row
     daily = con.execute(
         """
-        SELECT target_date, top1_ret, top1_hit, top5_ret, top5_hits
-        FROM experiment_daily WHERE seq = ? ORDER BY target_date
+        SELECT target_date, rank, ret, hit
+        FROM experiment_daily WHERE seq = ? ORDER BY target_date, rank
         """,
         [seq],
     ).df()

@@ -10,6 +10,8 @@ Semantic color only: green = hit/up, red = down/miss, amber = base rate.
 from __future__ import annotations
 
 import html
+import json
+import math
 
 import duckdb
 import pandas as pd
@@ -99,10 +101,14 @@ html, body { background: var(--bg); margin: 0; }
 .tp-root .chip { display: inline-block; width: 10px; height: 10px;
   border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
 .tp-root .empty { color: var(--ink-muted); font-style: italic; }
-.badge-sim { display: inline-block; background: var(--amber); color: var(--bg);
+.badge-sim, .badge-live { display: inline-block; color: var(--bg);
   font-size: 0.62rem; font-weight: 700; padding: 2px 7px; border-radius: 4px;
-  letter-spacing: 0.12em; vertical-align: 2px; margin-left: 7px; }
-.tp-root .card.sim { border-color: var(--amber); }
+  letter-spacing: 0.12em; vertical-align: 1px; margin-right: 6px; }
+.badge-sim { background: var(--amber); }
+.badge-live { background: var(--up); }
+.tp-root select { background: var(--card); color: var(--ink-1);
+  border: 1px solid var(--card-border); border-radius: 6px; padding: 3px 6px;
+  font: inherit; font-size: 0.84rem; }
 .tp-root .note { color: var(--ink-muted); font-size: 0.74rem; margin-top: 26px; }
 </style>
 """
@@ -230,54 +236,276 @@ def _tiles(
 _SIM_CAVEAT = (
     "Walk-forward simulation: the model never trains on the days it predicts, "
     "but the system was designed with this history visible. Assumes 30 bps "
-    "round-trip cost and perfect open/close fills; survivorship caveats apply. "
-    "The live record above is the clean test."
+    "round-trip cost and perfect open/close fills; picks require a next-day "
+    "bar and today's universe is applied to history, so delisted names can "
+    "never contribute their final catastrophic day — the dollar figures are "
+    "biased up. The live record above is the clean test."
 )
 
+BASKET_CHOICES = [1, 5, 10, 15, 20]
+BASKET_DEFAULT = 5
+WINDOW_DEFAULT = 126  # "6 months" in track.SIM_WINDOW_SPECS
 
-def _sim_panel(sim: tuple[dict, pd.DataFrame] | None) -> str:
-    """Simulated walk-forward record over standard trailing windows (amber SIM)."""
-    heading = (
-        "<h2>Simulated record — walk-forward, monthly retrain"
-        '<span class="badge-sim">SIM</span></h2>'
-    )
-    if sim is None:
-        return heading + (
-            '<p class="empty">No walk-forward simulation recorded yet — '
-            'run <span class="mono">twopercent benchmark</span>.</p>'
-        )
-    meta, daily = sim
-    summary = track.sim_windows(daily)
-    span = (
-        f'<p class="sub">Test span <b class="mono">{meta["test_start"]}</b> → '
-        f'<b class="mono">{meta["test_end"]}</b> · '
-        f'<span class="mono">{summary.days_available}</span> sim days available</p>'
-    )
-    if summary.windows:
-        trs = "".join(
-            f"<tr><td>{html.escape(w['label'])}</td>"
-            f'<td class="{"pos" if w["top1_growth"] >= 1 else "neg"}">'
-            f"${w['top1_growth']:.3f}</td>"
-            f'<td class="{"pos" if w["top5_growth"] >= 1 else "neg"}">'
-            f"${w['top5_growth']:.3f}</td>"
-            f"<td>{w['top1_hit_rate']:.0%}</td>"
-            f"<td>{w['top5_hit_rate']:.0%}</td></tr>"
-            for w in summary.windows
-        )
-        table = (
-            "<div class='card sim'><table>"
-            "<tr><th>Window</th><th>$1 → (top pick)</th><th>$1 → (top-5 basket)</th>"
-            "<th>Top-pick hit rate</th><th>Top-5 hit rate</th></tr>"
-            f"{trs}</table></div>"
-        )
+
+def _payload_days(frame: pd.DataFrame, bases: dict, ret_col: str, late: bool = False) -> list[dict]:
+    """Per-rank frame -> ordered payload day dicts {d, base, [late,] picks}."""
+    days: list[dict] = []
+    for d, grp in frame.groupby("target_date"):
+        day = pd.Timestamp(d).date()
+        base = bases.get(day)
+        entry = {
+            "d": str(day),
+            "base": round(float(base), 6) if base is not None else None,
+            "picks": [
+                [int(rank), round(float(ret), 6), int(hit)]
+                for rank, ret, hit in zip(grp["rank"], grp[ret_col], grp["hit"], strict=True)
+            ],
+        }
+        if late:
+            entry["late"] = bool(grp["late"].iloc[0])
+        days.append(entry)
+    return days
+
+
+def _summarize_days(days: list[dict], n: int) -> dict:
+    """Basket stats over payload days — EXACT server-side mirror of the inline
+    JS summarize(): basket = first n picks of each day (rank order; taking the
+    next available name IS the substitution rule), day return/hit = basket
+    means, growth compounds net of COST_ROUND_TRIP. Non-finite days are
+    counted as corrupt, never silently averaged around."""
+    growth, hit_sum, base_sum = 1.0, 0.0, 0.0
+    base_known = short = corrupt = 0
+    for day in days:
+        picks = day["picks"][:n]
+        if len(picks) < n:
+            short += 1
+        ret = sum(p[1] for p in picks) / len(picks)
+        hit = sum(p[2] for p in picks) / len(picks)
+        if not (math.isfinite(ret) and math.isfinite(hit)):
+            corrupt += 1
+            continue
+        growth *= 1 + ret - track.COST_ROUND_TRIP
+        hit_sum += hit
+        base = day.get("base")
+        if base is not None and math.isfinite(base):
+            base_sum += base
+            base_known += 1
+    clean = len(days) - corrupt
+    return {
+        "growth": growth,
+        "hit": hit_sum / clean if clean else float("nan"),
+        "base": base_sum / base_known if base_known else None,
+        "days": len(days),
+        "short": short,
+        "corrupt": corrupt,
+    }
+
+
+def _explorer_state(
+    sim_days: list[dict], live_days: list[dict], n: int, w: int
+) -> tuple[dict | None, dict | None, list[str]]:
+    """Selection outcome for both rows + disclosure notes — mirrors JS update().
+
+    Honesty rules enforced identically on both sides: a SIM window renders
+    only when that many sim days exist; LIVE uses live-only days and says
+    "all M live day(s)" when short of the window instead of pretending;
+    short-picks days and corrupt days are disclosed, never silent."""
+    notes: list[str] = []
+    sim_s = None
+    if not sim_days:
+        notes.append("No walk-forward simulation recorded yet — run twopercent benchmark.")
+    elif len(sim_days) < w:
+        notes.append(f"SIM: needs {w} trading days — {len(sim_days)} available")
     else:
-        shortest = track.SIM_WINDOW_SPECS[0]
-        table = (
-            f'<p class="empty">Only {summary.days_available} sim day(s) recorded — '
-            f"the shortest window ({shortest[0]}) needs {shortest[1]} trading days, "
-            "so no window is shown (never computed on a shorter span).</p>"
+        s = _summarize_days(sim_days[-w:], n)
+        if s["corrupt"]:
+            notes.append(f"SIM: {s['corrupt']} corrupt day(s) in window — data error")
+        else:
+            sim_s = s
+            if s["short"]:
+                notes.append(f"SIM: {s['short']} day(s) had fewer than {n} picks")
+    live = [d for d in live_days if not d["late"]]
+    live_s = None
+    if not live:
+        notes.append("LIVE: no live days yet")
+    else:
+        s = _summarize_days(live[-min(w, len(live)) :], n)
+        if s["corrupt"]:
+            notes.append(f"LIVE: {s['corrupt']} corrupt day(s) — data error")
+        else:
+            live_s = s
+            if len(live) < w:
+                notes.append(f"LIVE: all {len(live)} live day(s) — fewer than the {w}-day window")
+            if s["short"]:
+                notes.append(f"LIVE: {s['short']} day(s) had fewer than {n} picks")
+    return sim_s, live_s, notes
+
+
+def _explorer_cells(prefix: str, s: dict | None) -> str:
+    if s is None or not (math.isfinite(s["growth"]) and math.isfinite(s["hit"])):
+        return "".join(
+            f'<td id="tp-{prefix}-{col}">—</td>'
+            for col in ("growth", "hit", "base", "lift", "days")
         )
-    return heading + span + table + f'<p class="sub" style="margin-top:8px">{_SIM_CAVEAT}</p>'
+    base = s["base"]
+    base_txt = f"{base:.0%}" if base is not None else "—"
+    lift_txt = f"{s['hit'] / base:.2f}×" if base else "—"
+    cls = "pos" if s["growth"] >= 1 else "neg"
+    return (
+        f'<td id="tp-{prefix}-growth" class="{cls}">${s["growth"]:.3f}</td>'
+        f'<td id="tp-{prefix}-hit">{s["hit"]:.0%}</td>'
+        f'<td id="tp-{prefix}-base">{base_txt}</td>'
+        f'<td id="tp-{prefix}-lift">{lift_txt}</td>'
+        f'<td id="tp-{prefix}-days">{s["days"]}</td>'
+    )
+
+
+def _record_explorer(meta: dict | None, sim_days: list[dict], live_days: list[dict]) -> str:
+    """Interactive basket/window explorer: amber SIM row vs green LIVE row.
+
+    Server-side renders the default selection (top-5, 6 months) so the page
+    is meaningful without JS; the inline script recomputes on select change
+    from the embedded JSON payload."""
+    n, w = BASKET_DEFAULT, WINDOW_DEFAULT
+    sim_s, live_s, notes = _explorer_state(sim_days, live_days, n, w)
+    basket_opts = "".join(
+        f'<option value="{b}"{" selected" if b == n else ""}>Top {b}</option>'
+        for b in BASKET_CHOICES
+    )
+    window_opts = "".join(
+        f'<option value="{d}"{" selected" if d == w else ""}>{label} ({d} trading days)</option>'
+        for label, d in track.SIM_WINDOW_SPECS
+    )
+    controls = (
+        '<p class="sub controls"><label>Basket '
+        f'<select id="tp-basket">{basket_opts}</select></label> '
+        f'<label>Window <select id="tp-window">{window_opts}</select></label></p>'
+    )
+    span = ""
+    if meta is not None:
+        months = meta["params"].get("months")
+        run_day = pd.Timestamp(meta["run_ts"]).date()
+        span = (
+            f'<p class="sub">SIM test span <b class="mono">{meta["test_start"]}</b> → '
+            f'<b class="mono">{meta["test_end"]}</b> · months={months} · '
+            f'simulated <b class="mono">{run_day}</b> · '
+            f'<span class="mono">{len(sim_days)}</span> sim days available</p>'
+        )
+    table = (
+        "<div class='card'><table>"
+        "<tr><th>Record</th><th>$1 →</th><th>Hit rate</th><th>Base rate</th>"
+        "<th>Lift</th><th>Days</th></tr>"
+        '<tr><td><span class="badge-sim">SIM</span> walk-forward, monthly retrain</td>'
+        + _explorer_cells("sim", sim_s)
+        + "</tr>"
+        '<tr><td><span class="badge-live">LIVE</span> logged picks</td>'
+        + _explorer_cells("live", live_s)
+        + "</tr></table>"
+        f'<p class="sub" id="tp-note">{html.escape(" · ".join(notes))}</p></div>'
+    )
+    return (
+        "<h2>Record over trailing windows</h2>"
+        + controls
+        + table
+        + span
+        + f'<p class="sub" style="margin-top:8px">{_SIM_CAVEAT}</p>'
+    )
+
+
+_JS = """
+<script>
+(function () {
+  var el = function (id) { return document.getElementById(id); };
+  var dataEl = el("tp-data");
+  var basket = el("tp-basket");
+  var win = el("tp-window");
+  if (!dataEl || !basket || !win) return;
+  var data = JSON.parse(dataEl.textContent);
+  var DASH = "\\u2014";
+  function summarize(days, n, cost) {
+    var growth = 1, hitSum = 0, baseSum = 0, baseKnown = 0, shortDays = 0, corrupt = 0;
+    for (var i = 0; i < days.length; i++) {
+      var picks = days[i].picks.slice(0, n);
+      if (picks.length < n) shortDays += 1;
+      var ret = 0, hit = 0;
+      for (var j = 0; j < picks.length; j++) { ret += picks[j][1]; hit += picks[j][2]; }
+      ret /= picks.length; hit /= picks.length;
+      if (!isFinite(ret) || !isFinite(hit)) { corrupt += 1; continue; }
+      growth *= 1 + ret - cost;
+      hitSum += hit;
+      var b = days[i].base;
+      if (b != null && isFinite(b)) { baseSum += b; baseKnown += 1; }
+    }
+    var clean = days.length - corrupt;
+    return { growth: growth, hit: clean ? hitSum / clean : NaN,
+             base: baseKnown ? baseSum / baseKnown : null,
+             days: days.length, shortDays: shortDays, corrupt: corrupt };
+  }
+  function setRow(prefix, s) {
+    var g = el("tp-" + prefix + "-growth");
+    if (s == null || !isFinite(s.growth) || !isFinite(s.hit)) {
+      g.textContent = DASH; g.className = "";
+      el("tp-" + prefix + "-hit").textContent = DASH;
+      el("tp-" + prefix + "-base").textContent = DASH;
+      el("tp-" + prefix + "-lift").textContent = DASH;
+      el("tp-" + prefix + "-days").textContent = DASH;
+      return;
+    }
+    g.textContent = "$" + s.growth.toFixed(3);
+    g.className = s.growth >= 1 ? "pos" : "neg";
+    el("tp-" + prefix + "-hit").textContent = Math.round(100 * s.hit) + "%";
+    el("tp-" + prefix + "-base").textContent =
+      s.base == null ? DASH : Math.round(100 * s.base) + "%";
+    el("tp-" + prefix + "-lift").textContent =
+      s.base != null && s.base > 0 ? (s.hit / s.base).toFixed(2) + "\\u00d7" : DASH;
+    el("tp-" + prefix + "-days").textContent = String(s.days);
+  }
+  function update() {
+    var n = parseInt(basket.value, 10);
+    var w = parseInt(win.value, 10);
+    var notes = [];
+    if (!data.sim.length) {
+      setRow("sim", null);
+      notes.push("No walk-forward simulation recorded yet " + DASH +
+                 " run twopercent benchmark.");
+    } else if (data.sim.length < w) {
+      setRow("sim", null);
+      notes.push("SIM: needs " + w + " trading days " + DASH + " " +
+                 data.sim.length + " available");
+    } else {
+      var s = summarize(data.sim.slice(-w), n, data.cost);
+      if (s.corrupt) {
+        setRow("sim", null);
+        notes.push("SIM: " + s.corrupt + " corrupt day(s) in window " + DASH + " data error");
+      } else {
+        setRow("sim", s);
+        if (s.shortDays) notes.push("SIM: " + s.shortDays +
+                                    " day(s) had fewer than " + n + " picks");
+      }
+    }
+    var live = [];
+    for (var i = 0; i < data.live.length; i++) if (!data.live[i].late) live.push(data.live[i]);
+    if (!live.length) { setRow("live", null); notes.push("LIVE: no live days yet"); }
+    else {
+      var s2 = summarize(live.slice(-Math.min(w, live.length)), n, data.cost);
+      if (s2.corrupt) {
+        setRow("live", null);
+        notes.push("LIVE: " + s2.corrupt + " corrupt day(s) " + DASH + " data error");
+      } else {
+        setRow("live", s2);
+        if (live.length < w) notes.push("LIVE: all " + live.length + " live day(s) " + DASH +
+                                        " fewer than the " + w + "-day window");
+        if (s2.shortDays) notes.push("LIVE: " + s2.shortDays +
+                                     " day(s) had fewer than " + n + " picks");
+      }
+    }
+    el("tp-note").textContent = notes.join(" \\u00b7 ");
+  }
+  basket.addEventListener("change", update);
+  win.addEventListener("change", update);
+})();
+</script>
+"""
 
 
 def build_html(
@@ -375,7 +603,24 @@ def build_html(
         dates = ", ".join(f'<span class="mono">{d}</span>' for d in record.pending)
         pending = f'<p class="sub" style="margin-top:8px">Awaiting outcomes for: {dates}</p>'
 
-    sim_panel = _sim_panel(store.latest_experiment_daily(con, result.strategy))
+    sim = store.latest_experiment_daily(con, result.strategy)
+    outcomes = track.daily_rank_outcomes(con, result.strategy)
+    base_dates = [
+        pd.Timestamp(d).date()
+        for frame in ((sim[1] if sim is not None else None), outcomes)
+        if frame is not None and not frame.empty
+        for d in frame["target_date"]
+    ]
+    bases = track.daily_base_rates(con, base_dates)
+    sim_days = _payload_days(sim[1], bases, "ret") if sim is not None else []
+    live_days = _payload_days(outcomes, bases, "oc_return", late=True) if len(outcomes) else []
+    explorer = _record_explorer(sim[0] if sim is not None else None, sim_days, live_days)
+    payload = json.dumps(
+        {"cost": track.COST_ROUND_TRIP, "sim": sim_days, "live": live_days},
+        separators=(",", ":"),
+        allow_nan=False,  # a NaN reaching the payload must fail the render, loudly
+    )
+    data_tag = f'<script type="application/json" id="tp-data">{payload}</script>'
 
     return (
         head
@@ -383,9 +628,11 @@ def build_html(
         + "<h2>Track record</h2>"
         + body
         + pending
-        + sim_panel
+        + explorer
         + '<p class="note">Generated by twopercent. Model output, not investment advice.</p>'
         + "</div></div>"
+        + data_tag
+        + _JS
     )
 
 

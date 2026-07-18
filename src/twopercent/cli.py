@@ -253,9 +253,17 @@ def doctor_cmd(
         "behind the store max.",
     ),
     examples: int = typer.Option(10, help="Worst examples to print per check."),
+    repair_splits: bool = typer.Option(
+        False,
+        "--repair-splits",
+        help="Delete split-artifact bars (extreme oc_return with open off-scale "
+        "vs prior close) before running the checks. Without this flag the "
+        "doctor is read-only.",
+    ),
     db: Path = DbOption,
 ) -> None:
     """Data-quality checks over the price store; exit 1 if any check finds problems."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         con = store.connect(db)
     except duckdb.IOException:
@@ -264,6 +272,17 @@ def doctor_cmd(
     if scan_mod.latest_price_date(con) is None:
         typer.echo("Store has no price data — run `twopercent ingest` first.")
         raise typer.Exit(1)
+
+    if repair_splits:
+        removed = doctor_mod.repair_splits(con)
+        if removed.empty:
+            typer.echo("repair-splits: no split artifacts found")
+        else:
+            typer.echo(f"repair-splits: deleted {len(removed)} split-artifact bars:")
+            for row in removed.itertuples():
+                typer.echo(
+                    f"    {row.symbol:<8} {row.date:%Y-%m-%d} oc_return {row.oc_return:+.1%}"
+                )
 
     report = doctor_mod.run(con, stale_days=stale_days)
     typer.echo(f"Doctor report for {db}")

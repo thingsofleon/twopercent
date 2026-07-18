@@ -17,6 +17,7 @@ from sklearn.metrics import brier_score_loss, roc_auc_score
 
 from twopercent import store, strategies
 from twopercent.features import feature_frame
+from twopercent.predict import LIQUIDITY_MIN_MEDIAN_VOLUME
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,8 @@ def run_benchmark(
     daily_hits: list[float] = []
     fold_drops: dict[dt.date, frozenset[str]] = {}
     folds_run = 0
+    floored_row_days = 0
+    unscoreable_days = 0
 
     for month_start, month_end in folds:
         train = labeled[labeled["target_date"] < month_start]
@@ -69,12 +72,32 @@ def run_benchmark(
         all_probs.append(probs)
         all_labels.append(test["did_2pct_next"])
         for _, day_rows in test.assign(prob=probs).groupby("target_date"):
-            top = day_rows.nlargest(top_n, "prob")
+            # Same liquidity floor the shipped predictions apply (predict.py):
+            # only the top-N SELECTION filters — training and the AUC/brier
+            # populations above stay all-names, matching the label definition.
+            eligible = day_rows[day_rows["median_vol_20"] >= LIQUIDITY_MIN_MEDIAN_VOLUME]
+            floored_row_days += len(day_rows) - len(eligible)
+            if eligible.empty:
+                unscoreable_days += 1
+                continue
+            top = eligible.nlargest(top_n, "prob")
             daily_hits.append(top["did_2pct_next"].mean())
         logger.info("fold %s..%s: %d train, %d test", month_start, month_end, len(train), len(test))
 
     if not all_probs:
         raise RuntimeError("no folds had enough data to benchmark")
+    if not daily_hits:
+        raise RuntimeError("every test day fell below the liquidity floor — no top-N to score")
+    if floored_row_days:
+        logger.warning(
+            "top-N selection excluded %d row-days below the %d-share liquidity floor "
+            "across %d test days (%d days had no eligible names at all; training and "
+            "AUC/brier populations keep all names)",
+            floored_row_days,
+            LIQUIDITY_MIN_MEDIAN_VOLUME,
+            len(daily_hits) + unscoreable_days,
+            unscoreable_days,
+        )
 
     dropped_columns = sorted(set().union(*fold_drops.values()))
     if len(set(fold_drops.values())) > 1:
@@ -106,7 +129,12 @@ def run_benchmark(
         store.record_experiment(
             con,
             strategy=strategy_name,
-            params={"months": months, "top_n": top_n, "dropped_columns": dropped_columns},
+            params={
+                "months": months,
+                "top_n": top_n,
+                "selection": "liquidity_floor_100k",
+                "dropped_columns": dropped_columns,
+            },
             train_start=labeled["target_date"].min(),
             test_start=folds[0][0],
             test_end=folds[-1][1],

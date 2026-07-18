@@ -121,6 +121,135 @@ def test_all_universe_symbols_unions_snapshots(con):
     assert symbols[0] == "NVDA"  # largest cap first
 
 
+def _experiment(con, strategy="s", test_start=dt.date(2026, 1, 5), test_end=dt.date(2026, 2, 27)):
+    return store.record_experiment(
+        con,
+        strategy=strategy,
+        params={"months": 2},
+        train_start=dt.date(2025, 1, 2),
+        test_start=test_start,
+        test_end=test_end,
+        metrics={"lift": 1.5},
+    )
+
+
+def _daily_frame(dates, rets_by_rank: dict[int, list[float]]):
+    """Rank-level daily rows: {rank: [ret per date]} → target_date, rank, ret, hit."""
+    rows = [
+        {"target_date": d, "rank": rank, "ret": rets[i], "hit": 1 if rets[i] >= 0.021 else 0}
+        for i, d in enumerate(dates)
+        for rank, rets in sorted(rets_by_rank.items())
+    ]
+    return pd.DataFrame(rows)
+
+
+def test_record_experiment_returns_seq(con):
+    seq1 = _experiment(con)
+    seq2 = _experiment(con)
+    assert isinstance(seq1, int)
+    assert seq2 > seq1
+
+
+def test_latest_experiment_daily_none_when_no_daily_rows(con):
+    _experiment(con)  # aggregates only — predates the experiment_daily table
+    assert store.latest_experiment_daily(con, "s") is None
+
+
+def test_experiment_daily_roundtrip_most_days_wins(con):
+    long_dates = sorted(pd.bdate_range("2026-01-05", periods=3).date)
+    short_dates = long_dates[:2]
+    long_seq = _experiment(con)
+    store.record_experiment_daily(
+        con, long_seq, _daily_frame(long_dates, {1: [0.031, -0.013, 0.022], 2: [0.011] * 3})
+    )
+    short_seq = _experiment(con)  # NEWER but shorter — must not displace the long record
+    store.record_experiment_daily(con, short_seq, _daily_frame(short_dates, {1: [0.09, 0.09]}))
+    _experiment(con)  # newest of all, but no daily rows — must be skipped
+    other_seq = _experiment(con, strategy="other")
+    store.record_experiment_daily(con, other_seq, _daily_frame(long_dates, {1: [0.05] * 3}))
+
+    result = store.latest_experiment_daily(con, "s")
+    assert result is not None
+    meta, daily = result
+    assert meta["seq"] == long_seq
+    assert meta["test_start"] == dt.date(2026, 1, 5)
+    assert meta["test_end"] == dt.date(2026, 2, 27)
+    assert meta["params"]["months"] == 2
+    assert "run_ts" in meta
+    # Ordered by (target_date, rank); values roundtrip exactly.
+    assert [pd.Timestamp(d).date() for d in daily["target_date"]] == [
+        d for d in long_dates for _ in (1, 2)
+    ]
+    assert daily["rank"].tolist() == [1, 2, 1, 2, 1, 2]
+    assert daily[daily["rank"] == 1]["ret"].tolist() == [0.031, -0.013, 0.022]
+    assert daily[daily["rank"] == 1]["hit"].tolist() == [1, 0, 1]
+
+
+def test_latest_experiment_daily_tiebreak_is_newest(con):
+    dates = sorted(pd.bdate_range("2026-01-05", periods=2).date)
+    old_seq = _experiment(con)
+    store.record_experiment_daily(con, old_seq, _daily_frame(dates, {1: [0.01, 0.01]}))
+    new_seq = _experiment(con)
+    store.record_experiment_daily(con, new_seq, _daily_frame(dates, {1: [0.02, 0.02]}))
+    meta, _ = store.latest_experiment_daily(con, "s")
+    assert meta["seq"] == new_seq  # same day count → newest run wins
+
+
+def test_record_experiment_daily_empty_frame_is_noop(con):
+    seq = _experiment(con)
+    assert store.record_experiment_daily(con, seq, pd.DataFrame()) == 0
+    assert store.latest_experiment_daily(con, "s") is None
+
+
+def test_record_experiment_daily_rejects_corrupt_rows(con):
+    import numpy as np
+    import pytest
+
+    dates = sorted(pd.bdate_range("2026-01-05", periods=2).date)
+    seq = _experiment(con)
+    nan_ret = _daily_frame(dates, {1: [0.01, 0.02]})
+    nan_ret.loc[0, "ret"] = np.nan
+    with pytest.raises(ValueError, match="1 row"):
+        store.record_experiment_daily(con, seq, nan_ret)
+
+    null_hit = _daily_frame(dates, {1: [0.01, 0.02]})
+    null_hit["hit"] = null_hit["hit"].astype("float64")
+    null_hit.loc[1, "hit"] = np.nan
+    with pytest.raises(ValueError, match="non-finite ret or null hit"):
+        store.record_experiment_daily(con, seq, null_hit)
+
+    # Nothing was persisted by the rejected writes.
+    assert con.execute("SELECT count(*) FROM experiment_daily").fetchone()[0] == 0
+
+
+def test_connect_drops_pre_release_experiment_daily(tmp_path, caplog):
+    import duckdb
+
+    path = tmp_path / "old.duckdb"
+    old = duckdb.connect(str(path))
+    old.execute(
+        """
+        CREATE TABLE experiment_daily (
+            seq BIGINT NOT NULL, target_date DATE NOT NULL,
+            top1_ret DOUBLE, top1_hit INTEGER, top5_ret DOUBLE, top5_hits DOUBLE,
+            PRIMARY KEY (seq, target_date)
+        );
+        INSERT INTO experiment_daily VALUES (1, DATE '2026-01-05', 0.01, 0, 0.01, 0.2);
+        """
+    )
+    old.close()
+
+    with caplog.at_level("WARNING", logger="twopercent.store"):
+        con = store.connect(path)
+    assert "pre-release" in caplog.text and "1 sim row" in caplog.text
+    # The new shape is usable immediately.
+    seq = _experiment(con)
+    dates = sorted(pd.bdate_range("2026-01-05", periods=2).date)
+    assert store.record_experiment_daily(con, seq, _daily_frame(dates, {1: [0.01, 0.03]})) == 2
+    meta, daily = store.latest_experiment_daily(con, "s")
+    assert meta["seq"] == seq and daily["rank"].tolist() == [1, 1]
+
+
 def test_record_ingest_from_keeps_earliest(con):
     store.record_ingest_from(con, ["AAPL"], dt.date(2024, 1, 1))
     store.record_ingest_from(con, ["AAPL"], dt.date(2025, 1, 1))  # later; must not regress

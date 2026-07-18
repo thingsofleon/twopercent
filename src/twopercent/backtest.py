@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 MIN_TRAIN_ROWS = 10_000
 DEFAULT_TEST_MONTHS = 12
 DEFAULT_TOP_N = 20
+RECORD_RANKS = 20  # per-day ranks persisted to experiment_daily for the SIM panel
 
 
 def month_folds(target_dates: pd.Series, months: int) -> list[tuple[dt.date, dt.date]]:
@@ -53,8 +54,10 @@ def run_benchmark(
     folds_run = 0
     floored_row_days = 0
     unscoreable_days = 0
-    daily_picks: list[tuple[float, int, float, float]] = []
+    daily_picks: list[tuple[dt.date, float, int, float, float]] = []
+    rank_rows: list[tuple[dt.date, int, float, int]] = []
     fold_top1_growth: list[float] = []
+    first_run_start: dt.date | None = None
 
     for month_start, month_end in folds:
         fold_pick_start = len(daily_picks)
@@ -68,13 +71,17 @@ def run_benchmark(
             )
             continue
         folds_run += 1
+        if first_run_start is None:
+            # Skipped folds must not be claimed: the recorded test_start is the
+            # first fold that actually RAN, not the first fold requested.
+            first_run_start = month_start
         strategy = strategies.get(strategy_name)
         strategy.fit(train)
         fold_drops[month_start] = frozenset(getattr(strategy, "dropped_columns", ()))
         probs = strategy.predict_proba(test)
         all_probs.append(probs)
         all_labels.append(test["did_2pct_next"])
-        for _, day_rows in test.assign(prob=probs).groupby("target_date"):
+        for target_date, day_rows in test.assign(prob=probs).groupby("target_date"):
             # Same liquidity floor the shipped predictions apply (predict.py):
             # only the top-N SELECTION filters — training and the AUC/brier
             # populations above stay all-names, matching the label definition.
@@ -85,10 +92,19 @@ def run_benchmark(
                 continue
             top = eligible.nlargest(top_n, "prob")
             daily_hits.append(top["did_2pct_next"].mean())
-            top5 = eligible.nlargest(5, "prob")
+            # One frame drives both the recorded per-rank rows and the top-1/
+            # top-5 aggregates (rank 1 row, mean of ranks 1-5), so the stored
+            # rows recompound to exactly the recorded metrics.
+            top20 = eligible.nlargest(RECORD_RANKS, "prob")
+            for rank, row in enumerate(top20.itertuples(), start=1):
+                rank_rows.append(
+                    (target_date, rank, float(row.next_oc_return), int(row.did_2pct_next))
+                )
+            top5 = top20.iloc[:5]
             top1 = top5.iloc[0]
             daily_picks.append(
                 (
+                    target_date,
                     float(top1["next_oc_return"]),
                     int(top1["did_2pct_next"]),
                     float(top5["next_oc_return"].mean()),
@@ -96,7 +112,7 @@ def run_benchmark(
                 )
             )
         fold_growth = 1.0
-        for ret, _, _, _ in daily_picks[fold_pick_start:]:
+        for _, ret, _, _, _ in daily_picks[fold_pick_start:]:
             fold_growth *= 1 + ret - track.COST_ROUND_TRIP
         fold_top1_growth.append(round(fold_growth, 4))
         logger.info("fold %s..%s: %d train, %d test", month_start, month_end, len(train), len(test))
@@ -131,7 +147,9 @@ def run_benchmark(
     labels = pd.concat(all_labels).astype(int)
     base_rate = labels.mean()
     precision_at_n = float(pd.Series(daily_hits).mean())
-    picks = pd.DataFrame(daily_picks, columns=["top1_ret", "top1_hit", "top5_ret", "top5_hits"])
+    picks = pd.DataFrame(
+        daily_picks, columns=["target_date", "top1_ret", "top1_hit", "top5_ret", "top5_hits"]
+    )
     sim_top1 = float((1 + picks["top1_ret"] - track.COST_ROUND_TRIP).prod())
     sim_top5 = float((1 + picks["top5_ret"] - track.COST_ROUND_TRIP).prod())
     metrics = {
@@ -160,7 +178,7 @@ def run_benchmark(
         "folds": folds_run,
     }
     if record:
-        store.record_experiment(
+        seq = store.record_experiment(
             con,
             strategy=strategy_name,
             params={
@@ -170,8 +188,12 @@ def run_benchmark(
                 "dropped_columns": dropped_columns,
             },
             train_start=labeled["target_date"].min(),
-            test_start=folds[0][0],
+            test_start=first_run_start,
             test_end=folds[-1][1],
             metrics=metrics,
         )
+        # Per-day per-rank pick outcomes land in experiment_daily (dashboard
+        # SIM panel), never in the metrics JSON above.
+        rank_frame = pd.DataFrame(rank_rows, columns=["target_date", "rank", "ret", "hit"])
+        store.record_experiment_daily(con, seq, rank_frame)
     return metrics

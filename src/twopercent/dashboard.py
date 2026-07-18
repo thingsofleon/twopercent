@@ -255,7 +255,13 @@ def build_html(
             f'<td class="{"pos" if r.lift >= 1 else "neg"}">{r.lift:.2f}×</td></tr>'
             for r in record.scored.itertuples()
         )
-        body = (
+        late_note = ""
+        if record.late_days:
+            late_note = (
+                f'<p class="sub"><b>{record.late_days} of {len(record.scored)} days '
+                "were backfilled after the fact</b> — not live forecasting skill.</p>"
+            )
+        body = late_note + (
             f"<div class='card'>{_chart_svg(record.scored)}</div>"
             + "<div class='card'><table><tr><th>Day</th><th>Hits</th><th>Hit rate</th>"
             + f"<th>Base rate</th><th>Lift</th></tr>{trs}</table></div>"

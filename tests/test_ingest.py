@@ -85,15 +85,17 @@ def test_ingest_writes_and_reports(con, download_calls):
     assert store.price_row_count(con) == 10
 
 
-def test_ingest_skips_only_fully_covered_symbols(con, download_calls):
+def test_ingest_always_refetches_last_bar_even_when_current(con, download_calls):
+    # No skip path: a same-day bar could be a partial from a mid-session run,
+    # so even a fully-covered current symbol refetches from its last bar.
     today = dt.date.today()
     _seed_price(con, "AAPL", today)
     store.record_ingest_from(con, ["AAPL"], dt.date(2000, 1, 1))
 
     result = ingest.ingest(con, ["AAPL", "NVDA"], years=1)
 
-    assert result.symbols_skipped == ["AAPL"]
-    assert [c[0] for c in download_calls] == [["NVDA"]]  # AAPL never re-downloaded
+    assert result.symbols_skipped == []
+    assert download_calls[0][0] == ["AAPL", "NVDA"]  # AAPL re-downloaded, not skipped
 
 
 def test_ingest_backfills_when_prior_run_was_shorter(con, download_calls):

@@ -13,8 +13,14 @@ from twopercent.scan import _THRESHOLD_EPSILON, DEFAULT_THRESHOLD
 
 @dataclass
 class TrackRecord:
-    scored: pd.DataFrame  # one row per scoreable signal_date
+    scored: pd.DataFrame  # one row per scoreable signal_date; `late` column marks
+    # days whose predictions were logged AFTER the target date (backfills) —
+    # they are shown, but must never be read as live forecasting skill
     pending: list  # signal_dates predicted but with no next trading day ingested yet
+
+    @property
+    def late_days(self) -> int:
+        return int(self.scored["late"].sum()) if not self.scored.empty else 0
 
 
 def score_predictions(
@@ -62,6 +68,18 @@ def score_predictions(
         [strategy, threshold, strategy, top_n, threshold],
     ).df()
 
+    if not scored.empty:
+        created = dict(
+            con.execute(
+                "SELECT signal_date, max(created_ts) FROM predictions "
+                "WHERE strategy = ? GROUP BY signal_date",
+                [strategy],
+            ).fetchall()
+        )
+        scored["late"] = [
+            created[pd.Timestamp(sd).date()].date() > pd.Timestamp(td).date()
+            for sd, td in zip(scored["signal_date"], scored["target_date"], strict=True)
+        ]
     resolved = set(pd.to_datetime(scored["signal_date"]).dt.date) if not scored.empty else set()
     pending = [d for d in store.predicted_signal_dates(con, strategy) if d not in resolved]
     return TrackRecord(scored=scored, pending=pending)

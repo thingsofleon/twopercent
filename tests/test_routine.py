@@ -79,8 +79,11 @@ def test_market_hours_boundaries():
 
 def test_routine_aborts_on_ingest_introduced_corruption(ready, monkeypatch):
     def corrupting_ingest(con_, symbols, **kw):
-        # Ingest "succeeds" but writes a fresh split-artifact-scale bar.
-        seed_history(con_, {"EVIL": [0.0] * 3 + [0.9]}, start="2026-07-06")
+        # Ingest "succeeds" but writes a fresh extreme bar RECENT enough to be
+        # today's data (within 3 days of the store's newest bar).
+        newest = con_.execute("SELECT max(date) FROM prices").fetchone()[0]
+        start = pd.bdate_range(end=newest, periods=1)[0].date()
+        seed_history(con_, {"EVIL": [0.9]}, start=str(start))
         return ingest.IngestResult(symbols_skipped=list(symbols))
 
     monkeypatch.setattr(routine.ingest, "ingest", corrupting_ingest)
@@ -90,6 +93,22 @@ def test_routine_aborts_on_ingest_introduced_corruption(ready, monkeypatch):
     assert "EVIL" in report.steps[-1].detail
     n = ready.execute("SELECT count(*) FROM predictions").fetchone()[0]
     assert n == 0  # the model never trained on the corrupted store
+
+
+def test_routine_backfilled_historical_extremes_warn_not_fail(ready, monkeypatch):
+    # A weekly refresh backfilling a volatile symbol adds YEARS-OLD extreme
+    # bars. Hard-failing on those would cry wolf weekly and teach the operator
+    # to ignore exit 2 — they must WARN while recent corruption still FAILs.
+    def backfilling_ingest(con_, symbols, **kw):
+        seed_history(con_, {"BIOTC": [0.0, 0.9, 0.0]}, start="2024-03-04")  # old squeeze
+        return ingest.IngestResult(symbols_skipped=list(symbols))
+
+    monkeypatch.setattr(routine.ingest, "ingest", backfilling_ingest)
+    report = routine.run(db_path=_db(ready))
+    recheck = next(s for s in report.steps if s.name == "recheck")
+    assert recheck.status == "warn"
+    assert "backfill" in recheck.detail
+    assert any(s.name == "predict" for s in report.steps)  # run continued
 
 
 def test_routine_preexisting_problems_warn_but_run(ready):

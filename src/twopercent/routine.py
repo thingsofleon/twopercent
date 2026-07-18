@@ -6,9 +6,9 @@ draft):
 
 - **Market-hours guard first.** A mid-session run would ingest today's
   partial bar, fabricating features AND the prior day's label. The routine
-  refuses to run during US market hours. (Defense in depth: ingest also
-  refetches each symbol's last stored bar, so a partial bar written by a
-  bypassed run is overwritten by the next legitimate one.)
+  refuses to run during US market hours. (Defense in depth: ingest always
+  refetches each symbol's last stored bar — never skips it — so a partial
+  bar written by any bypassed run is overwritten by the next run.)
 - **Wall-clock staleness gate.** A store whose newest bar is old produces
   "predictions" for days that already happened; those must never enter the
   track record.
@@ -98,6 +98,14 @@ def _symbols(frame: pd.DataFrame) -> set[str]:
     return set(frame["symbol"]) if not frame.empty and "symbol" in frame.columns else set()
 
 
+def _bar_keys(frame: pd.DataFrame) -> set[tuple[str, str]]:
+    """(symbol, date) pairs — same-symbol new corruption must not hide behind
+    a baseline extreme on that symbol."""
+    if frame.empty or "symbol" not in frame.columns or "date" not in frame.columns:
+        return set()
+    return {(s, str(d)) for s, d in zip(frame["symbol"], frame["date"], strict=True)}
+
+
 def run(
     db_path: Path | str = store.DEFAULT_DB_PATH,
     out_path: str = "dashboard.html",
@@ -116,6 +124,7 @@ def run(
         )
         return report
     report.add("clock", OK, f"{now:%a %H:%M} ET, market closed")
+    today = now.date()  # one clock: ET everywhere (a UTC host is 'tomorrow' after 20:00 ET)
 
     try:
         con = store.connect(db_path)
@@ -133,17 +142,17 @@ def run(
     if uni.empty:
         try:
             fresh = universe.refresh_universe()
-            n = store.upsert_universe(con, fresh, as_of=dt.date.today())
+            n = store.upsert_universe(con, fresh, as_of=today)
             report.add("universe", OK, f"bootstrapped: {n} symbols")
         except Exception as exc:
             report.add("universe", FAIL, f"no universe stored and refresh failed: {exc}")
             return report
     else:
-        age = (dt.date.today() - uni["as_of"].iloc[0].date()).days
+        age = (today - uni["as_of"].iloc[0].date()).days
         if age > universe_max_age_days:
             try:
                 fresh = universe.refresh_universe()
-                n = store.upsert_universe(con, fresh, as_of=dt.date.today())
+                n = store.upsert_universe(con, fresh, as_of=today)
                 report.add("universe", OK, f"refreshed: {n} symbols (was {age}d old)")
             except Exception as exc:
                 report.add("universe", WARN, f"refresh failed, using {age}d-old snapshot: {exc}")
@@ -181,7 +190,7 @@ def run(
 
     post = doctor.run(con)
     max_date = post.max_date
-    if max_date is None or (dt.date.today() - max_date).days > MAX_STORE_AGE_DAYS:
+    if max_date is None or (today - max_date).days > MAX_STORE_AGE_DAYS:
         report.add(
             "freshness",
             FAIL,
@@ -191,28 +200,40 @@ def run(
         return report
     report.add("freshness", OK, f"newest bar {max_date}")
 
-    new_extreme = _symbols(post.extreme) - _symbols(pre.extreme)
+    # New corruption = (symbol, date) pairs absent from the pre-ingest
+    # baseline. Only RECENT pairs hard-fail: a weekly-refresh backfill of a
+    # volatile symbol legitimately adds years-old extreme bars, and a gate
+    # that cries wolf weekly trains its operator to ignore exit 2.
+    recent_cutoff = (pre.max_date or dt.date.min) - dt.timedelta(days=3)
+    new_extreme = _bar_keys(post.extreme) - _bar_keys(pre.extreme)
     new_invalid = _symbols(post.invalid) - _symbols(pre.invalid)
     new_zero = _symbols(post.zero_runs) - _symbols(pre.zero_runs)
-    if new_extreme or new_invalid:
-        examples = ", ".join(sorted(new_extreme | new_invalid)[:5])
+    recent_extreme = {k for k in new_extreme if k[1] >= str(recent_cutoff)}
+    backfill_extreme = new_extreme - recent_extreme
+    if recent_extreme or new_invalid:
+        examples = ", ".join(sorted({s for s, _ in recent_extreme} | new_invalid)[:5])
         report.add(
             "recheck",
             FAIL,
-            f"today's ingest introduced corruption ({len(new_extreme)} extreme, "
-            f"{len(new_invalid)} invalid symbols: {examples}) — aborting before the model",
+            f"today's ingest introduced corruption ({len(recent_extreme)} recent extreme "
+            f"bars, {len(new_invalid)} invalid symbols: {examples}) — aborting before the model",
         )
         return report
     coverage_holes = len(post.universe_missing_prices)
     recheck_detail = "no new corruption from today's ingest"
+    if backfill_extreme:
+        recheck_detail += (
+            f"; {len(backfill_extreme)} historical extreme bars from backfill (review)"
+        )
     if new_zero:
         recheck_detail += f"; {len(new_zero)} new zero-volume symbols"
     if coverage_holes:
         recheck_detail += f"; {coverage_holes} universe symbols still without prices"
-    report.add("recheck", WARN if (new_zero or coverage_holes) else OK, recheck_detail)
+    soft = backfill_extreme or new_zero or coverage_holes
+    report.add("recheck", WARN if soft else OK, recheck_detail)
 
-    name = champion.get_champion()
     try:
+        name = champion.get_champion()
         prediction = predict_for(con, name, save=True)
         head = prediction.scored.head(5)
         report.top_candidates = list(zip(head["symbol"], head["prob"], strict=True))

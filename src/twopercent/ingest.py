@@ -19,11 +19,6 @@ logger = logging.getLogger(__name__)
 BATCH_SIZE = 150
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 5.0
-# A symbol is skipped only when its last stored bar is essentially at the
-# window end (same-day rerun). Anything older refetches from its LAST stored
-# bar — not last+1 — so a partial bar written by a mid-session run is healed
-# by the next run's overwrite (upserts are idempotent).
-CURRENT_WITHIN_DAYS = 1
 
 
 @dataclass
@@ -126,16 +121,16 @@ def ingest(
 
     last_dates = store.last_price_dates(con)
     covered_from = store.ingest_from_dates(con)
-    end_cutoff = end - dt.timedelta(days=CURRENT_WITHIN_DAYS)
 
     plan: list[tuple[str, dt.date]] = []  # (symbol, fetch start)
     for sym in symbols:
         last = last_dates.get(sym)
         covers_start = covered_from.get(sym) is not None and covered_from[sym] <= start
-        if covers_start and last is not None and last >= end_cutoff:
-            result.symbols_skipped.append(sym)
-        elif covers_start and last is not None:
-            plan.append((sym, last))  # include the last bar: heals partials
+        if covers_start and last is not None:
+            # Always refetch from the LAST stored bar inclusive — never skip.
+            # The one bar a same-day skip would preserve is exactly the one
+            # that can be a partial (mid-session) bar; refetching heals it.
+            plan.append((sym, last))
         else:
             plan.append((sym, start))
     # Sort by fetch start so tail-fetches batch together instead of dragging a

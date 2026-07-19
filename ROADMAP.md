@@ -122,6 +122,28 @@ Locked decisions (v1, 2026-07-18):
   classification (data problem / feature drift / regime change / genuine
   model decay), findings as an issue comment plus scoped fix issues; it
   never edits champion.json or the referee.
+- **Overnight research loop (#42, decided 2026-07-18):** the idle GPU works
+  through a checked-in experiment queue (`research/queue.json`, `{strategy,
+  params, note}`, edited only via PR — auditable sweeps). Nightly runner
+  `twopercent research` (systemd timer, daily 22:00 America/Denver):
+  - **Budget cap:** at most `--budget` (default 8) experiments per night.
+  - **Clock gate:** runs only 16:30–05:00 America/Denver, any day — one rule
+    that clears market hours and both routine runs (single-writer DuckDB).
+  - **Queue state = the experiments ledger,** not a state file: a config with
+    a recorded standard (12-month, top-20) benchmark is skipped loudly, so
+    the queue is idempotent and a scheduled run never dirties the repo. A
+    crashed config is not recorded and retries next night.
+  - **Promotion guardrails:** a challenger beating the champion on lift
+    outside the noise band (0.1, shared with `compare`) files ONE deduped,
+    locked `promotion-candidate` issue. Promotion stays HUMAN-ONLY by PR
+    editing champion.json, after the standard full-window referee run plus
+    quant-skeptic review — decided on lift/AUC, never sim growth. The runner
+    writes nothing but experiments-ledger rows and that issue.
+  - **Multiple-comparisons caveat:** an overnight sweep evaluates many
+    configs against the same test months; the best of them is inflated by
+    selection and every candidate issue says so. Real fix — holdout-months
+    discipline (sweep selection vs final validation on untouched recent
+    months) — is #45, filed rather than half-built.
 - Your role: "keep prediction quality above X, keep data clean, surface
   anything unusual" — monitor by exception.
 
@@ -154,5 +176,9 @@ truth for *decisions and plan shape*; GitHub is the source of truth for
 - Level 4 — AI-native: **IN PROGRESS 2026-07-18** (#10). Shipped: `routine
   --mode score` (post-close scoring run), trailing-5 live-lift degradation
   detector, auto-filed `auto-degradation` investigation issue, investigator
-  agent charter. Exit criterion: a real degradation → investigation cycle
-  observed, or at minimum both timers proven live — NOT complete yet.
+  agent charter. Shipped (#42, pending live night-run proof): overnight
+  research loop — parameterized strategies, `xgb_gbm_v1` CUDA challenger
+  with loud CPU fallback, seeded 24-config queue, `twopercent research`
+  runner, `promotion-candidate` issues; follow-up #45 (holdout months).
+  Exit criterion: a real degradation → investigation cycle observed, or at
+  minimum both timers proven live — NOT complete yet.

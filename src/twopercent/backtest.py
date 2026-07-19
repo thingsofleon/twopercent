@@ -40,8 +40,15 @@ def run_benchmark(
     months: int = DEFAULT_TEST_MONTHS,
     top_n: int = DEFAULT_TOP_N,
     record: bool = True,
+    strategy_params: dict | None = None,
 ) -> dict:
-    """Walk-forward benchmark; returns metrics and records an experiments row."""
+    """Walk-forward benchmark; returns metrics and records an experiments row.
+
+    strategy_params are passed to the strategy constructor on every fold's
+    fresh instance and recorded in the experiments params JSON under
+    "strategy_params" — the key the research runner matches queue configs
+    against, so a recorded config is never re-run.
+    """
     frame = feature_frame(con)
     labeled = frame[frame["did_2pct_next"].notna()].copy()
     labeled["target_date"] = pd.to_datetime(labeled["target_date"]).dt.date
@@ -75,7 +82,7 @@ def run_benchmark(
             # Skipped folds must not be claimed: the recorded test_start is the
             # first fold that actually RAN, not the first fold requested.
             first_run_start = month_start
-        strategy = strategies.get(strategy_name)
+        strategy = strategies.get(strategy_name, **(strategy_params or {}))
         strategy.fit(train)
         fold_drops[month_start] = frozenset(getattr(strategy, "dropped_columns", ()))
         probs = strategy.predict_proba(test)
@@ -186,6 +193,7 @@ def run_benchmark(
                 "top_n": top_n,
                 "selection": "liquidity_floor_100k",
                 "dropped_columns": dropped_columns,
+                "strategy_params": strategy_params or {},
             },
             train_start=labeled["target_date"].min(),
             test_start=first_run_start,

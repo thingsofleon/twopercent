@@ -8,7 +8,7 @@ import pytest
 from tests.conftest import seed_planted
 from twopercent import backtest, store, strategies
 from twopercent.features import FEATURE_COLUMNS
-from twopercent.strategies.base import register
+from twopercent.strategies.base import _REGISTRY, register
 
 GBM_LOGGER = "twopercent.strategies.baseline_gbm"
 
@@ -135,3 +135,62 @@ def test_benchmark_warns_when_folds_drop_different_columns(con, monkeypatch, cap
     assert "log_mcap" in mixed[0]
     params = json.loads(store.list_experiments(con)["params"].iloc[0])
     assert params["dropped_columns"] == ["log_mcap"]  # union across folds
+
+
+# --- parameterized registry (research loop) -----------------------------------
+
+
+def test_get_passes_constructor_params_and_defaults():
+    @register("param_probe_v1")
+    class ParamProbe:
+        def __init__(self, alpha=1, beta="x"):
+            self.alpha = alpha
+            self.beta = beta
+
+    try:
+        got = strategies.get("param_probe_v1", alpha=7)
+        assert got.alpha == 7 and got.beta == "x"
+        default = strategies.get("param_probe_v1")
+        assert default.alpha == 1 and default.beta == "x"  # no params -> historical behavior
+    finally:
+        _REGISTRY.pop("param_probe_v1")
+
+
+def test_get_unknown_param_is_loud():
+    with pytest.raises(TypeError):
+        strategies.get("baseline_gbm_v1", bogus_knob=1)
+
+
+def test_baseline_gbm_constructor_kwargs_reach_sklearn():
+    tuned = strategies.get("baseline_gbm_v1", max_iter=60, learning_rate=0.05, max_depth=3)
+    params = tuned._model.get_params()
+    assert params["max_iter"] == 60
+    assert params["learning_rate"] == 0.05
+    assert params["max_depth"] == 3
+    # No-params regression: the historical baseline config, exactly.
+    default = strategies.get("baseline_gbm_v1")._model.get_params()
+    assert default["max_iter"] == 150
+    assert default["learning_rate"] == 0.1
+    assert default["random_state"] == 42
+    assert default["max_depth"] is None
+
+
+def test_benchmark_records_strategy_params(con, monkeypatch):
+    monkeypatch.setattr(backtest, "MIN_TRAIN_ROWS", 500)
+    seed_planted(con)
+
+    backtest.run_benchmark(
+        con, "baseline_gbm_v1", months=2, top_n=5, strategy_params={"max_iter": 60}
+    )
+    params = json.loads(store.list_experiments(con)["params"].iloc[0])
+    assert params["strategy_params"] == {"max_iter": 60}
+
+
+def test_benchmark_default_records_empty_strategy_params(con, monkeypatch):
+    monkeypatch.setattr(backtest, "MIN_TRAIN_ROWS", 500)
+    seed_planted(con)
+
+    metrics = backtest.run_benchmark(con, "baseline_gbm_v1", months=2, top_n=5)
+    assert metrics["lift"] > 1.5  # unchanged no-params behavior
+    params = json.loads(store.list_experiments(con)["params"].iloc[0])
+    assert params["strategy_params"] == {}

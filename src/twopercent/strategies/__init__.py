@@ -3,6 +3,7 @@
 from twopercent.strategies import (
     baseline_gbm,  # noqa: F401  (registers on import)
     logreg,  # noqa: F401  (registers on import)
+    xgb_gbm,  # noqa: F401  (registers on import)
 )
 from twopercent.strategies.base import Strategy, get, names, register
 

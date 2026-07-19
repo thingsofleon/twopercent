@@ -14,11 +14,15 @@ from twopercent import doctor as doctor_mod
 from twopercent import ingest as ingest_mod
 from twopercent import scan as scan_mod
 from twopercent import store, universe
+from twopercent.compare import compare_verdict as _compare_verdict
 
 app = typer.Typer(help="Scanner + predictor for +2% open-to-close US stock moves.")
 
 DbOption = typer.Option(store.DEFAULT_DB_PATH, "--db", help="Path to the DuckDB file.")
 OutOption = typer.Option(Path("dashboard.html"), "--out", help="Output HTML path.")
+QueueOption = typer.Option(
+    Path("research/queue.json"), "--queue", help="Experiment queue JSON (edited via PR)."
+)
 
 
 @app.command("universe")
@@ -120,26 +124,6 @@ def benchmark_cmd(
     typer.echo(f"Benchmark {name} over last {months} months (top-{top} daily):")
     for key, value in metrics.items():
         typer.echo(f"  {key:>15}: {value}")
-
-
-LIFT_NOISE_BAND = 0.1
-_NOISE_BAND_EPSILON = 1e-9  # FP: 2.05 - 1.95 == 0.0999...987, yet is a true 0.1 gap
-
-
-def _compare_verdict(strat_a: str, lift_a: float | None, strat_b: str, lift_b: float | None) -> str:
-    """One-line verdict on lift; refuses to crown a winner inside the noise band."""
-    if lift_a is None or lift_b is None:
-        return "Winner on lift: undecided (lift unavailable for at least one strategy)"
-    if lift_a == lift_b:
-        return f"Winner on lift: tie at {lift_a}"
-    if abs(lift_a - lift_b) < LIFT_NOISE_BAND - _NOISE_BAND_EPSILON:
-        return (
-            "Winner on lift: within noise — no meaningful difference "
-            "(same-window comparison; repeated trials against the same months "
-            "inflate the best result)"
-        )
-    winner = strat_a if lift_a > lift_b else strat_b
-    return f"Winner on lift: {winner} ({max(lift_a, lift_b)} vs {min(lift_a, lift_b)})"
 
 
 @app.command("compare")
@@ -261,6 +245,32 @@ def routine_cmd(
         typer.echo(f"Invalid --mode {mode!r}: expected 'predict' or 'score'.")
         raise typer.Exit(2)
     report = routine_mod.run(db_path=db, out_path=str(out), top=top, mode=mode)
+    for line in report.summary_lines():
+        typer.echo(line)
+    raise typer.Exit(report.exit_code)
+
+
+@app.command("research")
+def research_cmd(
+    budget: int = typer.Option(8, "--budget", min=1, help="Max experiments to run tonight."),
+    queue: Path = QueueOption,
+    db: Path = DbOption,
+) -> None:
+    """Overnight research loop: benchmark queued configs, flag champion beaters.
+
+    Runs only between 16:30 and 05:00 America/Denver (clear of market hours and
+    the routine runs). Exit codes: 0 clean or empty queue, 1 some experiments
+    failed or queue entries were malformed, 2 the runner itself failed.
+    """
+    from twopercent import research as research_mod
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        report = research_mod.run(db_path=db, budget=budget, queue_path=queue)
+    except Exception as exc:
+        logging.getLogger(__name__).exception("research runner crashed")
+        typer.echo(f"research: FAIL — runner crashed: {exc}")
+        raise typer.Exit(2) from exc
     for line in report.summary_lines():
         typer.echo(line)
     raise typer.Exit(report.exit_code)

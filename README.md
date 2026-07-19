@@ -25,6 +25,7 @@ uv run twopercent dashboard            # static dashboard.html
 uv run twopercent benchmark            # walk-forward benchmark -> experiments row
 uv run twopercent routine              # pre-open daily cycle (predict mode)
 uv run twopercent routine --mode score # post-close scoring + degradation check
+uv run twopercent research             # overnight experiment queue (budget 8/night)
 ```
 
 ## The daily cycle (two runs)
@@ -55,6 +56,48 @@ the cause (data problem / feature drift / regime change / genuine model
 decay), and posts findings back to the issue. With fewer than 5 live days the
 detector loudly reports it is not yet armed.
 
+## The research loop (overnight)
+
+`twopercent research` works through `research/queue.json` — a checked-in list
+of `{strategy, params, note}` configs (edited only via PR, so every sweep is
+auditable). Each config runs the standard referee benchmark (12-month
+walk-forward, top-20, recorded to the experiments ledger) with the params
+passed to the strategy constructor. The `xgb_gbm_v1` challenger trains on the
+GPU (`device="cuda"`) and falls back to CPU with a loud warning when CUDA is
+unavailable.
+
+Guardrails:
+
+- **Clock gate:** runs only between 16:30 and 05:00 America/Denver (any day —
+  offline compute, weekends fine), keeping clear of market hours and the
+  06:00/14:45 routine runs (DuckDB is single-writer). The window is rechecked
+  before each experiment with a one-hour must-finish margin (no new config
+  starts after 04:00), so a slow night can never hold the store into the
+  06:00 predict run.
+- **Budget:** at most `--budget` (default 8, minimum 1) experiments per night.
+- **Idempotent, no state file:** a config whose (strategy, params) already has
+  a recorded standard benchmark in the experiments ledger is skipped (loudly
+  counted; numeric identity is canonicalized, so 200 == 200.0), so a scheduled
+  run never dirties the repo and reruns are safe. The experiments row and its
+  daily rows land atomically; a crashed config records NOTHING and retries the
+  next night. The training device (cuda/cpu) is recorded per run, and a night
+  that recorded configs under CPU fallback warns loudly.
+- **Write-nothing:** the runner writes only experiments-ledger rows — never
+  champion.json, predictions, or prices.
+- **Promotion stays human:** a config beating the champion on lift beyond the
+  PROMOTION band (0.25 — family-wise, wider than compare's single-comparison
+  0.1 because a sweep is ~24 comparisons against the same months) AND holding
+  the margin on both disjoint halves of the shared test days files ONE
+  deduped, locked `promotion-candidate` GitHub issue. It is a hypothesis, not
+  a promotion: the issue demands the wall-clock holdout (margin holds on >= 2
+  months of data arriving after the candidate's test_end, #45), quant-skeptic
+  review, and a human PR — never sim growth. The champion's reference
+  benchmark is always its own default-config run (parameterized sweep
+  variants recorded under the same strategy name are excluded).
+
+Exit codes: 0 clean or empty queue, 1 some experiments failed or queue entries
+were malformed, 2 the runner itself failed.
+
 ## Scheduling (systemd user timers, local)
 
 The DuckDB store is on-box, so v1 schedules locally (cloud runs are deferred
@@ -65,6 +108,11 @@ to `logs/routine.log`:
 |---|---|---|---|
 | predict | `Mon..Fri 06:00 America/Denver` | 08:00 ET, pre-open | `uv run twopercent routine` |
 | score | `Mon..Fri 14:45 America/Denver` | 16:45 ET, post-close | `uv run twopercent routine --mode score` |
+| research | `daily 22:00 America/Denver` | 00:00 ET, overnight | `uv run twopercent research` |
+
+(Research runs every day, weekends included — it is offline compute against
+the local store, and its own clock gate refuses anything outside 16:30–05:00
+Denver.)
 
 The predict timer is already installed at
 `~/.config/systemd/user/twopercent-routine.{service,timer}`. The score timer
@@ -75,3 +123,10 @@ is a post-merge step — install it as follows: copy the routine units to
 `systemctl --user daemon-reload && systemctl --user enable --now
 twopercent-score.timer`. On WSL the machine must be running with lingering
 enabled (`loginctl enable-linger`) for unattended fire.
+
+The research timer installs the same way: copy the routine units to
+`twopercent-research.{service,timer}`, change `ExecStart` to
+`.../uv run twopercent research` and `OnCalendar` to
+`*-*-* 22:00 America/Denver` (every day), then
+`systemctl --user daemon-reload && systemctl --user enable --now
+twopercent-research.timer`.

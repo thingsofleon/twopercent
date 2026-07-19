@@ -257,3 +257,27 @@ def test_record_ingest_from_keeps_earliest(con):
 
     store.record_ingest_from(con, ["AAPL"], dt.date(2020, 1, 1))  # earlier; must win
     assert store.ingest_from_dates(con)["AAPL"] == dt.date(2020, 1, 1)
+
+
+def test_latest_experiment_daily_ignores_parameterized_variants(con):
+    """A research variant recorded under the same strategy name can tie on day
+    count and win on recency — it must never displace the strategy's own
+    default-config record (the dashboard sim panel reads this)."""
+    dates = sorted(pd.bdate_range("2026-01-05", periods=2).date)
+    champ_seq = _experiment(con)  # params {"months": 2}: no strategy_params key
+    store.record_experiment_daily(con, champ_seq, _daily_frame(dates, {1: [0.01, 0.01]}))
+    variant_seq = store.record_experiment(  # newer, MORE days, parameterized
+        con,
+        strategy="s",
+        params={"months": 2, "strategy_params": {"max_iter": 300}},
+        train_start=dt.date(2025, 1, 2),
+        test_start=dt.date(2026, 1, 5),
+        test_end=dt.date(2026, 2, 27),
+        metrics={"lift": 9.9},
+    )
+    long_dates = sorted(pd.bdate_range("2026-01-05", periods=3).date)
+    store.record_experiment_daily(con, variant_seq, _daily_frame(long_dates, {1: [0.02] * 3}))
+
+    meta, daily = store.latest_experiment_daily(con, "s")
+    assert meta["seq"] == champ_seq  # never the variant, despite more days + recency
+    assert "strategy_params" not in meta["params"]

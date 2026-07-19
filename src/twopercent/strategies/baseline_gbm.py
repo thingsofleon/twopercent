@@ -13,14 +13,21 @@ from twopercent.strategies.base import register
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_PARAMS = {"max_iter": 150, "learning_rate": 0.1, "random_state": 42}
+
+
 @register("baseline_gbm_v1")
 class BaselineGBM:
-    """HistGradientBoosting: fast on millions of rows, NaN-tolerant, no tuning."""
+    """HistGradientBoosting: fast on millions of rows, NaN-tolerant, no tuning.
 
-    def __init__(self) -> None:
-        self._model = HistGradientBoostingClassifier(
-            max_iter=150, learning_rate=0.1, random_state=42
-        )
+    Constructor kwargs pass straight through to HistGradientBoostingClassifier
+    (research configs use max_iter/learning_rate/max_depth); defaults are
+    DEFAULT_PARAMS, so no-arg construction is the historical baseline. An
+    unknown kwarg raises TypeError at construction — never a silent default.
+    """
+
+    def __init__(self, **params) -> None:
+        self._model = HistGradientBoostingClassifier(**{**DEFAULT_PARAMS, **params})
         self._columns: list[str] = list(FEATURE_COLUMNS)
         self.dropped_columns: list[str] = []
 

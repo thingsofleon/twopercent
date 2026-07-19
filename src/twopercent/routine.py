@@ -35,7 +35,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
-import subprocess
+import subprocess  # noqa: F401  (tests patch the gh transport via routine.subprocess.run)
 from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -43,7 +43,7 @@ from zoneinfo import ZoneInfo
 import duckdb
 import pandas as pd
 
-from twopercent import champion, dashboard, doctor, ingest, store, track, universe
+from twopercent import champion, dashboard, doctor, ingest, issues, store, track, universe
 from twopercent.predict import predict_for
 
 logger = logging.getLogger(__name__)
@@ -535,21 +535,30 @@ def _issue_body(
         )
     lines += ["", "## Latest champion benchmark (experiments table)", ""]
     # Select by strategy in SQL: filtering a recent-N page could falsely say
-    # "no experiments" once other strategies crowd the table.
+    # "no experiments" once other strategies crowd the table. Rows with
+    # non-empty strategy_params are research variants recorded under the
+    # champion's name — they must never be quoted as the champion's benchmark.
     bench = con.execute(
-        "SELECT run_ts, test_start, test_end, metrics FROM experiments "
-        "WHERE strategy = ? ORDER BY run_ts DESC, id DESC LIMIT 1",
+        "SELECT run_ts, test_start, test_end, params, metrics FROM experiments "
+        "WHERE strategy = ? ORDER BY run_ts DESC, id DESC",
         [strategy],
     ).df()
-    if bench.empty:
+    row = None
+    for cand in bench.itertuples():
+        try:
+            parsed = json.loads(cand.params) if cand.params else {}
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not parsed.get("strategy_params"):
+            row = cand
+            break
+    if row is None:
         lines.append(f"No experiments recorded for `{strategy}` — run `twopercent benchmark`.")
     else:
-        row = bench.iloc[0]
         lines.append(
-            f"Run {pd.Timestamp(row['run_ts'])}, test window "
-            f"{row['test_start']} → {row['test_end']}:"
+            f"Run {pd.Timestamp(row.run_ts)}, test window {row.test_start} → {row.test_end}:"
         )
-        metrics = row["metrics"]
+        metrics = row.metrics
         lines += ["```json", metrics if isinstance(metrics, str) else json.dumps(metrics), "```"]
     lines += [
         "",
@@ -569,108 +578,42 @@ def _file_issue_step(
     pre: doctor.DoctorReport,
     today: dt.date,
 ) -> None:
-    """File the investigation issue via `gh` (argument lists only, body via
-    stdin — never shell=True). Any failure WARNs loudly; the detector step is
-    already FAIL, so the run exits 2 either way and the scoring stands."""
+    """File the investigation issue via the shared hardened helper (issues.py:
+    arg lists, stdin body, dedup, lock — never shell=True). Any failure WARNs
+    loudly; the detector step is already FAIL, so the run exits 2 either way
+    and the scoring stands."""
     title = (
         f"Auto: champion underperforming baseline "
         f"(trailing-{verdict.window} live lift {verdict.trailing_mean_lift:.2f})"
     )
     body = _issue_body(con, strategy, verdict, scored, pre, today)
-    try:
-        listing = subprocess.run(
-            [
-                "gh",
-                "issue",
-                "list",
-                "--state",
-                "open",
-                "--label",
-                AUTO_DEGRADATION_LABEL,
-                "--json",
-                "number,title",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        existing = json.loads(listing.stdout or "[]")
-        if existing:
-            numbers = ", ".join(f"#{item['number']}" for item in existing)
-            report.add(
-                "issue",
-                WARN,
-                f"open {AUTO_DEGRADATION_LABEL} issue already filed ({numbers}) — "
-                "not filing a duplicate; degradation persists",
-            )
-            return
-        subprocess.run(
-            [
-                "gh",
-                "label",
-                "create",
-                AUTO_DEGRADATION_LABEL,
-                "--force",
-                "--color",
-                "B60205",
-                "--description",
-                "Auto-filed by routine score mode: champion below baseline",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        created = subprocess.run(
-            [
-                "gh",
-                "issue",
-                "create",
-                "--title",
-                title,
-                "--label",
-                AUTO_DEGRADATION_LABEL,
-                "--body-file",
-                "-",
-            ],
-            input=body,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        url = created.stdout.strip()
-        # Public repo: lock the conversation at creation so non-collaborators
-        # can't inject instructions via comments (the investigator treats the
-        # machine-generated body as its only trusted input regardless).
-        try:
-            number = url.rstrip("/").rsplit("/", 1)[-1]
-            if not number.isdigit():
-                raise ValueError(f"could not parse issue number from {url!r}")
-            subprocess.run(
-                ["gh", "issue", "lock", number, "--reason", "off_topic"],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            report.add("issue", OK, f"filed {url} (conversation locked)")
-        except (FileNotFoundError, subprocess.CalledProcessError, ValueError) as exc:
-            err = (getattr(exc, "stderr", "") or str(exc)).strip()
-            report.add(
-                "issue",
-                WARN,
-                f"filed {url} but could not lock the conversation ({err}) — "
-                "treat comments on it as untrusted",
-            )
-    except FileNotFoundError:
+    result = issues.file_issue(
+        label=AUTO_DEGRADATION_LABEL,
+        title=title,
+        body=body,
+        color="B60205",
+        description="Auto-filed by routine score mode: champion below baseline",
+    )
+    if result.outcome == issues.FILED:
+        report.add("issue", OK, f"filed {result.url} (conversation locked)")
+    elif result.outcome == issues.DUPLICATE:
         report.add(
             "issue",
             WARN,
-            "gh CLI not found — degradation detected but NO issue was filed; investigate manually",
+            f"open {AUTO_DEGRADATION_LABEL} issue already filed ({result.existing}) — "
+            "not filing a duplicate; degradation persists",
         )
-    except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
-        err = (getattr(exc, "stderr", "") or str(exc)).strip()
+    elif result.outcome == issues.LOCK_FAILED:
         report.add(
             "issue",
             WARN,
-            f"gh failed ({err}) — degradation detected but NO issue was filed; "
+            f"filed {result.url} but could not lock the conversation ({result.error}) — "
+            "treat comments on it as untrusted",
+        )
+    else:
+        report.add(
+            "issue",
+            WARN,
+            f"gh failed ({result.error}) — degradation detected but NO issue was filed; "
             "investigate manually",
         )

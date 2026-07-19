@@ -37,11 +37,18 @@ def register(name: str):
     return decorator
 
 
-def get(name: str) -> Strategy:
+def get(name: str, **params) -> Strategy:
+    """Instantiate a registered strategy, passing `params` to its constructor.
+
+    No params → identical to the historical no-arg behavior. A strategy whose
+    constructor rejects a param raises TypeError here — loud, so a typo in an
+    experiment config can never silently run the defaults instead.
+    """
     try:
-        return _REGISTRY[name]()
+        cls = _REGISTRY[name]
     except KeyError:
         raise ValueError(f"unknown strategy {name!r}; available: {sorted(_REGISTRY)}") from None
+    return cls(**params)
 
 
 def names() -> list[str]:

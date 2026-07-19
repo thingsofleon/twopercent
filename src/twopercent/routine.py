@@ -535,21 +535,30 @@ def _issue_body(
         )
     lines += ["", "## Latest champion benchmark (experiments table)", ""]
     # Select by strategy in SQL: filtering a recent-N page could falsely say
-    # "no experiments" once other strategies crowd the table.
+    # "no experiments" once other strategies crowd the table. Rows with
+    # non-empty strategy_params are research variants recorded under the
+    # champion's name — they must never be quoted as the champion's benchmark.
     bench = con.execute(
-        "SELECT run_ts, test_start, test_end, metrics FROM experiments "
-        "WHERE strategy = ? ORDER BY run_ts DESC, id DESC LIMIT 1",
+        "SELECT run_ts, test_start, test_end, params, metrics FROM experiments "
+        "WHERE strategy = ? ORDER BY run_ts DESC, id DESC",
         [strategy],
     ).df()
-    if bench.empty:
+    row = None
+    for cand in bench.itertuples():
+        try:
+            parsed = json.loads(cand.params) if cand.params else {}
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not parsed.get("strategy_params"):
+            row = cand
+            break
+    if row is None:
         lines.append(f"No experiments recorded for `{strategy}` — run `twopercent benchmark`.")
     else:
-        row = bench.iloc[0]
         lines.append(
-            f"Run {pd.Timestamp(row['run_ts'])}, test window "
-            f"{row['test_start']} → {row['test_end']}:"
+            f"Run {pd.Timestamp(row.run_ts)}, test window {row.test_start} → {row.test_end}:"
         )
-        metrics = row["metrics"]
+        metrics = row.metrics
         lines += ["```json", metrics if isinstance(metrics, str) else json.dumps(metrics), "```"]
     lines += [
         "",

@@ -19,8 +19,9 @@ from each fold's training labels (negatives/positives), never hard-coded.
 XGBoost tolerates NaN feature values natively, but columns with ZERO observed
 values are still dropped with the same loud warning as baseline_gbm_v1 so the
 benchmark's `dropped_columns` semantics (fold-drop warnings, ledger params)
-stay identical across strategies. NOTE: XGBoost only warns (does not raise) on
-unknown booster params, so keep queue configs to the documented knobs.
+stay identical across strategies. Constructor params are validated against
+ALLOWED_PARAMS (XGBoost itself would forward unknown kwargs with only a
+printed notice — a typo'd config must never silently run the defaults).
 """
 
 from __future__ import annotations
@@ -45,6 +46,10 @@ DEFAULT_PARAMS = {
     "subsample": 0.8,
     "colsample_bytree": 0.8,
 }
+# XGBoost forwards unknown kwargs to the booster with only a printed notice —
+# which would break the registry's promise that a typo'd experiment config can
+# never silently run the defaults. Whitelist the tunable surface instead.
+ALLOWED_PARAMS = frozenset(DEFAULT_PARAMS) | {"gamma", "reg_alpha", "reg_lambda"}
 
 
 def _probe_cuda() -> bool:
@@ -91,11 +96,19 @@ class XGBoostGBM:
     """XGBoost hist trees; see module docstring for defaults and GPU fallback."""
 
     def __init__(self, device: str = "cuda", **params) -> None:
+        unknown = sorted(set(params) - ALLOWED_PARAMS)
+        if unknown:
+            raise ValueError(
+                f"xgb_gbm_v1: unknown param(s) {', '.join(unknown)} — XGBoost would "
+                f"forward them silently; allowed (besides device): "
+                f"{', '.join(sorted(ALLOWED_PARAMS))}"
+            )
         self._device = device
         self._params = {**DEFAULT_PARAMS, **params}
         self._model: xgboost.XGBClassifier | None = None
         self._columns: list[str] = list(FEATURE_COLUMNS)
         self.dropped_columns: list[str] = []
+        self.resolved_device: str | None = None  # set at fit; recorded by the referee
 
     def fit(self, train: pd.DataFrame) -> None:
         empty = [col for col in FEATURE_COLUMNS if train[col].notna().sum() == 0]
@@ -121,9 +134,10 @@ class XGBoostGBM:
         # Imbalance weight from THIS fold's training labels (like the baseline's
         # intent); degenerate one-class training keeps a neutral 1.0.
         scale_pos_weight = negatives / positives if positives and negatives else 1.0
+        self.resolved_device = _resolve_device(self._device)
         self._model = xgboost.XGBClassifier(
             **self._params,
-            device=_resolve_device(self._device),
+            device=self.resolved_device,
             tree_method="hist",
             scale_pos_weight=scale_pos_weight,
             eval_metric="logloss",

@@ -319,16 +319,21 @@ def record_experiment_daily(con: duckdb.DuckDBPyConnection, seq: int, rows: pd.D
 def latest_experiment_daily(
     con: duckdb.DuckDBPyConnection, strategy: str
 ) -> tuple[dict, pd.DataFrame] | None:
-    """The best-recorded experiment for `strategy` that HAS daily rows, plus those rows.
+    """The best-recorded DEFAULT-CONFIG experiment for `strategy` that HAS
+    daily rows, plus those rows.
 
     "Best" = most daily rows first, then newest run_ts: a later short run
     (`benchmark --months 2`, a compare) must not silently displace the
-    12-month record the dashboard windows need. Returns (experiment metadata
-    dict, per-rank daily frame ordered by target_date, rank), or None when no
-    experiment of this strategy recorded daily rows — experiments predating
-    the experiment_daily table have aggregates only.
+    12-month record the dashboard windows need. Experiments with non-empty
+    `strategy_params` are EXCLUDED: a parameterized research variant recorded
+    under the same strategy name (the nightly sweep does this) must never
+    masquerade as the strategy's own reference run — it can tie on day count
+    and win on recency. Returns (experiment metadata dict, per-rank daily
+    frame ordered by target_date, rank), or None when no qualifying experiment
+    recorded daily rows — experiments predating the experiment_daily table
+    have aggregates only.
     """
-    row = con.execute(
+    rows = con.execute(
         """
         SELECT e.id, e.run_ts, e.params, e.test_start, e.test_end
         FROM experiments e
@@ -338,10 +343,23 @@ def latest_experiment_daily(
         ) d ON d.seq = e.id
         WHERE e.strategy = ?
         ORDER BY d.n_days DESC, e.run_ts DESC, e.id DESC
-        LIMIT 1
         """,
         [strategy],
-    ).fetchone()
+    ).fetchall()
+    row = None
+    for candidate in rows:
+        try:
+            parsed = json.loads(candidate[2]) if candidate[2] else {}
+        except json.JSONDecodeError:
+            logger.warning(
+                "experiments row #%s has unparseable params — skipped as reference run",
+                candidate[0],
+            )
+            continue
+        if parsed.get("strategy_params"):
+            continue  # parameterized variant, not the strategy's default config
+        row = candidate
+        break
     if row is None:
         return None
     seq, run_ts, params, test_start, test_end = row

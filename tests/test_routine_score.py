@@ -394,3 +394,35 @@ def test_degraded_gh_error_warns_and_still_exits_2(degraded, monkeypatch):
 def test_unknown_mode_rejected(ready):
     with pytest.raises(ValueError, match="unknown routine mode"):
         routine.run(db_path=_db(ready), mode="bogus")
+
+
+def test_issue_body_quotes_default_config_benchmark_not_variant(degraded, monkeypatch):
+    """Research variants record under the champion's strategy NAME — the
+    evidence bundle must quote the champion's own (params-free) benchmark,
+    never a newer parameterized sweep row."""
+    name = champion.get_champion()
+    store.record_experiment(
+        degraded,
+        strategy=name,
+        params={"months": 12, "top_n": 20, "dropped_columns": []},  # pre-research shape
+        train_start=dt.date(2021, 7, 1),
+        test_start=dt.date(2025, 7, 1),
+        test_end=dt.date(2026, 6, 30),
+        metrics={"lift": 2.0, "auc": 0.69},
+    )
+    store.record_experiment(  # NEWER variant row with a flattering lift
+        degraded,
+        strategy=name,
+        params={"months": 12, "top_n": 20, "strategy_params": {"max_iter": 300}},
+        train_start=dt.date(2021, 7, 1),
+        test_start=dt.date(2025, 7, 1),
+        test_end=dt.date(2026, 6, 30),
+        metrics={"lift": 9.9, "auc": 0.99},
+    )
+    calls = _gh_spy(monkeypatch)
+    routine.run(db_path=_db(degraded), mode="score")
+
+    _, create_kw = next((args, kw) for args, kw in calls if args[:3] == ["gh", "issue", "create"])
+    body = create_kw["input"]
+    assert '"lift": 2.0' in body  # the champion's own benchmark
+    assert "9.9" not in body  # the variant must never be quoted as the champion

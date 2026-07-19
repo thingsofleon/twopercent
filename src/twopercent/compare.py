@@ -10,17 +10,23 @@ _NOISE_BAND_EPSILON = 1e-9  # FP: 2.05 - 1.95 == 0.0999...987, yet is a true 0.1
 
 
 def lift_winner(
-    strat_a: str, lift_a: float | None, strat_b: str, lift_b: float | None
+    strat_a: str,
+    lift_a: float | None,
+    strat_b: str,
+    lift_b: float | None,
+    band: float = LIFT_NOISE_BAND,
 ) -> str | None:
-    """The strategy winning on lift OUTSIDE the noise band, else None.
+    """The strategy winning on lift OUTSIDE `band`, else None.
 
     None means undecided: lift unavailable, an exact tie, or a difference
-    inside the band. Callers comparing a strategy against itself must pass
+    inside the band. The default band is calibrated for a SINGLE comparison
+    (the compare CLI); multiple-comparison callers (the research sweep) must
+    pass a wider band. Callers comparing a strategy against itself must pass
     distinct role names (e.g. "challenger"/"champion") to tell the sides apart.
     """
     if lift_a is None or lift_b is None or lift_a == lift_b:
         return None
-    if abs(lift_a - lift_b) < LIFT_NOISE_BAND - _NOISE_BAND_EPSILON:
+    if abs(lift_a - lift_b) < band - _NOISE_BAND_EPSILON:
         return None
     return strat_a if lift_a > lift_b else strat_b
 

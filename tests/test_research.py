@@ -1,12 +1,14 @@
 """Research runner: clock gate, queue hygiene, ledger-based idempotency,
-budget cap, crash isolation, promotion-issue filing, and the write-nothing
-guarantee. Offline: benchmark and gh are monkeypatched; clocks are pinned."""
+budget cap, crash isolation, promotion gating (band + disjoint halves),
+issue filing, and the write-nothing guarantee. Offline: benchmark and gh are
+monkeypatched; clocks are pinned."""
 
 import datetime as dt
 import json
 import subprocess
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from twopercent import champion, issues, research, store
@@ -25,6 +27,8 @@ METRICS = {
     "test_days": 250,
     "folds": 12,
 }
+# Shared test days for the disjoint-halves confirmation (champion + fakes).
+DAILY_DATES = [d.date() for d in pd.bdate_range("2025-07-01", periods=10)]
 
 
 def _db(con) -> str:
@@ -41,17 +45,31 @@ def _config(strategy="xgb_gbm_v1", **params):
     return {"strategy": strategy, "params": params, "note": "test config"}
 
 
-def _seed_champion_experiment(con, lift=2.0) -> int:
-    """The champion's recorded standard 12-month benchmark; returns its id."""
-    return store.record_experiment(
+def _daily_rows(prec_per_day) -> pd.DataFrame:
+    """Top-20 rank rows whose per-day mean(hit) equals each day's precision."""
+    rows = []
+    for day, prec in zip(DAILY_DATES, prec_per_day, strict=True):
+        hits = int(round(prec * 20))
+        for rank in range(1, 21):
+            rows.append(
+                {"target_date": day, "rank": rank, "ret": 0.01, "hit": 1 if rank <= hits else 0}
+            )
+    return pd.DataFrame(rows)
+
+
+def _seed_champion_experiment(con, lift=2.0, test_end=dt.date(2026, 6, 30), daily_prec=0.5) -> int:
+    """The champion's recorded standard 12-month benchmark WITH daily rows."""
+    seq = store.record_experiment(
         con,
         strategy=champion.get_champion(),
         params={"months": 12, "top_n": 20, "dropped_columns": [], "strategy_params": {}},
         train_start=dt.date(2021, 7, 1),
         test_start=dt.date(2025, 7, 1),
-        test_end=dt.date(2026, 6, 30),
+        test_end=test_end,
         metrics={**METRICS, "lift": lift, "auc": 0.69},
     )
+    store.record_experiment_daily(con, seq, _daily_rows([daily_prec] * len(DAILY_DATES)))
+    return seq
 
 
 @pytest.fixture(autouse=True)
@@ -72,9 +90,10 @@ def night(monkeypatch):
 
 @pytest.fixture
 def bench_spy(monkeypatch):
-    """Fake referee: records a ledger row like the real one, returns METRICS
-    (override per-config via lifts dict; raise via boom set)."""
-    state = {"calls": [], "lifts": {}, "boom": set()}
+    """Fake referee: records a ledger row + daily rows like the real one and
+    returns METRICS. Overrides per config key: lifts (lift value), daily_prec
+    (scalar or per-day list), boom (raise), device (recorded params device)."""
+    state = {"calls": [], "lifts": {}, "daily_prec": {}, "boom": set(), "device": None}
 
     def fake(con, name, months=12, top_n=20, record=True, strategy_params=None):
         key = json.dumps(strategy_params or {}, sort_keys=True)
@@ -83,15 +102,21 @@ def bench_spy(monkeypatch):
             raise RuntimeError("synthetic benchmark crash")
         metrics = {**METRICS, "lift": state["lifts"].get(key, METRICS["lift"])}
         if record:
-            store.record_experiment(
+            params = {"months": months, "top_n": top_n, "strategy_params": strategy_params or {}}
+            if state["device"] is not None:
+                params["device"] = state["device"]
+            seq = store.record_experiment(
                 con,
                 strategy=name,
-                params={"months": months, "top_n": top_n, "strategy_params": strategy_params or {}},
+                params=params,
                 train_start=dt.date(2021, 7, 1),
                 test_start=dt.date(2025, 7, 1),
                 test_end=dt.date(2026, 6, 30),
                 metrics=metrics,
             )
+            prec = state["daily_prec"].get(key, 0.8)
+            precs = [prec] * len(DAILY_DATES) if isinstance(prec, int | float) else prec
+            store.record_experiment_daily(con, seq, _daily_rows(precs))
         return metrics
 
     monkeypatch.setattr(research.backtest, "run_benchmark", fake)
@@ -149,6 +174,36 @@ def test_clock_gate_matrix(con, tmp_path, monkeypatch, when, allowed):
         assert [s.name for s in report.steps] == ["clock"]
         assert report.exit_code == 2
         assert "research window" in report.steps[0].detail
+
+
+def test_window_rechecked_before_each_experiment(con, tmp_path, monkeypatch, bench_spy):
+    """Entry gating is not enough: a slow night must stop starting new configs
+    once past the 04:00 last-start margin, releasing the store well before the
+    06:00 predict run."""
+    times = iter(
+        [
+            dt.datetime(2026, 7, 18, 3, 0, tzinfo=research._DENVER),  # entry gate
+            dt.datetime(2026, 7, 18, 3, 30, tzinfo=research._DENVER),  # config 1 may start
+            dt.datetime(2026, 7, 18, 4, 10, tzinfo=research._DENVER),  # past the margin
+        ]
+    )
+    monkeypatch.setattr(research, "_now_denver", lambda: next(times))
+    queue = _write_queue(tmp_path, [_config(max_depth=4), _config(max_depth=6)])
+    report = research.run(db_path=_db(con), queue_path=queue)
+
+    assert len(bench_spy["calls"]) == 1  # second config never started
+    assert report.n_ran == 1
+    window = next(s for s in report.steps if s.name == "window")
+    assert window.status == "warn"
+    assert "stopped after 1 of 2" in window.detail and "window closing" in window.detail
+    assert report.exit_code == 0  # partial completion is not failure
+
+
+def test_budget_below_one_is_fatal(con, tmp_path, night, bench_spy):
+    report = research.run(db_path=_db(con), budget=0, queue_path=_write_queue(tmp_path, []))
+    assert report.exit_code == 2
+    assert [s.name for s in report.steps] == ["budget"]
+    assert not bench_spy["calls"]
 
 
 # --- queue hygiene ------------------------------------------------------------
@@ -219,6 +274,25 @@ def test_already_recorded_config_skipped_via_ledger(con, tmp_path, night, bench_
     assert any("1 already recorded" in s.detail for s in report.steps if s.name == "queue")
 
 
+def test_done_matching_canonicalizes_int_vs_float(con, tmp_path, night, bench_spy):
+    """A ledger row recorded with n_estimators 200.0 must satisfy the queue's
+    200 — JSON round-trips can float-ify ints, and a re-run every night would
+    silently burn the budget."""
+    store.record_experiment(
+        con,
+        strategy="xgb_gbm_v1",
+        params={"months": 12, "top_n": 20, "strategy_params": {"n_estimators": 200.0}},
+        train_start=dt.date(2021, 7, 1),
+        test_start=dt.date(2025, 7, 1),
+        test_end=dt.date(2026, 6, 30),
+        metrics=METRICS,
+    )
+    queue = _write_queue(tmp_path, [_config(n_estimators=200)])
+    report = research.run(db_path=_db(con), queue_path=queue)
+    assert report.n_skipped_done == 1
+    assert not bench_spy["calls"]
+
+
 def test_rerun_is_idempotent(con, tmp_path, night, bench_spy):
     """Night two of the same queue re-runs nothing — no state file needed."""
     queue = _write_queue(tmp_path, [_config(max_depth=4), _config(max_depth=6)])
@@ -258,15 +332,59 @@ def test_one_crash_does_not_kill_the_night(con, tmp_path, night, bench_spy):
     assert ("xgb_gbm_v1", '{"max_depth": 4}') not in research.recorded_configs(con)
 
 
+# --- champion identity --------------------------------------------------------
+
+
+def test_champion_reference_ignores_parameterized_variants(con):
+    """A queue variant of the champion strategy records under the champion's
+    NAME — the reference lookup must skip it, even when it is newer and shinier
+    (pre-research rows without the strategy_params key count as default)."""
+    champ_id = store.record_experiment(  # pre-research row: no strategy_params key at all
+        con,
+        strategy="baseline_gbm_v1",
+        params={"months": 12, "top_n": 20, "dropped_columns": []},
+        train_start=dt.date(2021, 7, 1),
+        test_start=dt.date(2025, 7, 1),
+        test_end=dt.date(2026, 6, 30),
+        metrics={**METRICS, "lift": 2.0},
+    )
+    store.record_experiment(  # newer variant with a flattering lift
+        con,
+        strategy="baseline_gbm_v1",
+        params={"months": 12, "top_n": 20, "strategy_params": {"max_iter": 300}},
+        train_start=dt.date(2021, 7, 1),
+        test_start=dt.date(2025, 7, 1),
+        test_end=dt.date(2026, 6, 30),
+        metrics={**METRICS, "lift": 9.9},
+    )
+    result = research._latest_standard_experiment(con, "baseline_gbm_v1")
+    assert result is not None
+    exp_id, metrics, test_end = result
+    assert exp_id == champ_id
+    assert metrics["lift"] == 2.0  # never the variant's 9.9
+    assert test_end == dt.date(2026, 6, 30)
+
+
+def test_stale_champion_reference_warns(con, tmp_path, night, bench_spy):
+    _seed_champion_experiment(con, lift=2.0, test_end=dt.date(2026, 3, 31))
+    bench_spy["lifts"]['{"max_depth": 4}'] = 2.05  # no promotion path
+    report = research.run(
+        db_path=_db(con), queue_path=_write_queue(tmp_path, [_config(max_depth=4)])
+    )
+    stale = [s for s in report.steps if s.name == "champion" and "stale" in s.detail]
+    assert len(stale) == 1 and stale[0].status == "warn"
+    assert "2026-03-31" in stale[0].detail
+
+
 # --- champion comparison and promotion issue ----------------------------------
 
 
-def test_winner_outside_noise_band_files_promotion_issue(
+def test_winner_beyond_promotion_band_files_promotion_issue(
     con, tmp_path, night, bench_spy, monkeypatch
 ):
     champ_id = _seed_champion_experiment(con, lift=2.0)
     gh = _gh_spy(monkeypatch)
-    bench_spy["lifts"]['{"max_depth": 4}'] = 2.5
+    bench_spy["lifts"]['{"max_depth": 4}'] = 2.5  # margin 0.5 >= 0.25 band
     champion_before = Path("champion.json").read_bytes()
     prices_before = store.price_row_count(con)
 
@@ -288,6 +406,10 @@ def test_winner_outside_noise_band_files_promotion_issue(
     assert f"#{champ_id}" in body  # champion's ledger id
     assert f"#{champ_id + 1}" in body  # challenger's ledger id (recorded after)
     assert "| lift | 2.5 | 2.0 |" in body  # full metrics vs champion's
+    assert "promotion band (0.25)" in body
+    assert "Disjoint-halves confirmation" in body and "+0.3000" in body  # 0.8 vs 0.5
+    assert "AFTER this candidate's test_end" in body  # wall-clock holdout demand
+    assert "#45" in body
     assert "quant-skeptic" in body and "champion.json" in body  # promotion rules
     assert "NEVER on sim growth" in body
     assert "hypothesis" in body and "Multiple-comparisons" in body
@@ -302,10 +424,13 @@ def test_winner_outside_noise_band_files_promotion_issue(
     assert store.price_row_count(con) == prices_before
 
 
-def test_within_noise_band_files_nothing(con, tmp_path, night, bench_spy, monkeypatch):
+def test_within_promotion_band_files_nothing(con, tmp_path, night, bench_spy, monkeypatch):
+    """2.2 vs 2.0 beats compare's 0.1 noise band but NOT the 0.25 promotion
+    band — a sweep's best-of-many needs the family-wise bar, not the
+    single-comparison one."""
     _seed_champion_experiment(con, lift=2.0)
     gh = _gh_spy(monkeypatch)
-    bench_spy["lifts"]['{"max_depth": 4}'] = 2.05  # inside the 0.1 band
+    bench_spy["lifts"]['{"max_depth": 4}'] = 2.2
     report = research.run(
         db_path=_db(con), queue_path=_write_queue(tmp_path, [_config(max_depth=4)])
     )
@@ -313,11 +438,37 @@ def test_within_noise_band_files_nothing(con, tmp_path, night, bench_spy, monkey
     assert not gh  # no gh subprocess call of any kind
     assert not any(s.name == "issue" for s in report.steps)
     assert report.exit_code == 0
-    assert any(
-        "challenger" not in s.detail or "within noise" in s.detail
-        for s in report.steps
-        if s.name == "experiment"
+    candidate = next(s for s in report.steps if s.name == "candidate")
+    assert candidate.status == "ok" and "within the promotion band (0.25)" in candidate.detail
+
+
+def test_half_window_loser_files_nothing(con, tmp_path, night, bench_spy, monkeypatch):
+    """Overall winner carried by one hot half: margin +0.5 then -0.2 — the
+    disjoint-halves confirmation must reject it and say so."""
+    _seed_champion_experiment(con, lift=2.0)  # daily precision 0.5 every day
+    gh = _gh_spy(monkeypatch)
+    bench_spy["lifts"]['{"max_depth": 4}'] = 2.5  # beyond the promotion band overall
+    bench_spy["daily_prec"]['{"max_depth": 4}'] = [1.0] * 5 + [0.3] * 5
+    report = research.run(
+        db_path=_db(con), queue_path=_write_queue(tmp_path, [_config(max_depth=4)])
     )
+
+    assert not gh  # no issue of any kind was attempted
+    candidate = next(s for s in report.steps if s.name == "candidate")
+    assert candidate.status == "warn"
+    assert "FAILED the disjoint-halves confirmation" in candidate.detail
+    assert "one-hot-window" in candidate.detail
+    assert report.exit_code == 0
+
+
+def test_cpu_fallback_recording_warns_in_digest(con, tmp_path, night, bench_spy):
+    bench_spy["device"] = "cpu"  # referee recorded a CPU-fallback training
+    report = research.run(
+        db_path=_db(con), queue_path=_write_queue(tmp_path, [_config(max_depth=4)])
+    )
+    device = next(s for s in report.steps if s.name == "device")
+    assert device.status == "warn"
+    assert "CPU FALLBACK" in device.detail and "delete their ledger rows" in device.detail
 
 
 def test_winner_dedups_existing_open_issue(con, tmp_path, night, bench_spy, monkeypatch):
@@ -348,7 +499,7 @@ def test_no_champion_benchmark_disables_promotion(con, tmp_path, night, bench_sp
 
 
 def test_digest_reports_night_summary(con, tmp_path, night, bench_spy):
-    _seed_champion_experiment(con, lift=2.35)  # best of night lands within noise: no issue
+    _seed_champion_experiment(con, lift=2.35)  # best of night lands within the band: no issue
     bench_spy["lifts"]['{"max_depth": 4}'] = 2.1
     bench_spy["lifts"]['{"max_depth": 6}'] = 2.4
     queue = _write_queue(tmp_path, [_config(max_depth=4), _config(max_depth=6)])

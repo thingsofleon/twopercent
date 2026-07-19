@@ -152,3 +152,21 @@ def test_xgb_keeps_partially_observed_column(caplog):
     assert strat.dropped_columns == []
     assert not [r for r in caplog.records if "zero observed values" in r.message]
     assert np.isfinite(strat.predict_proba(frame)).all()
+
+
+def test_unknown_param_rejected_at_construction():
+    """XGBoost forwards unknown kwargs with only a printed notice — the
+    whitelist keeps the registry's promise that a typo can never silently
+    run the defaults."""
+    with pytest.raises(ValueError, match="unknown param"):
+        strategies.get("xgb_gbm_v1", n_estimatorz=100)
+    # Whitelisted regularizers pass through.
+    strat = strategies.get("xgb_gbm_v1", gamma=0.1, reg_alpha=0.5)
+    assert strat._params["gamma"] == 0.1
+
+
+def test_resolved_device_exposed_for_the_referee():
+    strat = strategies.get("xgb_gbm_v1", **FAST)
+    assert strat.resolved_device is None  # unknown until fit
+    strat.fit(_feature_frame_rows())
+    assert strat.resolved_device == "cpu"  # probe forced to the fallback path

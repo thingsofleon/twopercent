@@ -252,7 +252,7 @@ def routine_cmd(
 
 @app.command("research")
 def research_cmd(
-    budget: int = typer.Option(8, "--budget", help="Max experiments to run tonight."),
+    budget: int = typer.Option(8, "--budget", min=1, help="Max experiments to run tonight."),
     queue: Path = QueueOption,
     db: Path = DbOption,
 ) -> None:

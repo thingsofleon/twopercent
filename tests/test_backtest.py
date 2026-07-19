@@ -154,3 +154,22 @@ def test_month_folds_shape():
     for start, end in folds:
         assert start < end
     assert folds[0][1] < folds[1][0]
+
+
+def test_record_is_atomic_when_daily_rows_fail(con, monkeypatch):
+    """A crash between the experiments row and its daily rows must leave
+    NOTHING: a half-recorded experiment would be counted "done" by the
+    research queue forever while its sim-panel rows are missing."""
+    monkeypatch.setattr(backtest, "MIN_TRAIN_ROWS", 500)
+    seed_planted(con)
+
+    def boom(con_, seq, rows):
+        raise ValueError("synthetic daily-row corruption")
+
+    monkeypatch.setattr(backtest.store, "record_experiment_daily", boom)
+    import pytest
+
+    with pytest.raises(ValueError, match="synthetic daily-row corruption"):
+        backtest.run_benchmark(con, "baseline_gbm_v1", months=2, top_n=5)
+    assert con.execute("SELECT count(*) FROM experiments").fetchone()[0] == 0
+    assert con.execute("SELECT count(*) FROM experiment_daily").fetchone()[0] == 0

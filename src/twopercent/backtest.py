@@ -185,23 +185,40 @@ def run_benchmark(
         "folds": folds_run,
     }
     if record:
-        seq = store.record_experiment(
-            con,
-            strategy=strategy_name,
-            params={
-                "months": months,
-                "top_n": top_n,
-                "selection": "liquidity_floor_100k",
-                "dropped_columns": dropped_columns,
-                "strategy_params": strategy_params or {},
-            },
-            train_start=labeled["target_date"].min(),
-            test_start=first_run_start,
-            test_end=folds[-1][1],
-            metrics=metrics,
-        )
-        # Per-day per-rank pick outcomes land in experiment_daily (dashboard
-        # SIM panel), never in the metrics JSON above.
-        rank_frame = pd.DataFrame(rank_rows, columns=["target_date", "rank", "ret", "hit"])
-        store.record_experiment_daily(con, seq, rank_frame)
+        params = {
+            "months": months,
+            "top_n": top_n,
+            "selection": "liquidity_floor_100k",
+            "dropped_columns": dropped_columns,
+            "strategy_params": strategy_params or {},
+        }
+        # Which device actually trained (strategies expose resolved_device
+        # when it matters, e.g. xgb's CUDA probe). A sibling of
+        # strategy_params on purpose: config done-matching keys on
+        # strategy_params only, so CPU-vs-GPU never changes config identity.
+        device = getattr(strategy, "resolved_device", None)
+        if device is not None:
+            params["device"] = device
+        # Both records must land atomically: an experiments row without its
+        # daily rows would be counted "done" by the research queue forever
+        # while the sim-panel data it promises is missing.
+        con.execute("BEGIN")
+        try:
+            seq = store.record_experiment(
+                con,
+                strategy=strategy_name,
+                params=params,
+                train_start=labeled["target_date"].min(),
+                test_start=first_run_start,
+                test_end=folds[-1][1],
+                metrics=metrics,
+            )
+            # Per-day per-rank pick outcomes land in experiment_daily (dashboard
+            # SIM panel), never in the metrics JSON above.
+            rank_frame = pd.DataFrame(rank_rows, columns=["target_date", "rank", "ret", "hit"])
+            store.record_experiment_daily(con, seq, rank_frame)
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
     return metrics

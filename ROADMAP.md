@@ -126,24 +126,38 @@ Locked decisions (v1, 2026-07-18):
   through a checked-in experiment queue (`research/queue.json`, `{strategy,
   params, note}`, edited only via PR — auditable sweeps). Nightly runner
   `twopercent research` (systemd timer, daily 22:00 America/Denver):
-  - **Budget cap:** at most `--budget` (default 8) experiments per night.
+  - **Budget cap:** at most `--budget` (default 8, min 1) experiments/night.
   - **Clock gate:** runs only 16:30–05:00 America/Denver, any day — one rule
-    that clears market hours and both routine runs (single-writer DuckDB).
+    that clears market hours and both routine runs (single-writer DuckDB) —
+    and is rechecked before each experiment with a 04:00 last-start margin,
+    so a slow night can never hold the store into the 06:00 predict run.
   - **Queue state = the experiments ledger,** not a state file: a config with
-    a recorded standard (12-month, top-20) benchmark is skipped loudly, so
-    the queue is idempotent and a scheduled run never dirties the repo. A
-    crashed config is not recorded and retries next night.
-  - **Promotion guardrails:** a challenger beating the champion on lift
-    outside the noise band (0.1, shared with `compare`) files ONE deduped,
-    locked `promotion-candidate` issue. Promotion stays HUMAN-ONLY by PR
-    editing champion.json, after the standard full-window referee run plus
-    quant-skeptic review — decided on lift/AUC, never sim growth. The runner
-    writes nothing but experiments-ledger rows and that issue.
+    a recorded standard (12-month, top-20) benchmark is skipped loudly
+    (numeric identity canonicalized: 200 == 200.0), so the queue is
+    idempotent and a scheduled run never dirties the repo. The experiments
+    row and its daily rows commit atomically; a crashed config records
+    nothing and retries next night. The training device is recorded per run
+    and CPU-fallback recordings warn in the digest.
+  - **Champion identity:** the champion's reference is always its own
+    DEFAULT-CONFIG experiment — rows with non-empty strategy_params
+    (sweep variants under the same strategy name) are excluded everywhere a
+    "champion benchmark" is read (research comparison, dashboard sim panel,
+    degradation evidence bundle).
+  - **Promotion guardrails:** candidate = beats the champion on lift beyond
+    the PROMOTION band 0.25 (family-wise for a ~24-config sweep; compare's
+    0.1 stays single-comparison) AND holds the margin on both disjoint
+    halves of the shared test days. That files ONE deduped, locked
+    `promotion-candidate` issue. Promotion stays HUMAN-ONLY by PR editing
+    champion.json, and additionally requires the wall-clock holdout: the
+    margin must hold on ≥2 months of data arriving AFTER the candidate's
+    test_end, same referee restricted to that window (#45 builds the
+    tooling; the issue template already demands it). Decided on lift/AUC,
+    never sim growth; quant-skeptic review mandatory. The runner writes
+    nothing but experiments-ledger rows and that issue.
   - **Multiple-comparisons caveat:** an overnight sweep evaluates many
     configs against the same test months; the best of them is inflated by
-    selection and every candidate issue says so. Real fix — holdout-months
-    discipline (sweep selection vs final validation on untouched recent
-    months) — is #45, filed rather than half-built.
+    selection and every candidate issue says so. The deterministic referee
+    re-run proves nothing — only wall-clock-new data is out of sample.
 - Your role: "keep prediction quality above X, keep data clean, surface
   anything unusual" — monitor by exception.
 

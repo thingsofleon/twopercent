@@ -70,20 +70,30 @@ Guardrails:
 
 - **Clock gate:** runs only between 16:30 and 05:00 America/Denver (any day —
   offline compute, weekends fine), keeping clear of market hours and the
-  06:00/14:45 routine runs (DuckDB is single-writer).
-- **Budget:** at most `--budget` (default 8) experiments per night.
+  06:00/14:45 routine runs (DuckDB is single-writer). The window is rechecked
+  before each experiment with a one-hour must-finish margin (no new config
+  starts after 04:00), so a slow night can never hold the store into the
+  06:00 predict run.
+- **Budget:** at most `--budget` (default 8, minimum 1) experiments per night.
 - **Idempotent, no state file:** a config whose (strategy, params) already has
   a recorded standard benchmark in the experiments ledger is skipped (loudly
-  counted), so a scheduled run never dirties the repo and reruns are safe. A
-  crashed config is NOT recorded and retries the next night.
+  counted; numeric identity is canonicalized, so 200 == 200.0), so a scheduled
+  run never dirties the repo and reruns are safe. The experiments row and its
+  daily rows land atomically; a crashed config records NOTHING and retries the
+  next night. The training device (cuda/cpu) is recorded per run, and a night
+  that recorded configs under CPU fallback warns loudly.
 - **Write-nothing:** the runner writes only experiments-ledger rows — never
   champion.json, predictions, or prices.
-- **Promotion stays human:** a config beating the champion on lift outside the
-  noise band (0.1) files ONE deduped, locked `promotion-candidate` GitHub
-  issue. It is a hypothesis, not a promotion — overnight sweeps are multiple
-  comparisons against the same test months (holdout discipline: #45).
-  Promotion remains a human PR after referee + quant-skeptic review, never on
-  sim growth.
+- **Promotion stays human:** a config beating the champion on lift beyond the
+  PROMOTION band (0.25 — family-wise, wider than compare's single-comparison
+  0.1 because a sweep is ~24 comparisons against the same months) AND holding
+  the margin on both disjoint halves of the shared test days files ONE
+  deduped, locked `promotion-candidate` GitHub issue. It is a hypothesis, not
+  a promotion: the issue demands the wall-clock holdout (margin holds on >= 2
+  months of data arriving after the candidate's test_end, #45), quant-skeptic
+  review, and a human PR — never sim growth. The champion's reference
+  benchmark is always its own default-config run (parameterized sweep
+  variants recorded under the same strategy name are excluded).
 
 Exit codes: 0 clean or empty queue, 1 some experiments failed or queue entries
 were malformed, 2 the runner itself failed.

@@ -82,6 +82,11 @@ supervised autonomy → AI-native).
 - **quant-skeptic** — adversarial methodology review (lookahead, leakage,
   contamination, survivorship, overfitting, regime). Mandatory for any PR
   touching features, labels, training, evaluation, or reported metrics.
+- **investigator** — diagnoses auto-degradation issues (data problem / feature
+  drift / regime change / model decay); read-only, findings as issue comments.
+- **strategy-researcher** — surveys published research and files referee-ready
+  strategy proposals as `strategy-proposal` design-doc issues, never code;
+  every proposal follows the `validate-new-strategy` skill checklist.
 
 ## Working loop
 

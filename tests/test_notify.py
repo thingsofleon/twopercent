@@ -11,6 +11,8 @@ import json
 import re
 import smtplib
 import ssl
+import sys
+import types
 import urllib.error
 
 import pandas as pd
@@ -169,6 +171,134 @@ def test_thin_day_states_the_shortfall_and_never_pads():
         assert "Only 3 candidate(s)" in body
         assert "not padded" in body
         assert "TCK03" not in body  # nothing invented past the real candidates
+
+
+# --- dashboard rendering (playwright mocked — CI has no browsers) --------------
+
+
+def _install_fake_playwright(monkeypatch, screenshot_bytes=b"fake-png", launch_exc=None):
+    """A fake playwright.sync_api in sys.modules recording the render calls."""
+    calls: dict = {}
+
+    class _Page:
+        def emulate_media(self, color_scheme=None):
+            calls["color_scheme"] = color_scheme
+
+        def goto(self, url, wait_until=None):
+            calls["url"] = url
+
+        def screenshot(self, full_page=False, type=None):
+            calls["full_page"] = full_page
+            return screenshot_bytes
+
+    class _Browser:
+        def new_page(self, viewport=None, device_scale_factor=None):
+            calls["viewport"] = viewport
+            calls["device_scale_factor"] = device_scale_factor
+            return _Page()
+
+        def close(self):
+            calls["closed"] = True
+
+    class _Chromium:
+        def launch(self, headless=True):
+            if launch_exc is not None:
+                raise launch_exc
+            calls["headless"] = headless
+            return _Browser()
+
+    class _Playwright:
+        chromium = _Chromium()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    module = types.ModuleType("playwright.sync_api")
+    module.sync_playwright = lambda: _Playwright()
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", module)
+    return calls
+
+
+def test_render_missing_dashboard_raises_render_unavailable(tmp_path):
+    with pytest.raises(notify.RenderUnavailable, match="not found"):
+        notify.render_dashboard_png(tmp_path / "nope.html")
+
+
+def test_render_playwright_not_importable_raises_render_unavailable(monkeypatch, tmp_path):
+    dash = tmp_path / "dashboard.html"
+    dash.write_text("<h1>x</h1>", encoding="utf-8")
+    # None in sys.modules makes the lazy import raise ImportError even though
+    # the package is installed on this box.
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", None)
+    with pytest.raises(notify.RenderUnavailable, match="playwright not installed"):
+        notify.render_dashboard_png(dash)
+
+
+def test_render_browser_launch_failure_becomes_render_unavailable_first_line(monkeypatch, tmp_path):
+    dash = tmp_path / "dashboard.html"
+    dash.write_text("<h1>x</h1>", encoding="utf-8")
+    _install_fake_playwright(
+        monkeypatch,
+        launch_exc=RuntimeError(
+            "Executable doesn't exist at /nowhere/chrome\nrun `playwright install`\nmore lines"
+        ),
+    )
+    with pytest.raises(notify.RenderUnavailable) as excinfo:
+        notify.render_dashboard_png(dash)
+    message = str(excinfo.value)
+    assert "browser render failed" in message
+    assert "Executable doesn't exist" in message
+    assert "more lines" not in message  # first line only — summary-safe
+
+
+def test_render_oversize_png_raises_render_unavailable_with_size(monkeypatch, tmp_path):
+    dash = tmp_path / "dashboard.html"
+    dash.write_text("<h1>x</h1>", encoding="utf-8")
+    _install_fake_playwright(monkeypatch, screenshot_bytes=b"x" * (notify.MAX_PNG_BYTES + 1))
+    with pytest.raises(notify.RenderUnavailable, match=r"20\.0MB"):
+        notify.render_dashboard_png(dash)
+
+
+def test_render_happy_path_dark_fullpage_at_declared_width(monkeypatch, tmp_path):
+    dash = tmp_path / "dashboard.html"
+    dash.write_text("<h1>x</h1>", encoding="utf-8")
+    calls = _install_fake_playwright(monkeypatch, screenshot_bytes=b"PNG-SENTINEL")
+    assert notify.render_dashboard_png(dash) == b"PNG-SENTINEL"
+    assert calls["color_scheme"] == "dark"
+    assert calls["full_page"] is True
+    assert calls["headless"] is True
+    assert calls["viewport"]["width"] == notify.RENDER_VIEWPORT_WIDTH
+    assert calls["device_scale_factor"] == 2
+    assert calls["url"].startswith("file://")
+    assert calls["closed"] is True  # browser closed even on success
+
+
+# --- dashboard-image composition ------------------------------------------------
+
+
+def test_compose_dashboard_email_subject_matches_text_email_and_body_is_the_image():
+    subject, text, html = notify.compose_dashboard_email(
+        _prediction(signal_date=dt.date(2026, 7, 16)), FRIDAY_0800_ET, b"png"
+    )
+    assert subject == "twopercent Daily Signal — Friday, July 17, 2026"
+    assert '<meta charset="utf-8">' in html
+    assert 'src="cid:dashboard"' in html
+    assert "max-width:900px" in html
+    assert 'alt="twopercent dashboard — Friday, July 17, 2026"' in html
+    # minimal shell: no composed sections — the dashboard carries its own text
+    assert "TCK00" not in html and "Trade Suggestion" not in html
+    assert text == (
+        "twopercent Daily Signal for Friday, July 17, 2026. This email is the "
+        "rendered dashboard image; view with an HTML-capable client."
+    )
+
+
+def test_compose_dashboard_email_refuses_empty_png():
+    with pytest.raises(ValueError, match="png_bytes is empty"):
+        notify.compose_dashboard_email(_prediction(), FRIDAY_0800_ET, b"")
 
 
 # --- config / transport selection ---------------------------------------------
@@ -497,6 +627,57 @@ def test_smtp_auth_failure_raises_fixed_message_without_credentials(monkeypatch,
     message = str(excinfo.value)
     assert message == "authentication failed (check the SMTP password)"
     assert "535" not in message and "smtp-pw" not in message
+
+
+# --- sending: dashboard-image email ------------------------------------------
+
+DASH_HTML = '<meta charset="utf-8"><img src="cid:dashboard" alt="dash">'
+
+
+def test_smtp_dashboard_email_is_related_wrapping_alternative_with_inline_cid(fake_smtp):
+    png = b"\x89PNG-SENTINEL-BYTES"
+    outcome = notify.send_dashboard_email(_smtp_config(), "subj", "text-alt", DASH_HTML, png)
+    assert outcome.transport == "smtp" and outcome.attached
+    (msg, _from_addr, _to_addrs) = fake_smtp.sent[-1]
+    # the exact layout Gmail expects: related( alternative(plain, html), png )
+    assert msg.get_content_type() == "multipart/related"
+    alternative, image = msg.get_payload()
+    assert alternative.get_content_type() == "multipart/alternative"
+    assert [p.get_content_type() for p in alternative.get_payload()] == [
+        "text/plain",
+        "text/html",
+    ]
+    assert image.get_content_type() == "image/png"
+    assert image["Content-ID"] == "<dashboard>"
+    assert image.get_content_disposition() == "inline"  # never a paperclip duplicate
+    assert image.get_content() == png
+    html = msg.get_body(("html",)).get_content()
+    assert 'src="cid:dashboard"' in html
+    # no dashboard.html attachment in this shape
+    assert not [p for p in msg.walk() if p.get_filename() == "dashboard.html"]
+
+
+def test_resend_dashboard_email_uses_content_id_inline_attachment(resend_capture):
+    png = b"\x89PNG-SENTINEL-BYTES"
+    outcome = notify.send_dashboard_email(_resend_config(), "subj", "text-alt", DASH_HTML, png)
+    assert outcome.transport == "resend" and outcome.attached
+    payload = json.loads(resend_capture["req"].data)
+    assert 'src="cid:dashboard"' in payload["html"]
+    assert payload["text"] == "text-alt"
+    [attachment] = payload["attachments"]
+    # Resend's documented inline field is `content_id`, referenced as cid: in html
+    assert attachment["content_id"] == "dashboard"
+    assert attachment["filename"] == "dashboard.png"
+    assert base64.b64decode(attachment["content"]) == png
+
+
+def test_dashboard_email_send_failure_still_raises_safe_send_error(monkeypatch):
+    def fail_urlopen(req, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(notify.urllib.request, "urlopen", fail_urlopen)
+    with pytest.raises(notify.SendError, match="unreachable"):
+        notify.send_dashboard_email(_resend_config(), "subj", "t", DASH_HTML, b"png")
 
 
 def test_scrub_redacts_the_secret():

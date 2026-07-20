@@ -59,12 +59,20 @@ detector loudly reports it is not yet armed.
 
 ## Daily signal email
 
-The predict run's last step emails the day's signal: a trade suggestion (the
-top-5 equal-weight open-to-close basket), the top-10 candidate table with
-model scores, a system summary whose precision/base-rate/lift figures are
-pulled from the champion's latest standard benchmark in the experiments
-ledger (never hard-coded), the live-record status, and a disclaimer — with
-`dashboard.html` attached. Score-mode runs (`--mode score`) never email.
+The predict run's last step emails the day's signal. The email body IS the
+rendered dashboard: `dashboard.html` is rendered headlessly at send time
+(Playwright chromium, dark theme, full page) to a PNG embedded inline via
+CID — no attachment, plus a one-line plain-text alternative for text-only
+clients. One-time setup on the box: `uv run playwright install chromium`
+(CI never needs browsers — tests mock the renderer). When rendering is
+unavailable (missing browsers, a render crash, an implausibly large PNG),
+the step WARNs and falls back to the previous composed email: a trade
+suggestion (the top-5 equal-weight open-to-close basket), the top-10
+candidate table with model scores, a system summary whose
+precision/base-rate/lift figures are pulled from the champion's latest
+standard benchmark in the experiments ledger (never hard-coded), the
+live-record status, and a disclaimer — with `dashboard.html` attached.
+Score-mode runs (`--mode score`) never email.
 
 Configuration is environment-only (see `.env.example`; copy it to `.env`,
 which is gitignored — never commit a real `.env`). Two variables are common
@@ -107,8 +115,9 @@ Behavior when things go wrong: recipient/sender or every transport unset →
 the step reports a loud "email not configured — skipping" line without
 degrading the exit code; a send failure (rejected API key, SMTP trouble) →
 WARN (exit 1 class), never exit 2 — the prediction is already logged either
-way, and no credential ever appears in logs or summaries. A missing
-`dashboard.html` warns and sends without the attachment.
+way, and no credential ever appears in logs or summaries. Dashboard render
+trouble WARNs and falls back to the composed text email; on that fallback a
+missing `dashboard.html` warns again and sends without the attachment.
 
 ## The research loop (overnight)
 

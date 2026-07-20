@@ -24,7 +24,10 @@ def ready(con, monkeypatch, tmp_path):
 
     Email is UNCONFIGURED by default (env cleared, .env pointed at a missing
     file) and SMTP is rigged to fail the test if anything ever dials out —
-    individual tests opt in with their own env + fake SMTP."""
+    individual tests opt in with their own env + fake SMTP. The dashboard
+    renderer is stubbed to RenderUnavailable (CI has no browsers; this box
+    does — tests must behave identically on both), so configured tests
+    exercise the text+attachment fallback unless they install a fake PNG."""
     seed_planted(con, n_each=10)
     con.execute("UPDATE universe SET as_of = ?", [CLOSED.date()])
     # Newest bar lands 3 days before the pinned clock — deterministic forever.
@@ -58,7 +61,17 @@ def ready(con, monkeypatch, tmp_path):
         "urlopen",
         lambda *a, **kw: pytest.fail("HTTP touched without a fake"),
     )
+    monkeypatch.setattr(notify, "render_dashboard_png", _render_unavailable)
     return con
+
+
+def _render_unavailable(path):
+    raise notify.RenderUnavailable("render stubbed out in tests")
+
+
+def _fake_render(monkeypatch, png=b"\x89PNG-STEP-SENTINEL"):
+    monkeypatch.setattr(notify, "render_dashboard_png", lambda path: png)
+    return png
 
 
 def test_routine_happy_path_completes_all_steps(ready):
@@ -320,19 +333,82 @@ def test_notify_unconfigured_skips_without_degrading_exit(ready):
     assert notify.ENV_RESEND_KEY in step.detail
 
 
-def test_notify_sends_via_resend_with_dashboard_attached(ready, monkeypatch, tmp_path):
+def test_notify_sends_rendered_dashboard_inline_via_resend(ready, monkeypatch, tmp_path):
+    _configure_resend(monkeypatch)
+    captured = _capture_resend(monkeypatch)
+    png = _fake_render(monkeypatch)
+    report = routine.run(db_path=_db(ready), out_path=str(tmp_path / "dashboard.html"))
+    step = next(s for s in report.steps if s.name == "notify")
+    assert step.status == "ok"
+    assert "via resend" in step.detail
+    assert "body is the rendered dashboard" in step.detail
+    payload = json.loads(captured["req"].data)
+    assert payload["to"] == ["leon@example.com"]
+    assert payload["subject"] == "twopercent Daily Signal — Monday, July 20, 2026"
+    assert 'src="cid:dashboard"' in payload["html"]
+    [attachment] = payload["attachments"]  # the inline PNG and nothing else
+    assert attachment["filename"] == "dashboard.png"
+    assert attachment["content_id"] == "dashboard"
+    assert base64.b64decode(attachment["content"]) == png
+
+
+def test_notify_sends_rendered_dashboard_inline_via_smtp(ready, monkeypatch, tmp_path):
+    _configure_smtp(monkeypatch)
+    _FakeSMTP.sent = []
+    monkeypatch.setattr(notify.smtplib, "SMTP", _FakeSMTP)
+    png = _fake_render(monkeypatch)
+    report = routine.run(db_path=_db(ready), out_path=str(tmp_path / "dashboard.html"))
+    step = next(s for s in report.steps if s.name == "notify")
+    assert step.status == "ok"
+    assert "body is the rendered dashboard" in step.detail
+    (msg, _from_addr, _to_addrs) = _FakeSMTP.sent[-1]
+    assert msg["Subject"] == "twopercent Daily Signal — Monday, July 20, 2026"
+    assert msg.get_content_type() == "multipart/related"
+    alternative, image = msg.get_payload()
+    assert alternative.get_content_type() == "multipart/alternative"
+    assert image.get_content_type() == "image/png"
+    assert image["Content-ID"] == "<dashboard>"
+    assert image.get_content() == png
+    assert 'src="cid:dashboard"' in msg.get_body(("html",)).get_content()
+    assert not [p for p in msg.walk() if p.get_filename() == "dashboard.html"]
+
+
+def test_notify_render_unavailable_warns_and_falls_back_to_text_with_attachment(
+    ready, monkeypatch, tmp_path
+):
     _configure_resend(monkeypatch)
     captured = _capture_resend(monkeypatch)
     out = tmp_path / "dashboard.html"
     report = routine.run(db_path=_db(ready), out_path=str(out))
     step = next(s for s in report.steps if s.name == "notify")
-    assert step.status == "ok"
-    assert "via resend" in step.detail
-    assert "with dashboard attached" in step.detail
+    assert step.status == "warn"  # render trouble is loud, but the email went out
+    assert "dashboard render unavailable (render stubbed out in tests)" in step.detail
+    assert "sent text summary with attachment instead" in step.detail
+    assert report.exit_code == 1  # WARN class, never 2
     payload = json.loads(captured["req"].data)
     assert payload["to"] == ["leon@example.com"]
     assert payload["attachments"][0]["filename"] == "dashboard.html"
     assert base64.b64decode(payload["attachments"][0]["content"]) == out.read_bytes()
+    assert "cid:dashboard" not in payload["html"]  # fallback body is the composed text
+
+
+def test_notify_render_failure_reason_is_scrubbed(ready, monkeypatch, tmp_path):
+    sentinel = "sekrit-render-sentinel-QWERT-7"
+    _configure_smtp(monkeypatch, password=sentinel)
+    _FakeSMTP.sent = []
+    monkeypatch.setattr(notify.smtplib, "SMTP", _FakeSMTP)
+
+    def leaky_render(path):
+        raise notify.RenderUnavailable(f"browser render failed: env has {sentinel}")
+
+    monkeypatch.setattr(notify, "render_dashboard_png", leaky_render)
+    report = routine.run(db_path=_db(ready), out_path=str(tmp_path / "dashboard.html"))
+    step = next(s for s in report.steps if s.name == "notify")
+    assert step.status == "warn"
+    assert "dashboard render unavailable" in step.detail
+    assert sentinel not in "\n".join(report.summary_lines())
+    assert "[redacted]" in step.detail
+    assert _FakeSMTP.sent  # the fallback email still went out
 
 
 def test_notify_missing_dashboard_warns_but_sends(ready, monkeypatch, tmp_path):

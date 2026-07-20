@@ -421,6 +421,10 @@ def render_dashboard_png(dashboard_path: Path) -> bytes:
                 page = browser.new_page(
                     viewport={"width": RENDER_VIEWPORT_WIDTH, "height": 1200},
                     device_scale_factor=2,
+                    # the dashboard server-side-renders its default explorer
+                    # view, so the screenshot needs no JS — and the unattended
+                    # morning render gets no script-execution surface at all.
+                    java_script_enabled=False,
                 )
                 page.emulate_media(color_scheme="dark")  # the product's terminal look
                 page.goto(path.resolve().as_uri(), wait_until="load")
@@ -432,6 +436,11 @@ def render_dashboard_png(dashboard_path: Path) -> bytes:
         # line gets the first line only, and never a traceback.
         reason = (str(exc).splitlines() or ["unknown"])[0][:200]
         raise RenderUnavailable(f"browser render failed: {reason}") from exc
+    if not png:
+        # An empty screenshot must fall back like every other render failure —
+        # compose_dashboard_email would otherwise reject it AFTER the fallback
+        # point, and no email would go out at all.
+        raise RenderUnavailable("browser returned an empty screenshot")
     if len(png) > MAX_PNG_BYTES:
         raise RenderUnavailable(
             f"rendered PNG is {len(png) / 1_048_576:.1f}MB "
@@ -621,12 +630,15 @@ def _send_smtp_dashboard(
     alternatives = EmailMessage()
     alternatives.set_content(text_body)
     alternatives.add_alternative(html_body, subtype="html")
-    del alternatives["MIME-Version"]  # subpart of the outer message, not a message itself
 
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = config.sender
     msg["To"] = ", ".join(config.to)
+    # make_related()+attach() never call set_content(), which is what would
+    # auto-add MIME-Version — without this the wire form violates RFC 2045
+    # and strict clients/spam filters may render raw boundaries.
+    msg["MIME-Version"] = "1.0"
     msg.make_related()
     msg.attach(alternatives)
     msg.add_related(
@@ -639,6 +651,9 @@ def _send_smtp_dashboard(
         # Gmail would then show a paperclip duplicate of the inline image.
         disposition="inline",
     )
+    for part in msg.walk():
+        if part is not msg:
+            del part["MIME-Version"]  # set_content adds it to subparts, which are not messages
     _smtp_deliver(config, msg)
 
 

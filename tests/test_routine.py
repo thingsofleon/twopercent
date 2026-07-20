@@ -65,6 +65,10 @@ def ready(con, monkeypatch, tmp_path):
     return con
 
 
+# the real function, captured before any fixture stubs the module attribute
+_REAL_RENDER_DASHBOARD_PNG = notify.render_dashboard_png
+
+
 def _render_unavailable(path):
     raise notify.RenderUnavailable("render stubbed out in tests")
 
@@ -390,6 +394,27 @@ def test_notify_render_unavailable_warns_and_falls_back_to_text_with_attachment(
     assert payload["attachments"][0]["filename"] == "dashboard.html"
     assert base64.b64decode(payload["attachments"][0]["content"]) == out.read_bytes()
     assert "cid:dashboard" not in payload["html"]  # fallback body is the composed text
+
+
+def test_notify_empty_screenshot_falls_back_and_the_email_still_sends(ready, monkeypatch, tmp_path):
+    # Real renderer, fake browser returning b"": the empty-screenshot guard
+    # must fire INSIDE render_dashboard_png so the step falls back and sends —
+    # not die in compose_dashboard_email with no email at all.
+    from tests.test_notify import _install_fake_playwright
+
+    _configure_resend(monkeypatch)
+    captured = _capture_resend(monkeypatch)
+    monkeypatch.setattr(notify, "render_dashboard_png", _REAL_RENDER_DASHBOARD_PNG)
+    _install_fake_playwright(monkeypatch, screenshot_bytes=b"")
+    out = tmp_path / "dashboard.html"
+    report = routine.run(db_path=_db(ready), out_path=str(out))
+    step = next(s for s in report.steps if s.name == "notify")
+    assert step.status == "warn"
+    assert "dashboard render unavailable" in step.detail
+    assert "empty screenshot" in step.detail
+    payload = json.loads(captured["req"].data)  # the fallback email went out
+    assert payload["attachments"][0]["filename"] == "dashboard.html"
+    assert base64.b64decode(payload["attachments"][0]["content"]) == out.read_bytes()
 
 
 def test_notify_render_failure_reason_is_scrubbed(ready, monkeypatch, tmp_path):

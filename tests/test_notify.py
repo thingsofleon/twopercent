@@ -192,9 +192,10 @@ def _install_fake_playwright(monkeypatch, screenshot_bytes=b"fake-png", launch_e
             return screenshot_bytes
 
     class _Browser:
-        def new_page(self, viewport=None, device_scale_factor=None):
+        def new_page(self, viewport=None, device_scale_factor=None, java_script_enabled=None):
             calls["viewport"] = viewport
             calls["device_scale_factor"] = device_scale_factor
+            calls["java_script_enabled"] = java_script_enabled
             return _Page()
 
         def close(self):
@@ -254,6 +255,17 @@ def test_render_browser_launch_failure_becomes_render_unavailable_first_line(mon
     assert "more lines" not in message  # first line only — summary-safe
 
 
+def test_render_empty_screenshot_raises_render_unavailable(monkeypatch, tmp_path):
+    # b"" would sail past the size cap, then die in compose_dashboard_email
+    # AFTER the fallback point — the one render failure that would skip the
+    # fallback that exists for it.
+    dash = tmp_path / "dashboard.html"
+    dash.write_text("<h1>x</h1>", encoding="utf-8")
+    _install_fake_playwright(monkeypatch, screenshot_bytes=b"")
+    with pytest.raises(notify.RenderUnavailable, match="empty screenshot"):
+        notify.render_dashboard_png(dash)
+
+
 def test_render_oversize_png_raises_render_unavailable_with_size(monkeypatch, tmp_path):
     dash = tmp_path / "dashboard.html"
     dash.write_text("<h1>x</h1>", encoding="utf-8")
@@ -268,6 +280,7 @@ def test_render_happy_path_dark_fullpage_at_declared_width(monkeypatch, tmp_path
     calls = _install_fake_playwright(monkeypatch, screenshot_bytes=b"PNG-SENTINEL")
     assert notify.render_dashboard_png(dash) == b"PNG-SENTINEL"
     assert calls["color_scheme"] == "dark"
+    assert calls["java_script_enabled"] is False  # no script surface in the unattended render
     assert calls["full_page"] is True
     assert calls["headless"] is True
     assert calls["viewport"]["width"] == notify.RENDER_VIEWPORT_WIDTH
@@ -655,6 +668,19 @@ def test_smtp_dashboard_email_is_related_wrapping_alternative_with_inline_cid(fa
     assert 'src="cid:dashboard"' in html
     # no dashboard.html attachment in this shape
     assert not [p for p in msg.walk() if p.get_filename() == "dashboard.html"]
+
+
+def test_smtp_dashboard_email_wire_form_declares_mime_version_at_top_level_only(fake_smtp):
+    # The parsed-object tests above can't see this: make_related()+attach()
+    # never call set_content(), which is what auto-adds MIME-Version — the
+    # WIRE form is what strict clients and spam filters judge (RFC 2045).
+    notify.send_dashboard_email(_smtp_config(), "subj", "text-alt", DASH_HTML, b"png")
+    (msg, _from_addr, _to_addrs) = fake_smtp.sent[-1]
+    wire = msg.as_string()
+    top_headers, _, body = wire.partition("\n\n")
+    assert "MIME-Version: 1.0" in top_headers
+    assert "MIME-Version" not in body  # never on subparts
+    assert wire.count("MIME-Version") == 1
 
 
 def test_resend_dashboard_email_uses_content_id_inline_attachment(resend_capture):

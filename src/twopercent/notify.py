@@ -29,8 +29,10 @@ import base64
 import datetime as dt
 import json
 import logging
+import math
 import os
 import smtplib
+import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -50,7 +52,10 @@ ENV_SMTP_HOST = "TWOPERCENT_SMTP_HOST"
 ENV_SMTP_PORT = "TWOPERCENT_SMTP_PORT"
 ENV_SMTP_USER = "TWOPERCENT_SMTP_USER"
 ENV_SMTP_PASSWORD = "TWOPERCENT_SMTP_PASSWORD"  # noqa: S105 — env var NAME, not a credential
-DEFAULT_ENV_PATH = Path(".env")
+# Anchored to the repo root (src/twopercent/notify.py -> parents[2]), not the
+# CWD, so a run launched from any directory still finds the same config.
+# Real environment variables always win over the file.
+DEFAULT_ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 
 RESEND_URL = "https://api.resend.com/emails"
 DEFAULT_SMTP_PORT = 587
@@ -255,7 +260,14 @@ def _benchmark_summary(benchmark: tuple[int, dict, dt.date | None, dt.date | Non
     p5 = metrics.get("precision_at_5")
     base = metrics.get("base_rate")
     window = f"{test_start} to {test_end}"
-    if p5 is None or base is None or base <= 0:
+
+    def _finite(value) -> bool:
+        # NaN survives the JSON round-trip and passes a `<= 0` check
+        # (NaN comparisons are False) — it must never reach the email
+        # as "nan% — a nanx lift".
+        return isinstance(value, int | float) and math.isfinite(value)
+
+    if not _finite(p5) or not _finite(base) or base <= 0:
         return (
             f"The latest recorded benchmark (test window {window}) is missing "
             "precision_at_5/base_rate figures, so no precision claim is made."
@@ -351,6 +363,10 @@ def compose_signal_email(
     note_html = f"<p><em>{escape(basket_note)}</em></p>" if basket_note else ""
     summary_html = "".join(f"<p>{escape(line)}</p>" for line in summary_lines)
     html_body = (
+        # MIME/JSON transport already declares utf-8, but the in-body
+        # declaration survives clients that ignore transport headers
+        # (project standard: generated HTML always declares its charset).
+        '<meta charset="utf-8">'
         "<div style=\"font-family:Georgia,'Times New Roman',serif;max-width:640px;"
         'margin:0 auto;color:#1a1a1a;line-height:1.5;">'
         '<h2 style="margin-bottom:2px;">twopercent Daily Signal</h2>'
@@ -456,7 +472,10 @@ def _send_smtp(
         )
     try:
         with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=60) as smtp:
-            smtp.starttls()
+            # An explicit verifying context: bare starttls() uses an
+            # UNVERIFIED context (CERT_NONE), letting an on-path MITM with a
+            # self-signed cert harvest the password from the unattended run.
+            smtp.starttls(context=ssl.create_default_context())
             smtp.login(config.smtp_user, config.smtp_password)
             smtp.send_message(msg, from_addr=config.sender, to_addrs=config.to)
     except smtplib.SMTPAuthenticationError as exc:

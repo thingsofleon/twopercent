@@ -260,8 +260,9 @@ class _FakeSMTP:
     def __exit__(self, *exc):
         return False
 
-    def starttls(self):
+    def starttls(self, context=None):
         self.calls.append("starttls")
+        self.starttls_context = context
 
     def login(self, user, password):
         self.calls.append("login")
@@ -423,6 +424,21 @@ def test_notify_misconfigured_recipient_warns(ready, monkeypatch):
     step = next(s for s in report.steps if s.name == "notify")
     assert step.status == "warn"
     assert "misconfigured" in step.detail
+    assert report.exit_code == 1
+
+
+def test_notify_malformed_env_file_warns_not_crashes(ready, monkeypatch, tmp_path):
+    # A non-UTF-8 .env raises UnicodeDecodeError from read_text — if that
+    # escaped, the whole predict routine would die with a traceback AFTER the
+    # prediction, with no summary and the wrong exit semantics.
+    bad = tmp_path / "bad.env"
+    bad.write_bytes(b"TWOPERCENT_EMAIL_TO=caf\xe9@example.com\n")  # latin-1 byte
+    monkeypatch.setattr(notify, "DEFAULT_ENV_PATH", bad)
+    report = routine.run(db_path=_db(ready))
+    step = next(s for s in report.steps if s.name == "notify")
+    assert step.status == "warn"
+    assert "misconfigured" in step.detail
+    assert any(s.name == "scoring" for s in report.steps)  # routine completed
     assert report.exit_code == 1
 
 

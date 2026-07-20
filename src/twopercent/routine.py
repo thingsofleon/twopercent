@@ -379,7 +379,11 @@ def _notify_step(
     pipeline failure or block anything (score mode never emails)."""
     try:
         config, missing = notify.email_config()
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
+        # ValueError covers bad addresses/ports AND UnicodeDecodeError (its
+        # subclass) from a non-UTF-8 .env; OSError covers an unreadable one.
+        # Any of these escaping would kill the routine AFTER the prediction
+        # with a traceback instead of a summary.
         report.add("notify", WARN, f"email misconfigured: {exc}")
         return
     if config is None:

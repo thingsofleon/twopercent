@@ -10,6 +10,7 @@ import io
 import json
 import re
 import smtplib
+import ssl
 import urllib.error
 
 import pandas as pd
@@ -137,6 +138,17 @@ def test_no_recorded_benchmark_says_so_instead_of_inventing_numbers():
         assert not re.search(r"\d+\.\d+%", body)
 
 
+def test_nan_metrics_fall_back_instead_of_emailing_nan(con):
+    # NaN survives the JSON round-trip and passes a `<= 0` check (NaN
+    # comparisons are False) — the email must never read "nan% — a nanx lift".
+    _seed_benchmark(con, metrics={**METRICS, "precision_at_5": float("nan")})
+    bench = backtest.latest_standard_experiment(con, "test_strat_v1")
+    _, text, html = notify.compose_signal_email(_prediction(), _perf(), bench, FRIDAY_0800_ET)
+    for body in (text, html):
+        assert "nan" not in body.lower()
+        assert "no precision claim is made" in body
+
+
 def test_zero_live_days_says_track_record_begins_today():
     _, text, html = notify.compose_signal_email(_prediction(), _perf(0), None, FRIDAY_0800_ET)
     for body in (text, html):
@@ -179,6 +191,13 @@ def _set_smtp(monkeypatch):
     monkeypatch.setenv(notify.ENV_SMTP_HOST, "smtp.example.com")
     monkeypatch.setenv(notify.ENV_SMTP_USER, "sender@example.com")
     monkeypatch.setenv(notify.ENV_SMTP_PASSWORD, "smtp-pw")
+
+
+def test_default_env_path_is_anchored_to_the_repo_root():
+    # CWD-relative ".env" would silently lose the config for any run
+    # launched from another directory (real env vars still win over it).
+    assert notify.DEFAULT_ENV_PATH.is_absolute()
+    assert (notify.DEFAULT_ENV_PATH.parent / "pyproject.toml").is_file()
 
 
 def test_config_neither_transport_names_whats_missing(clean_env, monkeypatch):
@@ -395,6 +414,7 @@ class FakeSMTP:
     def __init__(self, host, port, timeout=None):
         self.host, self.port = host, port
         self.calls = []
+        self.starttls_context = None
         type(self).last = self
 
     def __enter__(self):
@@ -403,8 +423,9 @@ class FakeSMTP:
     def __exit__(self, *exc):
         return False
 
-    def starttls(self):
+    def starttls(self, context=None):
         self.calls.append("starttls")
+        self.starttls_context = context
 
     def login(self, user, password):
         self.calls.append("login")
@@ -451,12 +472,18 @@ def test_smtp_reaches_all_comma_separated_recipients(fake_smtp, tmp_path):
     assert from_addr == "sender@example.com"
 
 
-def test_smtp_calls_starttls_before_login(fake_smtp, tmp_path):
+def test_smtp_calls_starttls_before_login_with_verifying_context(fake_smtp, tmp_path):
     dash = tmp_path / "dashboard.html"
     dash.write_text("x", encoding="utf-8")
     notify.send_signal_email(_smtp_config(), "subj", "text", "<p>h</p>", dash)
     calls = fake_smtp.last.calls
     assert calls.index("starttls") < calls.index("login") < calls.index("send_message")
+    # A bare starttls() would use Python's UNVERIFIED context (CERT_NONE) —
+    # an on-path MITM could then harvest the password every unattended run.
+    context = fake_smtp.last.starttls_context
+    assert context is not None
+    assert context.check_hostname is True
+    assert context.verify_mode == ssl.CERT_REQUIRED
 
 
 def test_smtp_auth_failure_raises_fixed_message_without_credentials(monkeypatch, tmp_path):

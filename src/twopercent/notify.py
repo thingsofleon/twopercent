@@ -63,6 +63,10 @@ DEFAULT_SMTP_PORT = 587
 BASKET_SIZE = 5
 TABLE_ROWS = 10
 ATTACHMENT_NAME = "dashboard.html"
+INLINE_PNG_NAME = "dashboard.png"
+DASHBOARD_CID = "dashboard"
+RENDER_VIEWPORT_WIDTH = 900
+MAX_PNG_BYTES = 20 * 1024 * 1024
 
 _DISCLAIMER = (
     "This message is automated model output from the twopercent research "
@@ -77,6 +81,11 @@ _DISCLAIMER = (
 
 class SendError(RuntimeError):
     """Send failure with a message already safe for summaries/logs."""
+
+
+class RenderUnavailable(RuntimeError):
+    """Dashboard PNG rendering is not possible here — callers must fall back
+    to the composed text email, loudly (never a raw traceback, never exit 2)."""
 
 
 def scrub(detail: str, secret: str) -> str:
@@ -390,6 +399,89 @@ def compose_signal_email(
     return subject, text_body, html_body
 
 
+def render_dashboard_png(dashboard_path: Path) -> bytes:
+    """Render dashboard.html to a full-page PNG (headless chromium, dark).
+
+    Every failure mode — playwright not importable, browser binaries absent,
+    a render crash, a missing dashboard file, an implausibly large PNG —
+    raises RenderUnavailable with a summary-safe reason, never a raw
+    traceback: render trouble must degrade to the text email, not kill it.
+    """
+    path = Path(dashboard_path)
+    if not path.is_file():
+        raise RenderUnavailable(f"dashboard not found at {path}")
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RenderUnavailable(f"playwright not installed: {exc}") from exc
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            try:
+                page = browser.new_page(
+                    viewport={"width": RENDER_VIEWPORT_WIDTH, "height": 1200},
+                    device_scale_factor=2,
+                    # the dashboard server-side-renders its default explorer
+                    # view, so the screenshot needs no JS — and the unattended
+                    # morning render gets no script-execution surface at all.
+                    java_script_enabled=False,
+                )
+                page.emulate_media(color_scheme="dark")  # the product's terminal look
+                page.goto(path.resolve().as_uri(), wait_until="load")
+                png = page.screenshot(full_page=True, type="png")
+            finally:
+                browser.close()
+    except Exception as exc:
+        # Playwright launch errors are multi-line install lectures; a summary
+        # line gets the first line only, and never a traceback.
+        reason = (str(exc).splitlines() or ["unknown"])[0][:200]
+        raise RenderUnavailable(f"browser render failed: {reason}") from exc
+    if not png:
+        # An empty screenshot must fall back like every other render failure —
+        # compose_dashboard_email would otherwise reject it AFTER the fallback
+        # point, and no email would go out at all.
+        raise RenderUnavailable("browser returned an empty screenshot")
+    if len(png) > MAX_PNG_BYTES:
+        raise RenderUnavailable(
+            f"rendered PNG is {len(png) / 1_048_576:.1f}MB "
+            f"(sanity cap {MAX_PNG_BYTES // 1_048_576}MB) — refusing to email it"
+        )
+    return png
+
+
+def compose_dashboard_email(
+    prediction: PredictResult,
+    generated_at: dt.datetime,
+    png_bytes: bytes,
+) -> tuple[str, str, str]:
+    """Build (subject, text_body, html_body) where the body IS the dashboard.
+
+    The HTML is a minimal shell around one inline CID image — the rendered
+    dashboard carries its own disclaimer footer, so no other text is added.
+    `png_bytes` must be the image the caller will send; composing this shape
+    without an image is a bug, not a fallback (use compose_signal_email).
+    """
+    if not png_bytes:
+        raise ValueError("png_bytes is empty — compose the text email instead")
+    target = target_trading_day(prediction.signal_date, generated_at)
+    date_str = _long_date(target)
+    subject = f"twopercent Daily Signal — {date_str}"
+    text_body = (
+        f"twopercent Daily Signal for {date_str}. This email is the rendered "
+        "dashboard image; view with an HTML-capable client."
+    )
+    html_body = (
+        # project standard: generated HTML always declares its charset.
+        '<meta charset="utf-8">'
+        '<div style="margin:0 auto;max-width:900px;">'
+        f'<img src="cid:{DASHBOARD_CID}" '
+        'style="width:100%;max-width:900px;display:block;" '
+        f'alt="twopercent dashboard — {escape(date_str)}">'
+        "</div>"
+    )
+    return subject, text_body, html_body
+
+
 @dataclass
 class SendOutcome:
     recipients: list[str]
@@ -429,6 +521,10 @@ def _send_resend(
                 "content": base64.b64encode(attachment).decode("ascii"),
             }
         ]
+    _resend_post(config, payload)
+
+
+def _resend_post(config: EmailConfig, payload: dict) -> None:
     req = urllib.request.Request(
         RESEND_URL,
         data=json.dumps(payload).encode("utf-8"),
@@ -470,6 +566,10 @@ def _send_smtp(
             subtype="html",
             filename=ATTACHMENT_NAME,
         )
+    _smtp_deliver(config, msg)
+
+
+def _smtp_deliver(config: EmailConfig, msg: EmailMessage) -> None:
     try:
         with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=60) as smtp:
             # An explicit verifying context: bare starttls() uses an
@@ -516,3 +616,85 @@ def send_signal_email(
     return SendOutcome(
         recipients=list(config.to), attached=attachment is not None, transport=config.transport
     )
+
+
+def _send_smtp_dashboard(
+    config: EmailConfig,
+    subject: str,
+    text_body: str,
+    html_body: str,
+    png_bytes: bytes,
+) -> None:
+    """multipart/related( multipart/alternative(text, html), image/png ) —
+    the layout Gmail expects for inline CID images."""
+    alternatives = EmailMessage()
+    alternatives.set_content(text_body)
+    alternatives.add_alternative(html_body, subtype="html")
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = config.sender
+    msg["To"] = ", ".join(config.to)
+    # make_related()+attach() never call set_content(), which is what would
+    # auto-add MIME-Version — without this the wire form violates RFC 2045
+    # and strict clients/spam filters may render raw boundaries.
+    msg["MIME-Version"] = "1.0"
+    msg.make_related()
+    msg.attach(alternatives)
+    msg.add_related(
+        png_bytes,
+        maintype="image",
+        subtype="png",
+        cid=f"<{DASHBOARD_CID}>",
+        filename=INLINE_PNG_NAME,
+        # a filename alone defaults the part to disposition "attachment" —
+        # Gmail would then show a paperclip duplicate of the inline image.
+        disposition="inline",
+    )
+    for part in msg.walk():
+        if part is not msg:
+            del part["MIME-Version"]  # set_content adds it to subparts, which are not messages
+    _smtp_deliver(config, msg)
+
+
+def send_dashboard_email(
+    config: EmailConfig,
+    subject: str,
+    text_body: str,
+    html_body: str,
+    png_bytes: bytes,
+) -> SendOutcome:
+    """Send the dashboard-image signal: the body IS the rendered dashboard.
+
+    The PNG rides inline (Content-ID `dashboard`, referenced as
+    `cid:dashboard` in the HTML) on both transports — Resend via the
+    `content_id` attachment field, SMTP via multipart/related. No
+    dashboard.html attachment in this shape; transport failures raise
+    SendError exactly like send_signal_email.
+    """
+    if config.transport == "resend":
+        payload: dict = {
+            "from": config.sender,
+            "to": config.to,
+            "subject": subject,
+            "text": text_body,
+            "html": html_body,
+            "attachments": [
+                {
+                    "filename": INLINE_PNG_NAME,
+                    "content": base64.b64encode(png_bytes).decode("ascii"),
+                    "content_id": DASHBOARD_CID,
+                }
+            ],
+        }
+        _resend_post(config, payload)
+    else:
+        _send_smtp_dashboard(config, subject, text_body, html_body, png_bytes)
+    logger.info(
+        "signal email sent via %s to %d recipient(s), body is the rendered dashboard "
+        "(%d-byte inline PNG)",
+        config.transport,
+        len(config.to),
+        len(png_bytes),
+    )
+    return SendOutcome(recipients=list(config.to), attached=True, transport=config.transport)

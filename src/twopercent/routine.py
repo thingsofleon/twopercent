@@ -43,8 +43,19 @@ from zoneinfo import ZoneInfo
 import duckdb
 import pandas as pd
 
-from twopercent import champion, dashboard, doctor, ingest, issues, store, track, universe
-from twopercent.predict import predict_for
+from twopercent import (
+    backtest,
+    champion,
+    dashboard,
+    doctor,
+    ingest,
+    issues,
+    notify,
+    store,
+    track,
+    universe,
+)
+from twopercent.predict import PredictResult, predict_for
 
 logger = logging.getLogger(__name__)
 
@@ -347,7 +358,61 @@ def _run_predict(
         report.add("scoring", OK, f"{len(scored)} days in track record")
     except Exception as exc:
         report.add("scoring", WARN, f"track-record scoring failed: {exc}")
+
+    _notify_step(report, con, name, prediction, out_path)
     return report
+
+
+def _notify_step(
+    report: RoutineReport,
+    con,
+    strategy: str,
+    prediction: PredictResult,
+    out_path: str,
+) -> None:
+    """Last predict-mode step: email the day's signal with the dashboard attached.
+
+    Deliberately unconfigured (any of the three vars unset) is OK-level — a
+    non-setup is not an exception, but the skip is stated loudly. Anything
+    else (misconfiguration, compose or send failure) is WARN, never FAIL:
+    the prediction is already logged, and email trouble must never read as a
+    pipeline failure or block anything (score mode never emails)."""
+    try:
+        config, missing = notify.email_config()
+    except ValueError as exc:
+        report.add("notify", WARN, f"email misconfigured: {exc}")
+        return
+    if config is None:
+        report.add("notify", OK, f"email not configured ({missing}) — skipping")
+        return
+    try:
+        perf = track.daily_pick_performance(con, strategy)
+        bench = backtest.latest_standard_experiment(con, strategy)
+        subject, text_body, html_body = notify.compose_signal_email(
+            prediction, perf, bench, generated_at=_now_eastern()
+        )
+        outcome = notify.send_signal_email(config, subject, text_body, html_body, Path(out_path))
+    except notify.SendError as exc:
+        report.add("notify", WARN, f"email send failed: {exc}")
+        return
+    except Exception as exc:
+        # scrub: no credential fragment may ever reach a summary/log line.
+        detail = str(exc)
+        for secret in config.secrets():
+            detail = notify.scrub(detail, secret)
+        report.add("notify", WARN, f"email failed: {detail}")
+        return
+    detail = f"signal emailed via {outcome.transport} to {len(outcome.recipients)} recipient(s)"
+    status = OK
+    if outcome.attached:
+        detail += " with dashboard attached"
+    else:
+        status = WARN
+        detail += " WITHOUT dashboard attachment (file missing)"
+    if config.ignored_smtp:
+        status = WARN
+        detail += " — both transports configured, SMTP settings ignored (Resend wins)"
+    report.add("notify", status, detail)
 
 
 def _scored_target_days(con, strategy: str, top_n: int) -> set[dt.date] | None:

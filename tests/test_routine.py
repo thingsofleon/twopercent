@@ -1,10 +1,15 @@
+import base64
 import datetime as dt
+import io
+import json
+import smtplib
+import urllib.error
 
 import pandas as pd
 import pytest
 
 from tests.conftest import seed_history, seed_planted
-from twopercent import ingest, routine, store
+from twopercent import ingest, notify, routine, store
 
 CLOSED = dt.datetime(2026, 7, 17, 7, 0, tzinfo=routine._EASTERN)  # Friday pre-open
 
@@ -14,8 +19,12 @@ def _db(con) -> str:
 
 
 @pytest.fixture
-def ready(con, monkeypatch):
-    """A healthy seeded store, clock pre-open, network steps stubbed out."""
+def ready(con, monkeypatch, tmp_path):
+    """A healthy seeded store, clock pre-open, network steps stubbed out.
+
+    Email is UNCONFIGURED by default (env cleared, .env pointed at a missing
+    file) and SMTP is rigged to fail the test if anything ever dials out —
+    individual tests opt in with their own env + fake SMTP."""
     seed_planted(con, n_each=10)
     con.execute("UPDATE universe SET as_of = ?", [CLOSED.date()])
     # Newest bar lands 3 days before the pinned clock — deterministic forever.
@@ -29,6 +38,25 @@ def ready(con, monkeypatch):
     )
     monkeypatch.setattr(
         routine.universe, "refresh_universe", lambda **kw: pytest.fail("network touched")
+    )
+    monkeypatch.setattr(notify, "DEFAULT_ENV_PATH", tmp_path / "absent.env")
+    for var in (
+        notify.ENV_TO,
+        notify.ENV_FROM,
+        notify.ENV_RESEND_KEY,
+        notify.ENV_SMTP_HOST,
+        notify.ENV_SMTP_PORT,
+        notify.ENV_SMTP_USER,
+        notify.ENV_SMTP_PASSWORD,
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(
+        notify.smtplib, "SMTP", lambda *a, **kw: pytest.fail("SMTP touched without a fake")
+    )
+    monkeypatch.setattr(
+        notify.urllib.request,
+        "urlopen",
+        lambda *a, **kw: pytest.fail("HTTP touched without a fake"),
     )
     return con
 
@@ -46,6 +74,7 @@ def test_routine_happy_path_completes_all_steps(ready):
         "predict",
         "dashboard",
         "scoring",
+        "notify",
     ]
     assert report.status in ("ok", "warn")
     assert report.top_candidates
@@ -211,3 +240,196 @@ def test_summary_lines_shape(ready):
     lines = report.summary_lines()
     assert lines[0].startswith("routine:")
     assert any("top candidates" in line for line in lines)
+
+
+# --- notify step wiring -------------------------------------------------------
+
+
+class _FakeSMTP:
+    """Records the call sequence; never touches the network."""
+
+    sent: list = []
+
+    def __init__(self, host, port, timeout=None):
+        self.host, self.port = host, port
+        self.calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def starttls(self):
+        self.calls.append("starttls")
+
+    def login(self, user, password):
+        self.calls.append("login")
+
+    def send_message(self, msg, from_addr=None, to_addrs=None):
+        self.calls.append("send_message")
+        type(self).sent.append((msg, from_addr, to_addrs))
+
+
+class _FakeResponse:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _configure_common(monkeypatch):
+    monkeypatch.setenv(notify.ENV_TO, "leon@example.com")
+    monkeypatch.setenv(notify.ENV_FROM, "signals@example.com")
+
+
+def _configure_resend(monkeypatch, key="re_test_key_123"):
+    _configure_common(monkeypatch)
+    monkeypatch.setenv(notify.ENV_RESEND_KEY, key)
+
+
+def _configure_smtp(monkeypatch, password="smtp-pw-123"):
+    _configure_common(monkeypatch)
+    monkeypatch.setenv(notify.ENV_SMTP_HOST, "smtp.example.com")
+    monkeypatch.setenv(notify.ENV_SMTP_USER, "sender@example.com")
+    monkeypatch.setenv(notify.ENV_SMTP_PASSWORD, password)
+
+
+def _capture_resend(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["req"] = req
+        return _FakeResponse()
+
+    monkeypatch.setattr(notify.urllib.request, "urlopen", fake_urlopen)
+    return captured
+
+
+def test_notify_unconfigured_skips_without_degrading_exit(ready):
+    report = routine.run(db_path=_db(ready))
+    step = report.steps[-1]
+    assert step.name == "notify"
+    assert step.status == "ok"  # deliberate non-setup is not an exception
+    assert "not configured" in step.detail and "skipping" in step.detail
+    assert notify.ENV_TO in step.detail  # names the missing variables
+    assert notify.ENV_RESEND_KEY in step.detail
+
+
+def test_notify_sends_via_resend_with_dashboard_attached(ready, monkeypatch, tmp_path):
+    _configure_resend(monkeypatch)
+    captured = _capture_resend(monkeypatch)
+    out = tmp_path / "dashboard.html"
+    report = routine.run(db_path=_db(ready), out_path=str(out))
+    step = next(s for s in report.steps if s.name == "notify")
+    assert step.status == "ok"
+    assert "via resend" in step.detail
+    assert "with dashboard attached" in step.detail
+    payload = json.loads(captured["req"].data)
+    assert payload["to"] == ["leon@example.com"]
+    assert payload["attachments"][0]["filename"] == "dashboard.html"
+    assert base64.b64decode(payload["attachments"][0]["content"]) == out.read_bytes()
+
+
+def test_notify_missing_dashboard_warns_but_sends(ready, monkeypatch, tmp_path):
+    _configure_resend(monkeypatch)
+    captured = _capture_resend(monkeypatch)
+
+    def broken_render(*a, **kw):
+        raise RuntimeError("render exploded")
+
+    monkeypatch.setattr(routine.dashboard, "render", broken_render)
+    report = routine.run(db_path=_db(ready), out_path=str(tmp_path / "dashboard.html"))
+    step = next(s for s in report.steps if s.name == "notify")
+    assert step.status == "warn"
+    assert "WITHOUT dashboard attachment" in step.detail
+    payload = json.loads(captured["req"].data)  # the email still went out
+    assert "attachments" not in payload
+
+
+def test_notify_resend_rejection_warns_with_status_never_the_key(ready, monkeypatch, tmp_path):
+    sentinel = "re_sentinel_key_XYZZY_99"
+    _configure_resend(monkeypatch, key=sentinel)
+
+    def fail_urlopen(req, timeout=None):
+        body = io.BytesIO(json.dumps({"message": "domain is not verified"}).encode())
+        raise urllib.error.HTTPError(notify.RESEND_URL, 403, "Forbidden", {}, body)
+
+    monkeypatch.setattr(notify.urllib.request, "urlopen", fail_urlopen)
+    report = routine.run(db_path=_db(ready), out_path=str(tmp_path / "dashboard.html"))
+    step = next(s for s in report.steps if s.name == "notify")
+    assert step.status == "warn"
+    assert "403" in step.detail and "domain is not verified" in step.detail
+    assert sentinel not in "\n".join(report.summary_lines())
+    assert report.exit_code == 1  # WARN class, never 2
+
+
+def test_notify_both_transports_warns_smtp_ignored(ready, monkeypatch, tmp_path):
+    _configure_resend(monkeypatch)
+    _configure_smtp(monkeypatch)  # SMTP set too — Resend must win, loudly
+    captured = _capture_resend(monkeypatch)
+    report = routine.run(db_path=_db(ready), out_path=str(tmp_path / "dashboard.html"))
+    step = next(s for s in report.steps if s.name == "notify")
+    assert step.status == "warn"
+    assert "SMTP settings ignored" in step.detail
+    assert "via resend" in step.detail
+    assert "req" in captured  # sent through Resend, not SMTP (SMTP fake would fail the test)
+
+
+def test_notify_smtp_auth_failure_warns_and_never_leaks_password(ready, monkeypatch, tmp_path):
+    sentinel = "sekrit-sentinel-XYZZY-99"
+    _configure_smtp(monkeypatch, password=sentinel)
+
+    class AuthFailSMTP(_FakeSMTP):
+        def login(self, user, password):
+            raise smtplib.SMTPAuthenticationError(535, b"5.7.8 Username and Password not accepted")
+
+    monkeypatch.setattr(notify.smtplib, "SMTP", AuthFailSMTP)
+    report = routine.run(db_path=_db(ready), out_path=str(tmp_path / "dashboard.html"))
+    step = next(s for s in report.steps if s.name == "notify")
+    assert step.status == "warn"
+    assert "authentication failed" in step.detail
+    assert "check the SMTP password" in step.detail
+    output = "\n".join(report.summary_lines())
+    assert sentinel not in output
+    assert "535" not in step.detail  # fixed message, not the exception repr
+    assert report.exit_code == 1  # WARN class, never 2
+
+
+def test_notify_generic_send_failure_scrubs_secrets(ready, monkeypatch, tmp_path):
+    sentinel = "sekrit-sentinel-ABCD-42"
+    _configure_smtp(monkeypatch, password=sentinel)
+
+    class ExplodingSMTP(_FakeSMTP):
+        def send_message(self, msg, from_addr=None, to_addrs=None):
+            raise RuntimeError(f"transport wedged while sending with {sentinel}")
+
+    monkeypatch.setattr(notify.smtplib, "SMTP", ExplodingSMTP)
+    report = routine.run(db_path=_db(ready), out_path=str(tmp_path / "dashboard.html"))
+    step = next(s for s in report.steps if s.name == "notify")
+    assert step.status == "warn"
+    assert sentinel not in "\n".join(report.summary_lines())
+    assert "[redacted]" in step.detail
+    assert report.exit_code == 1
+
+
+def test_notify_misconfigured_recipient_warns(ready, monkeypatch):
+    _configure_resend(monkeypatch)
+    monkeypatch.setenv(notify.ENV_TO, "not-an-address")
+    report = routine.run(db_path=_db(ready))
+    step = next(s for s in report.steps if s.name == "notify")
+    assert step.status == "warn"
+    assert "misconfigured" in step.detail
+    assert report.exit_code == 1
+
+
+def test_notify_partial_smtp_config_warns_not_skips(ready, monkeypatch):
+    _configure_common(monkeypatch)
+    monkeypatch.setenv(notify.ENV_SMTP_HOST, "smtp.example.com")  # no user/password
+    report = routine.run(db_path=_db(ready))
+    step = next(s for s in report.steps if s.name == "notify")
+    assert step.status == "warn"  # half-configured must never look like deliberate non-setup
+    assert "partial SMTP configuration" in step.detail

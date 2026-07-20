@@ -9,6 +9,7 @@ changed only by human-reviewed PR.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 
 import duckdb
@@ -32,6 +33,40 @@ def month_folds(target_dates: pd.Series, months: int) -> list[tuple[dt.date, dt.
     stamps = pd.to_datetime(target_dates.dropna().unique())
     periods = sorted(pd.PeriodIndex(stamps, freq="M").unique())
     return [(p.start_time.date(), p.end_time.date()) for p in periods[-months:]]
+
+
+def latest_standard_experiment(
+    con: duckdb.DuckDBPyConnection,
+    strategy: str,
+    months: int = DEFAULT_TEST_MONTHS,
+    top_n: int = DEFAULT_TOP_N,
+) -> tuple[int, dict, dt.date | None, dt.date | None] | None:
+    """The strategy's newest recorded standard (`months`, `top_n`) DEFAULT-CONFIG
+    benchmark, as (id, metrics, test_start, test_end).
+
+    Rows with non-empty strategy_params are research variants recorded under
+    the strategy's name — they must never be quoted as the strategy's own
+    benchmark (pre-research rows lack the key entirely; that counts as
+    default-config). Shared reader: research's champion reference and the
+    signal email both quote exactly this row.
+    """
+    rows = con.execute(
+        "SELECT id, params, metrics, test_start, test_end FROM experiments WHERE strategy = ? "
+        "ORDER BY run_ts DESC, id DESC",
+        [strategy],
+    ).fetchall()
+    for exp_id, params_json, metrics_json, test_start, test_end in rows:
+        try:
+            params = json.loads(params_json) if params_json else {}
+            metrics = json.loads(metrics_json)
+        except json.JSONDecodeError:
+            logger.warning("experiments row #%s has unparseable JSON — ignored", exp_id)
+            continue
+        if params.get("strategy_params"):
+            continue  # parameterized variant, not the strategy's own config
+        if params.get("months") == months and params.get("top_n") == top_n:
+            return exp_id, metrics, test_start, test_end
+    return None
 
 
 def run_benchmark(

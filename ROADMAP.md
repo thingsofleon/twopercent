@@ -194,5 +194,11 @@ truth for *decisions and plan shape*; GitHub is the source of truth for
   research loop — parameterized strategies, `xgb_gbm_v1` CUDA challenger
   with loud CPU fallback, seeded 24-config queue, `twopercent research`
   runner, `promotion-candidate` issues; follow-up #45 (holdout months).
+  Shipped (#48): daily signal email — predict-run `notify` step (last, WARN
+  at worst, skips loudly when unconfigured) composing trade suggestion +
+  top-10 table + ledger-sourced stats with dashboard.html attached;
+  pluggable transport (Resend HTTP API primary via scoped send-only key —
+  no personal credential on-box; generic SMTP fallback for a dedicated
+  sending account), env/.env config, credentials never in logs/summaries.
   Exit criterion: a real degradation → investigation cycle observed, or at
   minimum both timers proven live — NOT complete yet.

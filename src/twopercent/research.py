@@ -244,27 +244,16 @@ def _latest_standard_experiment(
     """The champion's newest recorded standard (12-month, top-20) DEFAULT-CONFIG
     benchmark, as (id, metrics, test_end).
 
-    Rows with non-empty strategy_params are research variants recorded under
-    the champion's strategy name — they must never be quoted as the champion
-    (pre-research rows lack the key entirely; that counts as default-config).
+    Thin wrapper over backtest.latest_standard_experiment (one params-free
+    filter in the codebase — the signal email quotes the same row).
     """
-    rows = con.execute(
-        "SELECT id, params, metrics, test_end FROM experiments WHERE strategy = ? "
-        "ORDER BY run_ts DESC, id DESC",
-        [strategy],
-    ).fetchall()
-    for exp_id, params_json, metrics_json, test_end in rows:
-        try:
-            params = json.loads(params_json) if params_json else {}
-            metrics = json.loads(metrics_json)
-        except json.JSONDecodeError:
-            logger.warning("experiments row #%s has unparseable JSON — ignored", exp_id)
-            continue
-        if params.get("strategy_params"):
-            continue  # parameterized variant, not the champion's own config
-        if params.get("months") == STANDARD_MONTHS and params.get("top_n") == STANDARD_TOP_N:
-            return exp_id, metrics, test_end
-    return None
+    latest = backtest.latest_standard_experiment(
+        con, strategy, months=STANDARD_MONTHS, top_n=STANDARD_TOP_N
+    )
+    if latest is None:
+        return None
+    exp_id, metrics, _test_start, test_end = latest
+    return exp_id, metrics, test_end
 
 
 def _halves_hold(

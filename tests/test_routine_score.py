@@ -116,6 +116,7 @@ def test_score_mode_happy_path_no_predict_no_universe_refresh(ready, monkeypatch
         "dashboard",
     ]
     assert "predict" not in names and "universe" not in names
+    assert "notify" not in names  # score-mode runs never email the signal
     # The dashboard's display-only rescore never logs predictions.
     assert calls and all(kw.get("save") is False for kw in calls)
     after = ready.execute("SELECT count(*) FROM predictions").fetchone()[0]

@@ -35,7 +35,8 @@ exception (exit 0 clean / 1 ran-with-warnings / 2 failed-or-degraded):
 
 - **predict mode** (default, pre-open): market-hours guard → doctor baseline →
   universe refresh (if stale) → tail ingest → freshness + corruption gates →
-  champion predict (logged) → dashboard → track-record scoring.
+  champion predict (logged) → dashboard → track-record scoring → signal email
+  (skipped loudly when unconfigured — see "Daily signal email").
 - **score mode** (post-close): refuses before 16:15 ET on weekdays; weekends
   may run — scoring time never affects the live/late flag, which depends only
   on when a prediction was *created* relative to its target day's 09:30 ET
@@ -55,6 +56,68 @@ the run exits 2 and auto-files a GitHub issue labeled `auto-degradation`
 the cause (data problem / feature drift / regime change / genuine model
 decay), and posts findings back to the issue. With fewer than 5 live days the
 detector loudly reports it is not yet armed.
+
+## Daily signal email
+
+The predict run's last step emails the day's signal. The email body IS the
+rendered dashboard: `dashboard.html` is rendered headlessly at send time
+(Playwright chromium, dark theme, full page) to a PNG embedded inline via
+CID — no attachment, plus a one-line plain-text alternative for text-only
+clients. One-time setup on the box: `uv run playwright install chromium`
+(CI never needs browsers — tests mock the renderer). When rendering is
+unavailable (missing browsers, a render crash, an implausibly large PNG),
+the step WARNs and falls back to the previous composed email: a trade
+suggestion (the top-5 equal-weight open-to-close basket), the top-10
+candidate table with model scores, a system summary whose
+precision/base-rate/lift figures are pulled from the champion's latest
+standard benchmark in the experiments ledger (never hard-coded), the
+live-record status, and a disclaimer — with `dashboard.html` attached.
+Score-mode runs (`--mode score`) never email.
+
+Configuration is environment-only (see `.env.example`; copy it to `.env`,
+which is gitignored — never commit a real `.env`). Two variables are common
+to both transports:
+
+- `TWOPERCENT_EMAIL_TO` — recipient address(es), comma-separated for several
+- `TWOPERCENT_EMAIL_FROM` — the From address
+
+The transport is selected by which credentials are present:
+
+**Resend HTTP API (recommended).** Set `TWOPERCENT_RESEND_API_KEY`. Setup is
+about five minutes: create a free account at [resend.com](https://resend.com)
+→ API Keys → create a key with **sending access only** — it is scoped and
+revocable, and no personal account credential ever lands on this box. On the
+free tier without a verified domain, use `onboarding@resend.dev` as
+`TWOPERCENT_EMAIL_FROM` and note that **recipients are restricted to the
+account owner's own address**. Verifying a domain you own (e.g.
+upanddownai.com) lifts that restriction and lets the mail come from
+`signals@your-domain` — that is the path if the signal is ever distributed
+to anyone else.
+
+**Generic SMTP (fallback).** Set `TWOPERCENT_SMTP_HOST`,
+`TWOPERCENT_SMTP_PORT` (default 587), `TWOPERCENT_SMTP_USER`, and
+`TWOPERCENT_SMTP_PASSWORD` for a STARTTLS SMTP relay. **Dedicated sending
+account only — never a personal credential.** When both transports are
+configured, Resend wins and the routine WARNs that the SMTP settings are
+ignored; a partially set SMTP trio WARNs as misconfiguration rather than
+silently skipping.
+
+For the scheduled predict run, hand the variables to the systemd service by
+adding one line to the `[Service]` section of
+`~/.config/systemd/user/twopercent-routine.service`, then
+`systemctl --user daemon-reload`:
+
+```ini
+EnvironmentFile=%h/projects/twopercent/.env
+```
+
+Behavior when things go wrong: recipient/sender or every transport unset →
+the step reports a loud "email not configured — skipping" line without
+degrading the exit code; a send failure (rejected API key, SMTP trouble) →
+WARN (exit 1 class), never exit 2 — the prediction is already logged either
+way, and no credential ever appears in logs or summaries. Dashboard render
+trouble WARNs and falls back to the composed text email; on that fallback a
+missing `dashboard.html` warns again and sends without the attachment.
 
 ## The research loop (overnight)
 

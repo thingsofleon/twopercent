@@ -43,8 +43,19 @@ from zoneinfo import ZoneInfo
 import duckdb
 import pandas as pd
 
-from twopercent import champion, dashboard, doctor, ingest, issues, store, track, universe
-from twopercent.predict import predict_for
+from twopercent import (
+    backtest,
+    champion,
+    dashboard,
+    doctor,
+    ingest,
+    issues,
+    notify,
+    store,
+    track,
+    universe,
+)
+from twopercent.predict import PredictResult, predict_for
 
 logger = logging.getLogger(__name__)
 
@@ -347,7 +358,93 @@ def _run_predict(
         report.add("scoring", OK, f"{len(scored)} days in track record")
     except Exception as exc:
         report.add("scoring", WARN, f"track-record scoring failed: {exc}")
+
+    _notify_step(report, con, name, prediction, out_path)
     return report
+
+
+def _notify_step(
+    report: RoutineReport,
+    con,
+    strategy: str,
+    prediction: PredictResult,
+    out_path: str,
+) -> None:
+    """Last predict-mode step: email the day's signal — the body is the
+    RENDERED DASHBOARD (inline PNG); when rendering is unavailable the step
+    WARNs and falls back to the composed text email with dashboard.html
+    attached.
+
+    Deliberately unconfigured (any of the three vars unset) is OK-level — a
+    non-setup is not an exception, but the skip is stated loudly. Anything
+    else (misconfiguration, render fallback, compose or send failure) is
+    WARN, never FAIL: the prediction is already logged, and email trouble
+    must never read as a pipeline failure or block anything (score mode
+    never emails)."""
+    try:
+        config, missing = notify.email_config()
+    except (ValueError, OSError) as exc:
+        # ValueError covers bad addresses/ports AND UnicodeDecodeError (its
+        # subclass) from a non-UTF-8 .env; OSError covers an unreadable one.
+        # Any of these escaping would kill the routine AFTER the prediction
+        # with a traceback instead of a summary.
+        report.add("notify", WARN, f"email misconfigured: {exc}")
+        return
+    if config is None:
+        report.add("notify", OK, f"email not configured ({missing}) — skipping")
+        return
+    render_reason = ""
+    try:
+        generated_at = _now_eastern()
+        try:
+            png = notify.render_dashboard_png(Path(out_path))
+        except notify.RenderUnavailable as exc:
+            png = None
+            render_reason = str(exc)
+        if png is not None:
+            subject, text_body, html_body = notify.compose_dashboard_email(
+                prediction, generated_at, png
+            )
+            outcome = notify.send_dashboard_email(config, subject, text_body, html_body, png)
+        else:
+            perf = track.daily_pick_performance(con, strategy)
+            bench = backtest.latest_standard_experiment(con, strategy)
+            subject, text_body, html_body = notify.compose_signal_email(
+                prediction, perf, bench, generated_at=generated_at
+            )
+            outcome = notify.send_signal_email(
+                config, subject, text_body, html_body, Path(out_path)
+            )
+    except notify.SendError as exc:
+        report.add("notify", WARN, f"email send failed: {exc}")
+        return
+    except Exception as exc:
+        # scrub: no credential fragment may ever reach a summary/log line.
+        detail = str(exc)
+        for secret in config.secrets():
+            detail = notify.scrub(detail, secret)
+        report.add("notify", WARN, f"email failed: {detail}")
+        return
+    detail = f"signal emailed via {outcome.transport} to {len(outcome.recipients)} recipient(s)"
+    status = OK
+    if not render_reason:
+        detail += ", body is the rendered dashboard"
+    else:
+        # scrub: a render exception could quote environment/config fragments.
+        for secret in config.secrets():
+            render_reason = notify.scrub(render_reason, secret)
+        status = WARN
+        fallback = (
+            "with attachment" if outcome.attached else "WITHOUT dashboard attachment (file missing)"
+        )
+        detail += (
+            f" — dashboard render unavailable ({render_reason}) — "
+            f"sent text summary {fallback} instead"
+        )
+    if config.ignored_smtp:
+        status = WARN
+        detail += " — both transports configured, SMTP settings ignored (Resend wins)"
+    report.add("notify", status, detail)
 
 
 def _scored_target_days(con, strategy: str, top_n: int) -> set[dt.date] | None:

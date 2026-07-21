@@ -194,5 +194,19 @@ truth for *decisions and plan shape*; GitHub is the source of truth for
   research loop — parameterized strategies, `xgb_gbm_v1` CUDA challenger
   with loud CPU fallback, seeded 24-config queue, `twopercent research`
   runner, `promotion-candidate` issues; follow-up #45 (holdout months).
+  Shipped (#48): daily signal email — predict-run `notify` step (last, WARN
+  at worst, skips loudly when unconfigured) composing trade suggestion +
+  top-10 table + ledger-sourced stats with dashboard.html attached;
+  pluggable transport (Resend HTTP API primary via scoped send-only key —
+  no personal credential on-box; generic SMTP fallback for a dedicated
+  sending account), env/.env config, credentials never in logs/summaries.
+  Shipped (#50): the email body is now the RENDERED DASHBOARD — headless
+  Playwright chromium renders dashboard.html (dark, 900px, 2x) to a
+  full-page PNG embedded inline via CID on both transports (Resend
+  `content_id`, SMTP multipart/related wrapping the alternatives); any
+  render trouble (no browsers as in CI, crash, >20MB PNG) raises
+  RenderUnavailable and the step WARNs and falls back to the #48 composed
+  text email with attachment — render failure never kills the email.
+  One-time box setup: `uv run playwright install chromium`.
   Exit criterion: a real degradation → investigation cycle observed, or at
   minimum both timers proven live — NOT complete yet.

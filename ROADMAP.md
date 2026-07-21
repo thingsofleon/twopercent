@@ -137,7 +137,11 @@ Locked decisions (v1, 2026-07-18):
     idempotent and a scheduled run never dirties the repo. The experiments
     row and its daily rows commit atomically; a crashed config records
     nothing and retries next night. The training device is recorded per run
-    and CPU-fallback recordings warn in the digest.
+    and CPU-fallback recordings warn in the digest. An **exhausted queue**
+    (empty file, or every config already recorded so nothing is pending) is a
+    WARN (exit 1), never a clean OK — the runner would otherwise no-op every
+    night unseen; it files ONE deduped `research-queue-empty` issue asking for
+    a PR refill and pointing at the ledger (#52).
   - **Champion identity:** the champion's reference is always its own
     DEFAULT-CONFIG experiment — rows with non-empty strategy_params
     (sweep variants under the same strategy name) are excluded everywhere a
@@ -193,7 +197,9 @@ truth for *decisions and plan shape*; GitHub is the source of truth for
   agent charter. Shipped (#42, pending live night-run proof): overnight
   research loop — parameterized strategies, `xgb_gbm_v1` CUDA challenger
   with loud CPU fallback, seeded 24-config queue, `twopercent research`
-  runner, `promotion-candidate` issues; follow-up #45 (holdout months).
+  runner, `promotion-candidate` issues; follow-up #45 (holdout months). An
+  exhausted/empty queue now WARNs and files a deduped `research-queue-empty`
+  refill issue instead of silently no-op'ing every night (#52).
   Shipped (#48): daily signal email — predict-run `notify` step (last, WARN
   at worst, skips loudly when unconfigured) composing trade suggestion +
   top-10 table + ledger-sourced stats with dashboard.html attached;

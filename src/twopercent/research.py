@@ -35,8 +35,11 @@ Guardrails (recorded in ROADMAP Level 4):
   (>= 2 post-candidate months) before any promotion PR. Still a hypothesis,
   never a promotion.
 
-Exit codes: 0 clean (including empty queue), 1 some experiments failed or
-queue entries were malformed, 2 the runner itself failed.
+Exit codes: 0 clean, 1 some experiments failed, queue entries were malformed,
+or the queue is exhausted (empty or every config already recorded — nothing to
+research, so the runner no-ops and files a `research-queue-empty` issue asking
+for a refill), 2 the runner itself failed. An exhausted queue is a WARN, not a
+clean night: a silent OK on a runner that does nothing forever is the bug.
 """
 
 from __future__ import annotations
@@ -62,6 +65,7 @@ STANDARD_MONTHS = 12  # the referee standard: promotion evidence is 12-month wal
 STANDARD_TOP_N = 20
 QUEUE_PATH = Path("research/queue.json")
 PROMOTION_LABEL = "promotion-candidate"
+QUEUE_EMPTY_LABEL = "research-queue-empty"
 
 # Promotion band, deliberately wider than compare.LIFT_NOISE_BAND (0.1): the
 # compare CLI makes ONE comparison; a seeded sweep makes ~24 against the same
@@ -138,6 +142,7 @@ class ResearchReport:
     n_failed: int = 0
     n_skipped_done: int = 0
     n_malformed: int = 0
+    queue_exhausted: bool = False  # empty or all-recorded: nothing to research, WARN
     best: dict | None = None  # strategy, params, metrics, experiment_id, verdict
     champion_lift: float | None = None
     champion_auc: float | None = None
@@ -152,11 +157,12 @@ class ResearchReport:
 
     @property
     def exit_code(self) -> int:
-        """0 clean/empty-queue, 1 experiments failed or queue entries malformed,
-        2 runner failed — a scheduled job's headline signal."""
+        """0 clean, 1 experiments failed / queue entries malformed / queue
+        exhausted (nothing to research — refill it), 2 runner failed — a
+        scheduled job's headline signal."""
         if self.fatal:
             return 2
-        if self.n_failed or self.n_malformed:
+        if self.n_failed or self.n_malformed or self.queue_exhausted:
             return 1
         return 0
 
@@ -396,6 +402,80 @@ def _file_candidate_issue(
         )
 
 
+def _queue_empty_body(n_recorded: int) -> str:
+    if n_recorded:
+        state = (
+            f"All **{n_recorded}** config(s) in `research/queue.json` already have a "
+            "recorded standard benchmark, so there are **0 pending** — nothing to run."
+        )
+    else:
+        state = (
+            "`research/queue.json` is empty (or every entry was malformed and skipped), "
+            "so there is **0 pending** — nothing to run."
+        )
+    lines = [
+        "Auto-filed by `twopercent research`: the overnight experiment queue is exhausted.",
+        "",
+        state,
+        "",
+        "The nightly runner will **no-op every night until the queue is refilled** — it "
+        "ran, found nothing to research, and exited with a warning. This issue exists so "
+        "that goes noticed instead of silently repeating.",
+        "",
+        "## How to refill",
+        "",
+        "Add new configs to `research/queue.json` **via a pull request** — the queue is "
+        "git-tracked so every experiment the overnight GPU runs stays auditable (per the "
+        "repo workflow; the runner never edits the queue itself).",
+        "",
+        "- Use the `strategy-researcher` agent to propose new strategies/params and the "
+        "`validate-new-strategy` skill to turn them into referee-ready candidates before "
+        "they go in the queue.",
+        "- The full sweep run so far is queryable from the experiments ledger: "
+        "`twopercent experiments`.",
+        "",
+        "This issue is deduped by label (`" + QUEUE_EMPTY_LABEL + "`): it stays open and "
+        "is not re-filed each night — close it after refilling the queue.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _file_queue_empty_issue(report: ResearchReport, n_recorded: int) -> None:
+    """Mirror of _file_candidate_issue for the 'nothing to research' states: an
+    exhausted queue means the runner no-ops forever until a human refills it, so
+    signal it loudly (one deduped issue) instead of a silent OK."""
+    result = issues.file_issue(
+        label=QUEUE_EMPTY_LABEL,
+        title="Research queue exhausted — refill research/queue.json",
+        body=_queue_empty_body(n_recorded),
+        color="FBCA04",
+        description="Auto-filed by twopercent research: experiment queue exhausted",
+    )
+    if result.outcome == issues.FILED:
+        report.add("issue", OK, f"filed {result.url} (conversation locked)")
+    elif result.outcome == issues.DUPLICATE:
+        report.add(
+            "issue",
+            WARN,
+            f"open {QUEUE_EMPTY_LABEL} issue already filed ({result.existing}) — not "
+            "filing a duplicate; the refill signal is in the digest and the log",
+        )
+    elif result.outcome == issues.LOCK_FAILED:
+        report.add(
+            "issue",
+            WARN,
+            f"filed {result.url} but could not lock the conversation ({result.error}) — "
+            "treat comments on it as untrusted",
+        )
+    else:
+        report.add(
+            "issue",
+            WARN,
+            f"gh failed ({result.error}) — the queue is exhausted but NO issue was "
+            "filed; the refill signal is in the digest and the log",
+        )
+
+
 def run(
     db_path: Path | str = store.DEFAULT_DB_PATH,
     budget: int = DEFAULT_BUDGET,
@@ -438,7 +518,9 @@ def run(
                 f"queue is empty after skipping {report.n_malformed} malformed "
                 "entries — nothing to research"
             )
-        report.add("queue", WARN if report.n_malformed else OK, detail)
+        report.add("queue", WARN, detail)
+        report.queue_exhausted = True
+        _file_queue_empty_issue(report, n_recorded=0)
         return report
 
     done = recorded_configs(con)
@@ -447,12 +529,14 @@ def run(
     batch = pending[:budget]
     report.add(
         "queue",
-        WARN if report.n_malformed else OK,
+        WARN if (report.n_malformed or not batch) else OK,
         f"{len(entries)} valid config(s): {len(pending)} pending, "
         f"{report.n_skipped_done} already recorded, {report.n_malformed} malformed; "
         f"running {len(batch)} (budget {budget})",
     )
     if not batch:
+        report.queue_exhausted = True
+        _file_queue_empty_issue(report, n_recorded=len(entries))
         return report
 
     champ = None

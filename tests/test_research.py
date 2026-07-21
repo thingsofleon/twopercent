@@ -163,9 +163,9 @@ def _gh_spy(monkeypatch, list_stdout: str = "[]") -> list:
         (dt.datetime(2026, 7, 17, 14, 45), False),  # score-run slot
     ],
 )
-def test_clock_gate_matrix(con, tmp_path, monkeypatch, when, allowed):
+def test_clock_gate_matrix(con, tmp_path, monkeypatch, when, allowed, bench_spy):
     monkeypatch.setattr(research, "_now_denver", lambda: when.replace(tzinfo=research._DENVER))
-    queue = _write_queue(tmp_path, [])
+    queue = _write_queue(tmp_path, [_config(max_depth=4)])  # pending work: no queue-empty path
     report = research.run(db_path=_db(con), queue_path=queue)
     if allowed:
         assert report.steps[0].name == "clock" and report.steps[0].status == "ok"
@@ -209,12 +209,97 @@ def test_budget_below_one_is_fatal(con, tmp_path, night, bench_spy):
 # --- queue hygiene ------------------------------------------------------------
 
 
-def test_empty_queue_is_loud_noop_exit_0(con, tmp_path, night, bench_spy):
+def test_empty_queue_is_loud_and_files_refill_issue(con, tmp_path, night, bench_spy, monkeypatch):
+    """A truly-empty queue file is an attention state (WARN, exit 1), not a
+    clean night: the runner would no-op forever, so it files a refill issue."""
+    gh = _gh_spy(monkeypatch)
     report = research.run(db_path=_db(con), queue_path=_write_queue(tmp_path, []))
-    assert report.exit_code == 0
+
+    assert report.exit_code == 1
+    assert report.queue_exhausted
     queue_step = next(s for s in report.steps if s.name == "queue")
-    assert "empty" in queue_step.detail
+    assert queue_step.status == "warn" and "empty" in queue_step.detail
     assert not bench_spy["calls"]
+
+    create = next(a for a, _ in gh if a[:3] == ["gh", "issue", "create"])
+    assert create[create.index("--label") + 1] == "research-queue-empty"
+    issue_step = next(s for s in report.steps if s.name == "issue")
+    assert issue_step.status == "ok" and "issues/77" in issue_step.detail
+
+
+def test_all_recorded_queue_files_refill_issue(con, tmp_path, night, bench_spy, monkeypatch):
+    """Every config already recorded (pending == []) is the state that fires
+    every night once the seeded sweep is done: WARN + one refill issue."""
+    gh = _gh_spy(monkeypatch)
+    configs = [_config(max_depth=4), _config(max_depth=6)]
+    for cfg in configs:  # seed the ledger so every queue key is already done
+        store.record_experiment(
+            con,
+            strategy=cfg["strategy"],
+            params={"months": 12, "top_n": 20, "strategy_params": cfg["params"]},
+            train_start=dt.date(2021, 7, 1),
+            test_start=dt.date(2025, 7, 1),
+            test_end=dt.date(2026, 6, 30),
+            metrics=METRICS,
+        )
+    report = research.run(db_path=_db(con), queue_path=_write_queue(tmp_path, configs))
+
+    assert not bench_spy["calls"]  # nothing pending, nothing ran
+    assert report.n_skipped_done == 2
+    assert report.queue_exhausted and report.exit_code == 1
+    queue_step = next(s for s in report.steps if s.name == "queue")
+    assert queue_step.status == "warn"
+
+    creates = [a for a, _ in gh if a[:3] == ["gh", "issue", "create"]]
+    assert len(creates) == 1  # filed exactly once
+    assert creates[0][creates[0].index("--label") + 1] == "research-queue-empty"
+    body = next(kw["input"] for a, kw in gh if a[:3] == ["gh", "issue", "create"])
+    assert "2" in body and "twopercent experiments" in body  # honest, forwardable
+    assert "pull request" in body and "strategy-researcher" in body
+
+
+def test_pending_work_does_not_file_refill_issue(con, tmp_path, night, bench_spy, monkeypatch):
+    """A normal night with pending work must be provably unaffected — no
+    research-queue-empty issue is filed."""
+    _seed_champion_experiment(con, lift=2.5)  # ties survivor: no promotion path either
+    gh = _gh_spy(monkeypatch)
+    report = research.run(
+        db_path=_db(con), queue_path=_write_queue(tmp_path, [_config(max_depth=4)])
+    )
+
+    assert report.n_ran == 1
+    assert not report.queue_exhausted
+    assert not any(s.name == "issue" for s in report.steps)
+    assert not any(
+        "research-queue-empty" in a for args, _ in gh for a in args
+    )  # never the refill label
+    assert not gh  # in fact no gh call at all (champion tie files nothing)
+
+
+def test_refill_issue_dedup_does_not_spam(con, tmp_path, night, bench_spy, monkeypatch):
+    """A refill issue already open → WARN 'already filed', no create, no crash."""
+    gh = _gh_spy(monkeypatch, list_stdout='[{"number": 88, "title": "Research queue exhausted"}]')
+    report = research.run(db_path=_db(con), queue_path=_write_queue(tmp_path, []))
+
+    assert not any(a[:3] == ["gh", "issue", "create"] for a, _ in gh)  # deduped
+    issue_step = next(s for s in report.steps if s.name == "issue")
+    assert issue_step.status == "warn" and "#88" in issue_step.detail
+    assert report.exit_code == 1  # still WARN: the queue is still exhausted
+
+
+def test_refill_issue_gh_missing_is_loud(con, tmp_path, night, bench_spy, monkeypatch):
+    """gh CLI missing → loud WARN, run still completes and still reports exit 1."""
+
+    def gh_gone(args, **kw):
+        raise FileNotFoundError("gh")
+
+    monkeypatch.setattr(issues.subprocess, "run", gh_gone)
+    report = research.run(db_path=_db(con), queue_path=_write_queue(tmp_path, []))
+
+    issue_step = next(s for s in report.steps if s.name == "issue")
+    assert issue_step.status == "warn"
+    assert "NO issue was filed" in issue_step.detail and "refill signal" in issue_step.detail
+    assert report.queue_exhausted and report.exit_code == 1
 
 
 def test_missing_queue_file_fails_run(con, tmp_path, night, bench_spy):
@@ -274,10 +359,11 @@ def test_already_recorded_config_skipped_via_ledger(con, tmp_path, night, bench_
     assert any("1 already recorded" in s.detail for s in report.steps if s.name == "queue")
 
 
-def test_done_matching_canonicalizes_int_vs_float(con, tmp_path, night, bench_spy):
+def test_done_matching_canonicalizes_int_vs_float(con, tmp_path, night, bench_spy, monkeypatch):
     """A ledger row recorded with n_estimators 200.0 must satisfy the queue's
     200 — JSON round-trips can float-ify ints, and a re-run every night would
     silently burn the budget."""
+    _gh_spy(monkeypatch)  # the sole config is already recorded → exhausted, files a refill issue
     store.record_experiment(
         con,
         strategy="xgb_gbm_v1",
@@ -293,16 +379,20 @@ def test_done_matching_canonicalizes_int_vs_float(con, tmp_path, night, bench_sp
     assert not bench_spy["calls"]
 
 
-def test_rerun_is_idempotent(con, tmp_path, night, bench_spy):
-    """Night two of the same queue re-runs nothing — no state file needed."""
+def test_rerun_is_idempotent(con, tmp_path, night, bench_spy, monkeypatch):
+    """Night two of the same queue re-runs nothing — no state file needed. With
+    the whole queue now recorded it is an exhausted night: WARN + refill issue."""
+    gh = _gh_spy(monkeypatch)
     queue = _write_queue(tmp_path, [_config(max_depth=4), _config(max_depth=6)])
     first = research.run(db_path=_db(con), queue_path=queue)
     assert first.n_ran == 2
+    assert not first.queue_exhausted  # night one had pending work
     second = research.run(db_path=_db(con), queue_path=queue)
     assert second.n_ran == 0
     assert second.n_skipped_done == 2
-    assert second.exit_code == 0
+    assert second.queue_exhausted and second.exit_code == 1
     assert len(bench_spy["calls"]) == 2  # nothing re-ran
+    assert any(a[:3] == ["gh", "issue", "create"] for a, _ in gh)  # refill signal filed
 
 
 def test_budget_cap_respected(con, tmp_path, night, bench_spy):

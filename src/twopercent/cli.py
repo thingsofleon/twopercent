@@ -259,8 +259,9 @@ def research_cmd(
     """Overnight research loop: benchmark queued configs, flag champion beaters.
 
     Runs only between 16:30 and 05:00 America/Denver (clear of market hours and
-    the routine runs). Exit codes: 0 clean or empty queue, 1 some experiments
-    failed or queue entries were malformed, 2 the runner itself failed.
+    the routine runs). Exit codes: 0 clean, 1 some experiments failed, queue
+    entries were malformed, or the queue is exhausted (empty or all-recorded —
+    refill research/queue.json), 2 the runner itself failed.
     """
     from twopercent import research as research_mod
 

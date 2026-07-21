@@ -227,6 +227,33 @@ def test_empty_queue_is_loud_and_files_refill_issue(con, tmp_path, night, bench_
     assert issue_step.status == "ok" and "issues/77" in issue_step.detail
 
 
+def test_all_malformed_queue_files_refill_issue(con, tmp_path, night, bench_spy, monkeypatch):
+    """A queue whose entries are ALL malformed leaves zero valid entries — the
+    `not entries` branch with n_malformed > 0. It is still exhausted (WARN, exit
+    1) and files the refill issue, and the queue detail names the drop."""
+    gh = _gh_spy(monkeypatch)
+    queue = _write_queue(
+        tmp_path,
+        [
+            {"params": {"max_depth": 4}},  # no strategy
+            "not even a dict",  # not a dict at all
+        ],
+    )
+    report = research.run(db_path=_db(con), queue_path=queue)
+
+    assert report.n_malformed == 2
+    assert report.queue_exhausted and report.exit_code == 1
+    assert not bench_spy["calls"]
+    queue_step = next(s for s in report.steps if s.name == "queue")
+    assert queue_step.status == "warn"
+    assert "malformed" in queue_step.detail and "empty" in queue_step.detail
+
+    create = next(a for a, _ in gh if a[:3] == ["gh", "issue", "create"])
+    assert create[create.index("--label") + 1] == "research-queue-empty"
+    issue_step = next(s for s in report.steps if s.name == "issue")
+    assert issue_step.status == "ok" and "issues/77" in issue_step.detail
+
+
 def test_all_recorded_queue_files_refill_issue(con, tmp_path, night, bench_spy, monkeypatch):
     """Every config already recorded (pending == []) is the state that fires
     every night once the seeded sweep is done: WARN + one refill issue."""

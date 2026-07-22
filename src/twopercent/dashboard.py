@@ -167,7 +167,8 @@ _INFO_TEXT = {
     "c_prob": "Model's estimated chance the symbol moves +2% open-to-close. The "
     "bar is relative to today's top candidate — a ranking, not calibrated odds.",
     "c_prev": "The symbol's open-to-close return on the most recent completed day.",
-    "c_vol": "Latest volume ÷ its 20-day median. Above 1× means unusually active.",
+    "c_vol": "Latest volume ÷ its trailing-20-day average volume (today included). "
+    "Above 1× means unusually active.",
     "c_cnt": "How many of the last 20 trading days this symbol moved +2% "
     "open-to-close.",
     "c_co": "Company name.",

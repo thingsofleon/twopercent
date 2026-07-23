@@ -83,6 +83,15 @@ def no_real_gh(monkeypatch):
     monkeypatch.setattr(issues.subprocess, "run", forbidden)
 
 
+@pytest.fixture(autouse=True)
+def no_autogen(monkeypatch):
+    """Disable the auto-search generator by default: the curated-queue tests
+    below exercise budget/window/dedup/promotion mechanics and must not have
+    their spare budget filled by generated configs. Generation is tested
+    explicitly (test_autogen_*) by re-patching grid_configs to a small grid."""
+    monkeypatch.setattr(research.generate, "grid_configs", lambda: [])
+
+
 @pytest.fixture
 def night(monkeypatch):
     monkeypatch.setattr(research, "_now_denver", lambda: IN_WINDOW)
@@ -218,7 +227,8 @@ def test_empty_queue_is_loud_and_files_refill_issue(con, tmp_path, night, bench_
     assert report.exit_code == 1
     assert report.queue_exhausted
     queue_step = next(s for s in report.steps if s.name == "queue")
-    assert queue_step.status == "warn" and "empty" in queue_step.detail
+    # No curated work and (autouse) an empty grid → nothing to run, refill signal.
+    assert queue_step.status == "warn" and "0 pending" in queue_step.detail
     assert not bench_spy["calls"]
 
     create = next(a for a, _ in gh if a[:3] == ["gh", "issue", "create"])
@@ -246,7 +256,7 @@ def test_all_malformed_queue_files_refill_issue(con, tmp_path, night, bench_spy,
     assert not bench_spy["calls"]
     queue_step = next(s for s in report.steps if s.name == "queue")
     assert queue_step.status == "warn"
-    assert "malformed" in queue_step.detail and "empty" in queue_step.detail
+    assert "2 malformed" in queue_step.detail and "0 pending" in queue_step.detail
 
     create = next(a for a, _ in gh if a[:3] == ["gh", "issue", "create"])
     assert create[create.index("--label") + 1] == "research-queue-empty"
@@ -301,6 +311,95 @@ def test_pending_work_does_not_file_refill_issue(con, tmp_path, night, bench_spy
         "research-queue-empty" in a for args, _ in gh for a in args
     )  # never the refill label
     assert not gh  # in fact no gh call at all (champion tie files nothing)
+
+
+# --- auto-search generation (tier 1) -----------------------------------------
+
+FAKE_GRID = [
+    {
+        "strategy": "xgb_gbm_v1",
+        "params": {"reg_lambda": 5.0},
+        "note": "auto-search: reg_lambda=5.0",
+    },
+    {"strategy": "xgb_gbm_v1", "params": {"reg_lambda": 10.0}, "note": "auto: reg_lambda=10.0"},
+    {"strategy": "baseline_gbm_v1", "params": {"l2_regularization": 1.0}, "note": "auto: l2=1.0"},
+]
+
+
+def _seed_recorded(con, strategy, params):
+    store.record_experiment(
+        con,
+        strategy=strategy,
+        params={"months": 12, "top_n": 20, "strategy_params": params},
+        train_start=dt.date(2021, 7, 1),
+        test_start=dt.date(2025, 7, 1),
+        test_end=dt.date(2026, 6, 30),
+        metrics=METRICS,
+    )
+
+
+def test_autogen_fills_when_curated_all_recorded(con, tmp_path, night, bench_spy, monkeypatch):
+    """The #54 state — every curated config already recorded — no longer no-ops:
+    the runner tops the batch up from the auto-search grid so the GPU works, and
+    files NO refill issue because there is real work to do."""
+    monkeypatch.setattr(research.generate, "grid_configs", lambda: list(FAKE_GRID))
+    _seed_recorded(con, "xgb_gbm_v1", {"max_depth": 4})  # the sole curated config is done
+    report = research.run(
+        db_path=_db(con), budget=8, queue_path=_write_queue(tmp_path, [_config(max_depth=4)])
+    )
+
+    assert report.n_generated == 3 and report.n_ran == 3
+    assert not report.queue_exhausted and report.exit_code == 0
+    assert not any(s.name == "issue" for s in report.steps)  # no refill signal — there was work
+    ran = {c["params"] for c in bench_spy["calls"]}
+    assert ran == {'{"reg_lambda": 5.0}', '{"reg_lambda": 10.0}', '{"l2_regularization": 1.0}'}
+
+
+def test_autogen_respects_budget(con, tmp_path, night, bench_spy, monkeypatch):
+    monkeypatch.setattr(research.generate, "grid_configs", lambda: list(FAKE_GRID))
+    report = research.run(db_path=_db(con), budget=2, queue_path=_write_queue(tmp_path, []))
+    assert report.n_generated == 2 and len(bench_spy["calls"]) == 2  # never exceeds budget
+
+
+def test_autogen_skips_grid_config_already_in_ledger(con, tmp_path, night, bench_spy, monkeypatch):
+    """A grid config already recorded (canonical key, 5.0 == 5) is never re-run —
+    generation is idempotent against the ledger, like the curated queue."""
+    monkeypatch.setattr(research.generate, "grid_configs", lambda: list(FAKE_GRID))
+    _seed_recorded(con, "xgb_gbm_v1", {"reg_lambda": 5.0})
+    report = research.run(db_path=_db(con), budget=8, queue_path=_write_queue(tmp_path, []))
+
+    assert report.n_generated == 2  # the recorded one dropped
+    ran = {c["params"] for c in bench_spy["calls"]}
+    assert '{"reg_lambda": 5.0}' not in ran and '{"reg_lambda": 10.0}' in ran
+
+
+def test_autogen_tops_up_alongside_curated_pending(con, tmp_path, night, bench_spy, monkeypatch):
+    """Curated pending work runs first; the generator fills only the spare
+    budget — curated priority is preserved, the GPU is still saturated."""
+    monkeypatch.setattr(research.generate, "grid_configs", lambda: list(FAKE_GRID))
+    report = research.run(
+        db_path=_db(con), budget=8, queue_path=_write_queue(tmp_path, [_config(max_depth=99)])
+    )
+    assert report.n_ran == 4 and report.n_generated == 3  # 1 curated + 3 generated
+    assert '{"max_depth": 99}' in {c["params"] for c in bench_spy["calls"]}
+
+
+def test_autogen_exhausted_grid_still_files_refill_issue(
+    con, tmp_path, night, bench_spy, monkeypatch
+):
+    """When curated AND the grid are both dry, the refill signal fires as before
+    — now meaning 'even auto-search is tapped out; add new kinds of work.'"""
+    gh = _gh_spy(monkeypatch)
+    monkeypatch.setattr(research.generate, "grid_configs", lambda: list(FAKE_GRID))
+    for cfg in FAKE_GRID:  # record every grid config too
+        _seed_recorded(con, cfg["strategy"], cfg["params"])
+    report = research.run(db_path=_db(con), budget=8, queue_path=_write_queue(tmp_path, []))
+
+    assert report.n_generated == 0 and report.queue_exhausted and report.exit_code == 1
+    creates = [a for a, _ in gh if a[:3] == ["gh", "issue", "create"]]
+    assert (
+        len(creates) == 1 and creates[0][creates[0].index("--label") + 1] == "research-queue-empty"
+    )
 
 
 def test_refill_issue_dedup_does_not_spam(con, tmp_path, night, bench_spy, monkeypatch):
@@ -623,7 +722,10 @@ def test_digest_reports_night_summary(con, tmp_path, night, bench_spy):
     report = research.run(db_path=_db(con), budget=8, queue_path=queue)
 
     lines = report.summary_lines()
-    assert any("night: 2 run, 0 skipped (already recorded), 0 failed" in line for line in lines)
+    assert any(
+        "night: 2 run (0 auto-generated), 0 skipped (already recorded), 0 failed" in line
+        for line in lines
+    )
     best = next(line for line in lines if line.strip().startswith("best:"))
     assert "xgb_gbm_v1" in best and "2.4" in best  # highest lift of the night
     assert "vs champion lift 2.35" in best

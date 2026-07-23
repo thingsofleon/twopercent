@@ -53,7 +53,7 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 
-from twopercent import backtest, champion, issues, store
+from twopercent import backtest, champion, generate, issues, store
 from twopercent.compare import compare_verdict, lift_winner
 from twopercent.routine import _RANK, FAIL, OK, WARN, Step, _market_is_open
 from twopercent.strategies import xgb_gbm
@@ -142,7 +142,8 @@ class ResearchReport:
     n_failed: int = 0
     n_skipped_done: int = 0
     n_malformed: int = 0
-    queue_exhausted: bool = False  # empty or all-recorded: nothing to research, WARN
+    n_generated: int = 0  # auto-search configs the generator added to tonight's batch
+    queue_exhausted: bool = False  # curated queue AND auto-search grid both dry: WARN
     best: dict | None = None  # strategy, params, metrics, experiment_id, verdict
     champion_lift: float | None = None
     champion_auc: float | None = None
@@ -170,7 +171,8 @@ class ResearchReport:
         lines = [f"research: {self.status.upper()}"]
         lines += [f"  [{s.status:^4}] {s.name:<10} {s.detail}" for s in self.steps]
         lines.append(
-            f"  night: {self.n_ran} run, {self.n_skipped_done} skipped (already recorded), "
+            f"  night: {self.n_ran} run ({self.n_generated} auto-generated), "
+            f"{self.n_skipped_done} skipped (already recorded), "
             f"{self.n_failed} failed, {self.n_malformed} malformed, budget {self.budget}"
         )
         if self.n_failed:
@@ -476,6 +478,34 @@ def _file_queue_empty_issue(report: ResearchReport, n_recorded: int) -> None:
         )
 
 
+def _fill_generated(
+    batch: list[QueueEntry],
+    budget: int,
+    done: set[tuple[str, str]],
+    entries: list[QueueEntry],
+) -> int:
+    """Append auto-search configs to `batch` (in place) until it reaches budget.
+
+    Skips configs already recorded in the ledger, already in the curated queue,
+    or already in this batch — so the same trial is never run twice. Returns the
+    number appended. Mirrors QueueEntry.key() identity (canonical params), the
+    one used everywhere for done-matching."""
+    if len(batch) >= budget:
+        return 0
+    seen = set(done) | {e.key() for e in entries} | {b.key() for b in batch}
+    added = 0
+    for cfg in generate.grid_configs():
+        if len(batch) >= budget:
+            break
+        entry = QueueEntry(cfg["strategy"], cfg["params"], cfg["note"])
+        if entry.key() in seen:
+            continue
+        seen.add(entry.key())
+        batch.append(entry)
+        added += 1
+    return added
+
+
 def run(
     db_path: Path | str = store.DEFAULT_DB_PATH,
     budget: int = DEFAULT_BUDGET,
@@ -511,30 +541,26 @@ def run(
         report.add("queue", FAIL, f"queue {queue_path} missing or unreadable")
         report.fatal = True
         return report
-    if not entries:
-        detail = "queue is empty — nothing to research"
-        if report.n_malformed:
-            detail = (
-                f"queue is empty after skipping {report.n_malformed} malformed "
-                "entries — nothing to research"
-            )
-        report.add("queue", WARN, detail)
-        report.queue_exhausted = True
-        _file_queue_empty_issue(report, n_recorded=0)
-        return report
 
     done = recorded_configs(con)
     pending = [e for e in entries if e.key() not in done]
     report.n_skipped_done = len(entries) - len(pending)
     batch = pending[:budget]
+    # Top up spare budget from the auto-search grid so the GPU never idles once
+    # the curated queue is worked through. Generation is idempotent — grid
+    # configs already in the ledger or the curated queue are skipped, so a
+    # config is never run twice (state is the ledger, not a queue-file write).
+    report.n_generated = _fill_generated(batch, budget, done, entries)
     report.add(
         "queue",
         WARN if (report.n_malformed or not batch) else OK,
-        f"{len(entries)} valid config(s): {len(pending)} pending, "
+        f"{len(entries)} curated config(s): {len(pending)} pending, "
         f"{report.n_skipped_done} already recorded, {report.n_malformed} malformed; "
-        f"running {len(batch)} (budget {budget})",
+        f"running {len(batch)} ({report.n_generated} auto-generated, budget {budget})",
     )
     if not batch:
+        # Curated queue AND the bounded auto-search grid are both exhausted —
+        # only genuinely new kinds of work (features, algorithms) remain.
         report.queue_exhausted = True
         _file_queue_empty_issue(report, n_recorded=len(entries))
         return report

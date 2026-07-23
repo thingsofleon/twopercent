@@ -63,6 +63,41 @@ def test_dashboard_renders_scored_track_record(modeled, tmp_path):
     assert "Awaiting outcomes" in content  # the render-day prediction is pending
 
 
+def test_dashboard_info_tooltips_present(modeled, tmp_path):
+    dates = sorted(pd.bdate_range("2026-01-05", periods=60).date)
+    predict_for(modeled, "baseline_gbm_v1", signal_date=dates[-3], save=True)
+    predict_for(modeled, "baseline_gbm_v1", signal_date=dates[-2], save=True)
+
+    out = tmp_path / "dash.html"
+    dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5)
+    content = out.read_text()
+
+    # An "i" icon with its tooltip appears for a tile, a candidate column, the
+    # chart, a track-record column, and an explorer control — one per surface.
+    assert 'class="tp-i"' in content
+    for key in ("t_lift", "c_prob", "chart", "r_lift", "e_basket"):
+        assert dashboard._INFO_TEXT[key] in content, key
+    # Edge columns anchor their tooltip inward so it can't clip the viewport.
+    assert "tp-tip--start" in content and "tp-tip--end" in content
+    # Company column carries the class the mobile media query hides — on both
+    # the header and the body cell, or the columns misalign when it's dropped.
+    assert content.count("col-co") >= 2
+    assert "@media (max-width: 520px)" in content
+
+
+def test_info_helper_escapes_and_labels():
+    # Authored text only, but the icon must stay breakout-proof and carry an
+    # accessible label for keyboard/screen-reader users (tooltip is hover-only).
+    dashboard._INFO_TEXT["_probe"] = 'a <b> "quote" & amp'
+    try:
+        html_out = dashboard._info("_probe")
+    finally:
+        del dashboard._INFO_TEXT["_probe"]
+    assert 'aria-label="a &lt;b&gt; &quot;quote&quot; &amp; amp"' in html_out
+    assert "<b>" not in html_out  # raw tag never reaches the markup
+    assert 'tabindex="0"' in html_out
+
+
 def test_dashboard_empty_track_record_state(modeled, tmp_path):
     out = tmp_path / "dash.html"
     dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5)

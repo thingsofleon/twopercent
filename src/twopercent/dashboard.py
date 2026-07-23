@@ -72,7 +72,7 @@ html, body { background: var(--bg); margin: 0; }
 }
 .tp-root .card {
   background: var(--card); border: 1px solid var(--card-border);
-  border-radius: 8px; padding: 14px 16px; margin-top: 10px; overflow-x: auto;
+  border-radius: 8px; padding: 14px 16px; margin-top: 10px; overflow: visible;
 }
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 10px; margin-top: 16px; }
@@ -111,8 +111,103 @@ html, body { background: var(--bg); margin: 0; }
   border: 1px solid var(--card-border); border-radius: 6px; padding: 3px 6px;
   font: inherit; font-size: 0.84rem; }
 .tp-root .note { color: var(--ink-muted); font-size: 0.74rem; margin-top: 26px; }
+.tp-i {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 14px; height: 14px; margin-left: 5px; border-radius: 50%;
+  border: 1px solid var(--ink-muted); color: var(--ink-muted);
+  font: 600 9px/1 system-ui, sans-serif; font-style: normal;
+  text-transform: none; letter-spacing: 0; cursor: help;
+  position: relative; vertical-align: middle; user-select: none; flex: none;
+}
+.tp-i:hover, .tp-i:focus-visible { color: var(--info); border-color: var(--info); }
+.tp-i:focus-visible { outline: 2px solid var(--info); outline-offset: 1px; }
+.tp-tip {
+  display: none; position: absolute; top: calc(100% + 9px); left: 50%;
+  transform: translateX(-50%); width: max-content; max-width: min(260px, 82vw);
+  background: var(--card); border: 1px solid var(--card-border); border-radius: 8px;
+  padding: 8px 11px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.30); z-index: 50;
+  color: var(--ink-2); font: 400 0.72rem/1.45 system-ui, sans-serif;
+  font-style: normal; text-transform: none; letter-spacing: normal;
+  text-align: left; white-space: normal; pointer-events: none;
+}
+.tp-i:hover .tp-tip, .tp-i:focus-visible .tp-tip { display: block; }
+.tp-tip--start { left: 0; transform: none; }
+.tp-tip--end { left: auto; right: 0; transform: none; }
+.tp-tip::after, .tp-tip::before {
+  content: ""; position: absolute; bottom: 100%; left: 50%; border: 6px solid transparent;
+  border-bottom-color: var(--card); margin-left: -6px;
+}
+.tp-tip::before { border-width: 7px; border-bottom-color: var(--card-border); margin-left: -7px; }
+.tp-tip--start::after, .tp-tip--start::before { left: 15px; }
+.tp-tip--end::after, .tp-tip--end::before { left: auto; right: 15px; margin-left: 0; }
+@media (max-width: 520px) {
+  .tp-root .col-co { display: none; }
+  .tp-root table { font-size: 0.8rem; }
+  .tp-root .probbar { width: 34px; }
+}
 </style>
 """
+
+
+_INFO_TEXT = {
+    # Header tiles
+    "t_lift": "How much more often the top picks hit +2% than a random symbol "
+    "would, pooled across every scored day. Above 1× beats chance.",
+    "t_hit": "Share of the top-ranked picks that actually moved +2% open-to-close, "
+    "across all scored days.",
+    "t_live1": "Of live days (picks logged before the market opened), the share "
+    "where the #1 ranked pick moved +2%. Backfilled days excluded.",
+    "t_growth": "Value today of $1 placed each live day on the #1 pick — and, "
+    "alongside, on the top-5 equal-weight basket — net of assumed round-trip "
+    "costs. Live days only.",
+    "t_cands": "How many symbols the model ranked for the next trading day.",
+    # Candidates table columns
+    "c_rank": "Rank by model probability — 1 is the most likely to move +2%.",
+    "c_sym": "Ticker symbol.",
+    "c_prob": "Model's estimated chance the symbol moves +2% open-to-close. The "
+    "bar is relative to today's top candidate — a ranking, not calibrated odds.",
+    "c_prev": "The symbol's open-to-close return on the most recent completed day.",
+    "c_vol": "Latest volume ÷ its trailing-20-day average volume (today included). "
+    "Above 1× means unusually active.",
+    "c_cnt": "How many of the last 20 trading days this symbol moved +2% open-to-close.",
+    "c_co": "Company name.",
+    # Track-record chart + table
+    "chart": "One bar per scored day: the top-N hit rate. Green beat the market "
+    "base rate, red missed it. The amber dash marks that day's base rate — the "
+    "share of all symbols that moved +2%.",
+    "r_day": "The trading day these picks were made for.",
+    "r_pick": "The #1 ranked pick and its actual open-to-close return. A † means "
+    "the day was backfilled, not a live forecast.",
+    "r_hits": "How many of that day's scored top-N picks moved +2%.",
+    "r_hit": "Hits ÷ picks scored that day. Green beat the market base rate.",
+    "r_base": "Share of all symbols that moved +2% that day — the bar to beat.",
+    "r_lift": "Hit rate ÷ base rate. Above 1× is better than picking at random.",
+    # Explorer controls + table
+    "e_basket": "Basket size — the top-N ranked picks each day drive the numbers below.",
+    "e_window": "How many trailing trading days to summarize.",
+    "e_record": "SIM is walk-forward simulation: the model never trains on the days "
+    "it predicts, but the system was built with this history visible. LIVE is the "
+    "picks actually logged before each open — the clean test.",
+    "e_growth": "Compounded value of $1 over the selected window, net of assumed round-trip costs.",
+    "e_hit": "Share of the basket that moved +2%, averaged over the window.",
+    "e_base": "Average share of all symbols that moved +2% over the window.",
+    "e_lift": "Hit rate ÷ base rate over the window. Above 1× beats random.",
+    "e_days": "Trading days included in this window.",
+}
+
+
+def _info(key: str, variant: str = "") -> str:
+    """A hoverable/focusable 'i' icon with a CSS tooltip. Text is authored here
+    (never user data), but escape anyway — belt and suspenders, and the aria
+    label must not break the attribute. variant is '' | 'start' | 'end' to
+    anchor edge-column tooltips inside the viewport."""
+    text = _INFO_TEXT[key]
+    tip_cls = "tp-tip" + (f" tp-tip--{variant}" if variant else "")
+    return (
+        f'<span class="tp-i" tabindex="0" role="note" '
+        f'aria-label="{html.escape(text, quote=True)}">i'
+        f'<span class="{tip_cls}">{html.escape(text, quote=False)}</span></span>'
+    )
 
 
 def _chart_svg(scored: pd.DataFrame) -> str:
@@ -173,7 +268,8 @@ def _chart_svg(scored: pd.DataFrame) -> str:
         '<div class="legend">'
         '<span><span class="chip" style="background:var(--up)"></span>hit rate (beat market)</span>'
         '<span><span class="chip" style="background:var(--down)"></span>hit rate (missed)</span>'
-        '<span><span class="chip" style="background:var(--amber)"></span>market base rate</span>'
+        '<span><span class="chip" style="background:var(--amber)"></span>market base rate'
+        f"{_info('chart')}</span>"
         "</div>"
         f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" '
         f'aria-label="Daily top-N hit rate vs market base rate">{"".join(parts)}</svg>'
@@ -193,10 +289,10 @@ def _tiles(
     lift = overall_p / overall_b if overall_b > 0 else float("nan")
     tiles = (
         '<div class="tiles">'
-        f'<div class="tile"><span class="label">Cumulative lift</span>'
+        f'<div class="tile"><span class="label">Cumulative lift{_info("t_lift")}</span>'
         f'<b class="{"up" if lift >= 1 else ""}">{lift:.2f}×</b>'
         f'<span class="cmp">vs picking at random</span></div>'
-        f'<div class="tile"><span class="label">Hit rate (top {top})</span>'
+        f'<div class="tile"><span class="label">Hit rate (top {top}){_info("t_hit")}</span>'
         f"<b>{overall_p:.0%}</b>"
         f'<span class="cmp">market base {overall_b:.0%}</span></div>'
     )
@@ -209,24 +305,27 @@ def _tiles(
         if g1 is not None:
             live = picks.live
             tiles += (
-                f'<div class="tile"><span class="label">Top pick hit rate (live)</span>'
+                f'<div class="tile"><span class="label">Top pick hit rate (live)'
+                f"{_info('t_live1')}</span>"
                 f"<b>{p1:.0%}</b>"
                 f'<span class="cmp">{int(live["top1_hit"].sum())}/{len(live)} days'
                 f" did +2%{late_note}</span></div>"
-                f'<div class="tile"><span class="label">$1 → top pick daily (live)</span>'
+                f'<div class="tile"><span class="label">$1 → top pick daily (live)'
+                f"{_info('t_growth')}</span>"
                 f'<b class="{"up" if g1 >= 1 else ""}">${g1:.3f}</b>'
                 f'<span class="cmp">top-5: ${g5:.3f} · net of '
                 f"{track.COST_ROUND_TRIP:.1%}/day assumed costs{late_note}</span></div>"
             )
         else:
             tiles += (
-                f'<div class="tile"><span class="label">$1 → top pick daily (live)</span>'
+                f'<div class="tile"><span class="label">$1 → top pick daily (live)'
+                f"{_info('t_growth')}</span>"
                 f"<b>—</b>"
                 f'<span class="cmp">all {picks.late_days} scored days were backfilled — '
                 f"live record starts with the next scheduled run</span></div>"
             )
     tiles += (
-        f'<div class="tile"><span class="label">Candidates today</span>'
+        f'<div class="tile"><span class="label">Candidates today{_info("t_cands")}</span>'
         f"<b>{n_candidates}</b>"
         f'<span class="cmp">ranked by probability</span></div>'
         "</div>"
@@ -434,8 +533,9 @@ def _record_explorer(meta: dict | None, sim_days: list[dict], live_days: list[di
     )
     controls = (
         '<p class="sub controls"><label>Basket '
-        f'<select id="tp-basket">{basket_opts}</select></label> '
-        f'<label>Window <select id="tp-window">{window_opts}</select></label></p>'
+        f'<select id="tp-basket">{basket_opts}</select></label>{_info("e_basket")} '
+        f'<label>Window <select id="tp-window">{window_opts}</select></label>'
+        f"{_info('e_window')}</p>"
     )
     span = ""
     if meta is not None:
@@ -448,9 +548,10 @@ def _record_explorer(meta: dict | None, sim_days: list[dict], live_days: list[di
             f'<span class="mono">{len(sim_days)}</span> sim days available</p>'
         )
     table = (
-        "<div class='card'><table>"
-        "<tr><th>Record</th><th>$1 →</th><th>Hit rate</th><th>Base rate</th>"
-        "<th>Lift</th><th>Days</th></tr>"
+        "<div class='card'><table><tr>"
+        f"<th>Record{_info('e_record', 'start')}</th><th>$1 →{_info('e_growth')}</th>"
+        f"<th>Hit rate{_info('e_hit')}</th><th>Base rate{_info('e_base')}</th>"
+        f"<th>Lift{_info('e_lift')}</th><th>Days{_info('e_days', 'end')}</th></tr>"
         '<tr><td><span class="badge-sim">SIM</span> walk-forward, monthly retrain</td>'
         + _explorer_cells("sim", sim_s)
         + "</tr>"
@@ -619,12 +720,14 @@ def build_html(
             f'<td>{row.prob:.3f}<span class="probbar"><i style="width:{bar}%"></i></span></td>'
             f'<td class="{move_cls}">{row.oc_return_today:+.1%}</td>'
             f"<td>{row.volume_ratio:.2f}×</td><td>{int(row.cnt_2pct_20d)}</td>"
-            f'<td class="name">{name}</td></tr>'
+            f'<td class="name col-co">{name}</td></tr>'
         )
     candidates = (
         f"<h2>Top {top} candidates</h2><div class='card'><table>"
-        "<tr><th>#</th><th>Symbol</th><th>Probability</th><th>Prev day</th>"
-        "<th>Vol ratio</th><th>2% days /20d</th><th>Company</th></tr>"
+        f"<tr><th>#{_info('c_rank', 'start')}</th><th>Symbol{_info('c_sym')}</th>"
+        f"<th>Probability{_info('c_prob')}</th><th>Prev day{_info('c_prev')}</th>"
+        f"<th>Vol ratio{_info('c_vol')}</th><th>2% days /20d{_info('c_cnt')}</th>"
+        f'<th class="col-co">Company{_info("c_co", "end")}</th></tr>'
         + "".join(rows)
         + "</table></div>"
     )
@@ -665,8 +768,11 @@ def build_html(
             )
         body = late_note + (
             f"<div class='card'>{_chart_svg(record.scored)}</div>"
-            + "<div class='card'><table><tr><th>Day</th><th>Top pick</th><th>Hits</th>"
-            + f"<th>Hit rate</th><th>Base rate</th><th>Lift</th></tr>{trs}</table></div>"
+            + "<div class='card'><table><tr>"
+            + f"<th>Day{_info('r_day', 'start')}</th><th>Top pick{_info('r_pick')}</th>"
+            + f"<th>Hits{_info('r_hits')}</th><th>Hit rate{_info('r_hit')}</th>"
+            + f"<th>Base rate{_info('r_base')}</th>"
+            + f"<th>Lift{_info('r_lift', 'end')}</th></tr>{trs}</table></div>"
         )
     pending = ""
     if record.pending:

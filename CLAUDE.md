@@ -26,6 +26,9 @@ supervised autonomy → AI-native).
   the happy path. (Session 1's review found four of these on "all-green" code.)
 - **Lint cold before pushing:** `uv run ruff check --no-cache .` — a stale
   ruff cache passed locally and failed in CI after a package-structure change.
+  CI *also* runs `uv run ruff format --check .`; `ruff check` alone won't catch
+  formatting, so run both before pushing — a format-only miss reddened CI on an
+  otherwise-green PR (multi-line f-string edits are the usual culprit).
 - **DuckDB uses total ordering in comparisons: `NaN > 0` is TRUE and NaN sorts
   above every number.** Any SQL filtering or ranking float columns must guard
   with `isfinite()` — a NaN row otherwise tops every ORDER BY DESC. (Session 2:

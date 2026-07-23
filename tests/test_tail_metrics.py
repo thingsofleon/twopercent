@@ -141,5 +141,5 @@ def test_dashboard_shows_pick_tiles_and_column(con_with_universe, tmp_path):
     content = out.read_text()
     assert "Top pick hit rate (live)" in content
     assert "$1 → top pick daily (live)" in content
-    assert "Top pick</th>" in content
+    assert "<th>Top pick" in content  # column header (now carries an info icon)
     assert "WIN" in content

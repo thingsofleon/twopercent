@@ -200,25 +200,44 @@ idea physically cannot go live on backtest results alone, agents can be bold.
   proposals (the standing idea backlog).
 - **Forward shadow gate → autonomous promotion. Supersedes** the Level-4
   "champion promotion is HUMAN-ONLY by PR" decision. A challenger promotes only
-  after two stages: (1) **backtest** — beats the champion beyond the 0.25 band +
-  both-halves rule (candidate only); (2) **forward shadow** — runs live in
-  parallel each morning (picks generated, logged, scored next day) but NOT
-  emailed, for ~20 trading days, and still beats the champion on that
-  never-seen forward window. Forward live data is the one evidence immune to
-  multiple-comparisons, so a shadow win is a sound autonomous promotion
-  criterion. On promotion: swap `champion.json` autonomously, **email + file an
-  issue announcing it with evidence** (a silent champion swap would itself be a
+  after two stages: (1) **backtest** — beats the champion beyond the promotion
+  band + both-halves rule (candidate only); (2) **forward shadow** — runs live
+  in parallel each morning (picks generated, logged, scored next day) but NOT
+  emailed, and still beats the champion on that never-seen forward window.
+  Forward live data removes the *backtest* selection bias — but it is NOT
+  automatically "immune to multiple comparisons": promoting whoever wins among K
+  concurrently-shadowed challengers is a max-over-K and reintroduces selection
+  (quant-skeptic D-1). So the gate needs a concurrency cap and a forward margin
+  that scales with K (~`sqrt(2·ln K)·SE`), and the window length must be DERIVED
+  from a target power at a target edge — not asserted. quant-skeptic's power
+  arithmetic (D-2) puts a meaningful window at **~87 trading days even under
+  optimistic independence, and ~250–870 once daily cross-sectional correlation
+  is priced in** — so any "~20 days" placeholder is far too short and is not the
+  spec. On promotion: swap `champion.json` autonomously, **email + file an issue
+  announcing it with evidence** (a silent champion swap would itself be a
   dangerous silent success), and keep the prior champion for rollback.
-- **Auto-rollback:** the trailing-5 degradation detector reverts a freshly
-  auto-promoted champion to its predecessor if it underperforms in its first
-  ~10 live days — the loop self-heals a slip-through.
+- **Auto-rollback (must not oscillate):** a freshly auto-promoted champion
+  reverts to its predecessor if it underperforms early — but a naive trailing-5
+  check is even noisier than the promote gate and will false-revert good
+  champions and flap (quant-skeptic D-3). Requires **hysteresis** (rollback
+  threshold below the promote threshold), a **minimum dwell time**, **burning a
+  reverted config** so it can't be re-nominated and re-win by luck, and
+  **quarantining promote/rollback churn from the reported live record** so the
+  emailed track record isn't polluted by a flapping model.
 - **Multiple-comparisons accounting (open design item, quant-skeptic-gated):**
   bounded generator families cap the backtest-stage trial count, but the shadow
   stage is itself a multiple-comparison if many challengers are shadowed at
   once — so the shadow gate needs a concurrency cap and a forward-margin
   threshold that scales with the number concurrently shadowed. The promotion
-  band may need to scale with total trials. This is reviewed as a design before
-  any promotion code lands.
+  band scales with total trials (tier 1 already bumped 0.25→0.27 for the ~56
+  family; the dynamic version lives here). Two further contamination leaks to
+  design against (quant-skeptic D-4): **window reuse** — a challenger's shadow
+  days later roll into the training/benchmark window that selects the *next*
+  generation, so promotion-decision windows must be excluded from subsequent
+  selection folds; and **single-regime promotion** — a forward window inside one
+  regime is a one-regime win, so pair the forward gate with a base-rate-adjusted
+  (lift-style) metric or require it to span more than one regime. Reviewed as a
+  design before any promotion code lands.
 
 Build order: T1 generator (GPU busy now) → challenger isolation + shadow-trading
 engine → forward shadow-gate promotion + notify + rollback → T2/T3 autonomous

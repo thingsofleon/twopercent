@@ -1,6 +1,7 @@
 """Tier-1 auto-search generator: bounded, deterministic, constructible configs."""
 
-from twopercent import generate, strategies
+from tests.conftest import seed_planted
+from twopercent import backtest, generate, store, strategies
 from twopercent.strategies.xgb_gbm import ALLOWED_PARAMS
 
 
@@ -41,3 +42,20 @@ def test_generated_params_are_valid_for_their_strategy():
             # HistGradientBoosting: constructing proves the kwargs are accepted
             # (CPU-only, safe in CI — no CUDA touched).
             strategies.get("baseline_gbm_v1", **cfg["params"])
+
+
+def test_baseline_grid_config_survives_a_real_benchmark(con, monkeypatch):
+    """Construction accepting the kwargs is not the same as the referee training
+    on them without crashing — and a generated config that crashes at benchmark
+    time would be re-generated and re-crashed every night (never recorded, so
+    never skipped). Run one real baseline grid config end-to-end through the
+    walk-forward referee on planted data to prove the params train and record."""
+    monkeypatch.setattr(backtest, "MIN_TRAIN_ROWS", 500)
+    seed_planted(con)
+    cfg = next(c for c in generate.grid_configs() if c["strategy"] == "baseline_gbm_v1")
+    metrics = backtest.run_benchmark(
+        con, "baseline_gbm_v1", months=2, top_n=5, record=True, strategy_params=cfg["params"]
+    )
+    assert metrics["lift"] > 0  # trained and scored, no crash
+    recorded = store.list_experiments(con)
+    assert len(recorded) == 1  # the generated config landed in the ledger

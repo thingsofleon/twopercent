@@ -292,7 +292,10 @@ def test_all_recorded_queue_files_refill_issue(con, tmp_path, night, bench_spy, 
     assert creates[0][creates[0].index("--label") + 1] == "research-queue-empty"
     body = next(kw["input"] for a, kw in gh if a[:3] == ["gh", "issue", "create"])
     assert "2" in body and "twopercent experiments" in body  # honest, forwardable
-    assert "pull request" in body and "strategy-researcher" in body
+    # Now that auto-search covers hyperparameters, the refill body must point at
+    # NEW features/algorithms, not more queue configs, and say the grid is dry.
+    assert "auto-search grid" in body and "strategy-researcher" in body
+    assert "new" in body and "will not unstick" in body
 
 
 def test_pending_work_does_not_file_refill_issue(con, tmp_path, night, bench_spy, monkeypatch):
@@ -600,7 +603,7 @@ def test_winner_beyond_promotion_band_files_promotion_issue(
 ):
     champ_id = _seed_champion_experiment(con, lift=2.0)
     gh = _gh_spy(monkeypatch)
-    bench_spy["lifts"]['{"max_depth": 4}'] = 2.5  # margin 0.5 >= 0.25 band
+    bench_spy["lifts"]['{"max_depth": 4}'] = 2.5  # margin 0.5 >= 0.27 band
     champion_before = Path("champion.json").read_bytes()
     prices_before = store.price_row_count(con)
 
@@ -622,7 +625,7 @@ def test_winner_beyond_promotion_band_files_promotion_issue(
     assert f"#{champ_id}" in body  # champion's ledger id
     assert f"#{champ_id + 1}" in body  # challenger's ledger id (recorded after)
     assert "| lift | 2.5 | 2.0 |" in body  # full metrics vs champion's
-    assert "promotion band (0.25)" in body
+    assert "promotion band (0.27)" in body
     assert "Disjoint-halves confirmation" in body and "+0.3000" in body  # 0.8 vs 0.5
     assert "AFTER this candidate's test_end" in body  # wall-clock holdout demand
     assert "#45" in body
@@ -641,7 +644,7 @@ def test_winner_beyond_promotion_band_files_promotion_issue(
 
 
 def test_within_promotion_band_files_nothing(con, tmp_path, night, bench_spy, monkeypatch):
-    """2.2 vs 2.0 beats compare's 0.1 noise band but NOT the 0.25 promotion
+    """2.2 vs 2.0 beats compare's 0.1 noise band but NOT the 0.27 promotion
     band — a sweep's best-of-many needs the family-wise bar, not the
     single-comparison one."""
     _seed_champion_experiment(con, lift=2.0)
@@ -655,7 +658,7 @@ def test_within_promotion_band_files_nothing(con, tmp_path, night, bench_spy, mo
     assert not any(s.name == "issue" for s in report.steps)
     assert report.exit_code == 0
     candidate = next(s for s in report.steps if s.name == "candidate")
-    assert candidate.status == "ok" and "within the promotion band (0.25)" in candidate.detail
+    assert candidate.status == "ok" and "within the promotion band (0.27)" in candidate.detail
 
 
 def test_half_window_loser_files_nothing(con, tmp_path, night, bench_spy, monkeypatch):

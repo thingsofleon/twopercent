@@ -169,8 +169,7 @@ _INFO_TEXT = {
     "c_prev": "The symbol's open-to-close return on the most recent completed day.",
     "c_vol": "Latest volume ÷ its trailing-20-day average volume (today included). "
     "Above 1× means unusually active.",
-    "c_cnt": "How many of the last 20 trading days this symbol moved +2% "
-    "open-to-close.",
+    "c_cnt": "How many of the last 20 trading days this symbol moved +2% open-to-close.",
     "c_co": "Company name.",
     # Track-record chart + table
     "chart": "One bar per scored day: the top-N hit rate. Green beat the market "
@@ -184,14 +183,12 @@ _INFO_TEXT = {
     "r_base": "Share of all symbols that moved +2% that day — the bar to beat.",
     "r_lift": "Hit rate ÷ base rate. Above 1× is better than picking at random.",
     # Explorer controls + table
-    "e_basket": "Basket size — the top-N ranked picks each day drive the numbers "
-    "below.",
+    "e_basket": "Basket size — the top-N ranked picks each day drive the numbers below.",
     "e_window": "How many trailing trading days to summarize.",
     "e_record": "SIM is walk-forward simulation: the model never trains on the days "
     "it predicts, but the system was built with this history visible. LIVE is the "
     "picks actually logged before each open — the clean test.",
-    "e_growth": "Compounded value of $1 over the selected window, net of assumed "
-    "round-trip costs.",
+    "e_growth": "Compounded value of $1 over the selected window, net of assumed round-trip costs.",
     "e_hit": "Share of the basket that moved +2%, averaged over the window.",
     "e_base": "Average share of all symbols that moved +2% over the window.",
     "e_lift": "Hit rate ÷ base rate over the window. Above 1× beats random.",
@@ -309,12 +306,12 @@ def _tiles(
             live = picks.live
             tiles += (
                 f'<div class="tile"><span class="label">Top pick hit rate (live)'
-                f'{_info("t_live1")}</span>'
+                f"{_info('t_live1')}</span>"
                 f"<b>{p1:.0%}</b>"
                 f'<span class="cmp">{int(live["top1_hit"].sum())}/{len(live)} days'
                 f" did +2%{late_note}</span></div>"
                 f'<div class="tile"><span class="label">$1 → top pick daily (live)'
-                f'{_info("t_growth")}</span>'
+                f"{_info('t_growth')}</span>"
                 f'<b class="{"up" if g1 >= 1 else ""}">${g1:.3f}</b>'
                 f'<span class="cmp">top-5: ${g5:.3f} · net of '
                 f"{track.COST_ROUND_TRIP:.1%}/day assumed costs{late_note}</span></div>"
@@ -322,7 +319,7 @@ def _tiles(
         else:
             tiles += (
                 f'<div class="tile"><span class="label">$1 → top pick daily (live)'
-                f'{_info("t_growth")}</span>'
+                f"{_info('t_growth')}</span>"
                 f"<b>—</b>"
                 f'<span class="cmp">all {picks.late_days} scored days were backfilled — '
                 f"live record starts with the next scheduled run</span></div>"
@@ -538,7 +535,7 @@ def _record_explorer(meta: dict | None, sim_days: list[dict], live_days: list[di
         '<p class="sub controls"><label>Basket '
         f'<select id="tp-basket">{basket_opts}</select></label>{_info("e_basket")} '
         f'<label>Window <select id="tp-window">{window_opts}</select></label>'
-        f'{_info("e_window")}</p>'
+        f"{_info('e_window')}</p>"
     )
     span = ""
     if meta is not None:
@@ -552,9 +549,9 @@ def _record_explorer(meta: dict | None, sim_days: list[dict], live_days: list[di
         )
     table = (
         "<div class='card'><table><tr>"
-        f'<th>Record{_info("e_record", "start")}</th><th>$1 →{_info("e_growth")}</th>'
-        f'<th>Hit rate{_info("e_hit")}</th><th>Base rate{_info("e_base")}</th>'
-        f'<th>Lift{_info("e_lift")}</th><th>Days{_info("e_days", "end")}</th></tr>'
+        f"<th>Record{_info('e_record', 'start')}</th><th>$1 →{_info('e_growth')}</th>"
+        f"<th>Hit rate{_info('e_hit')}</th><th>Base rate{_info('e_base')}</th>"
+        f"<th>Lift{_info('e_lift')}</th><th>Days{_info('e_days', 'end')}</th></tr>"
         '<tr><td><span class="badge-sim">SIM</span> walk-forward, monthly retrain</td>'
         + _explorer_cells("sim", sim_s)
         + "</tr>"
@@ -727,9 +724,9 @@ def build_html(
         )
     candidates = (
         f"<h2>Top {top} candidates</h2><div class='card'><table>"
-        f'<tr><th>#{_info("c_rank", "start")}</th><th>Symbol{_info("c_sym")}</th>'
-        f'<th>Probability{_info("c_prob")}</th><th>Prev day{_info("c_prev")}</th>'
-        f'<th>Vol ratio{_info("c_vol")}</th><th>2% days /20d{_info("c_cnt")}</th>'
+        f"<tr><th>#{_info('c_rank', 'start')}</th><th>Symbol{_info('c_sym')}</th>"
+        f"<th>Probability{_info('c_prob')}</th><th>Prev day{_info('c_prev')}</th>"
+        f"<th>Vol ratio{_info('c_vol')}</th><th>2% days /20d{_info('c_cnt')}</th>"
         f'<th class="col-co">Company{_info("c_co", "end")}</th></tr>'
         + "".join(rows)
         + "</table></div>"
@@ -772,10 +769,10 @@ def build_html(
         body = late_note + (
             f"<div class='card'>{_chart_svg(record.scored)}</div>"
             + "<div class='card'><table><tr>"
-            + f'<th>Day{_info("r_day", "start")}</th><th>Top pick{_info("r_pick")}</th>'
-            + f'<th>Hits{_info("r_hits")}</th><th>Hit rate{_info("r_hit")}</th>'
-            + f'<th>Base rate{_info("r_base")}</th>'
-            + f'<th>Lift{_info("r_lift", "end")}</th></tr>{trs}</table></div>'
+            + f"<th>Day{_info('r_day', 'start')}</th><th>Top pick{_info('r_pick')}</th>"
+            + f"<th>Hits{_info('r_hits')}</th><th>Hit rate{_info('r_hit')}</th>"
+            + f"<th>Base rate{_info('r_base')}</th>"
+            + f"<th>Lift{_info('r_lift', 'end')}</th></tr>{trs}</table></div>"
         )
     pending = ""
     if record.pending:

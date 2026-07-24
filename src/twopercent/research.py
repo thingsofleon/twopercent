@@ -53,7 +53,7 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 
-from twopercent import backtest, champion, issues, store
+from twopercent import backtest, champion, generate, issues, store
 from twopercent.compare import compare_verdict, lift_winner
 from twopercent.routine import _RANK, FAIL, OK, WARN, Step, _market_is_open
 from twopercent.strategies import xgb_gbm
@@ -68,12 +68,17 @@ PROMOTION_LABEL = "promotion-candidate"
 QUEUE_EMPTY_LABEL = "research-queue-empty"
 
 # Promotion band, deliberately wider than compare.LIFT_NOISE_BAND (0.1): the
-# compare CLI makes ONE comparison; a seeded sweep makes ~24 against the same
-# test months. With SE(delta-lift) ~ 0.065-0.08 on ~250 shared test days, 0.1
-# is only a ~1.5-sigma test — a null 24-config sweep would produce a spurious
-# "candidate" with ~45% probability. 0.25 corresponds to z ~ 3.1-3.8, holding
-# the family-wise false-candidate rate near a few percent.
-RESEARCH_PROMOTION_BAND = 0.25
+# compare CLI makes ONE comparison; the overnight loop makes MANY against the
+# same test months, so the band has to survive a max-over-trials. With
+# SE(delta-lift) ~ 0.065-0.08 on ~250 shared test days, 0.1 is only ~1.5-sigma
+# and a null sweep would throw a spurious "candidate" nearly half the time.
+# The family is now the 24 curated configs PLUS the auto-search grid (tier 1,
+# generate.py) — up to 24 + generate.MAX_AUTO_FAMILY. At the ~56-config family
+# this build creates, 0.25 (z ~ 3.1-3.8) allows ~5% family-wise; 0.27 pulls it
+# back near ~2%. This is a fixed interim widening — scaling the band off the
+# ACTUAL recorded-config count (and accounting for the forward-shadow stage) is
+# issue #60, gated by quant-skeptic before the promotion tiers land.
+RESEARCH_PROMOTION_BAND = 0.27
 
 _DENVER = ZoneInfo("America/Denver")
 WINDOW_OPEN = dt.time(16, 30)  # research may start (post score-run, post-close)
@@ -142,7 +147,8 @@ class ResearchReport:
     n_failed: int = 0
     n_skipped_done: int = 0
     n_malformed: int = 0
-    queue_exhausted: bool = False  # empty or all-recorded: nothing to research, WARN
+    n_generated: int = 0  # auto-search configs the generator added to tonight's batch
+    queue_exhausted: bool = False  # curated queue AND auto-search grid both dry: WARN
     best: dict | None = None  # strategy, params, metrics, experiment_id, verdict
     champion_lift: float | None = None
     champion_auc: float | None = None
@@ -170,7 +176,8 @@ class ResearchReport:
         lines = [f"research: {self.status.upper()}"]
         lines += [f"  [{s.status:^4}] {s.name:<10} {s.detail}" for s in self.steps]
         lines.append(
-            f"  night: {self.n_ran} run, {self.n_skipped_done} skipped (already recorded), "
+            f"  night: {self.n_ran} run ({self.n_generated} auto-generated), "
+            f"{self.n_skipped_done} skipped (already recorded), "
             f"{self.n_failed} failed, {self.n_malformed} malformed, budget {self.budget}"
         )
         if self.n_failed:
@@ -349,10 +356,12 @@ def _promotion_body(
         "",
         "## Multiple-comparisons caveat",
         "",
-        f"This candidate is the best of an overnight sweep ({n_swept} config(s) run "
-        "tonight; more across nights) evaluated against the SAME 12 test months. The "
-        "best of many trials is inflated by selection — treat it as a hypothesis and "
-        "expect the edge to shrink out of sample.",
+        f"This candidate is the best of **{n_swept} distinct config(s)** (curated queue "
+        "plus the auto-search grid) evaluated against the SAME 12 test months to date. "
+        "The best of many trials is inflated by selection — the more configs the sweep "
+        "has run, the larger the winner's expected overstatement. Treat it as a "
+        "hypothesis and expect the edge to shrink out of sample; the wall-clock holdout "
+        "above is the real test.",
     ]
     return "\n".join(lines) + "\n"
 
@@ -406,36 +415,48 @@ def _queue_empty_body(n_recorded: int) -> str:
     if n_recorded:
         state = (
             f"All **{n_recorded}** config(s) in `research/queue.json` already have a "
-            "recorded standard benchmark, so there are **0 pending** — nothing to run."
+            "recorded standard benchmark, **and the bounded auto-search grid "
+            "(`generate.py`) is also fully recorded** — so there are **0 pending** and "
+            "nothing left to generate."
         )
     else:
         state = (
-            "`research/queue.json` is empty (or every entry was malformed and skipped), "
-            "so there is **0 pending** — nothing to run."
+            "`research/queue.json` is empty (or every entry was malformed and skipped) "
+            "**and the auto-search grid is fully recorded** — so there is **0 pending** "
+            "and nothing left to generate."
         )
     lines = [
-        "Auto-filed by `twopercent research`: the overnight experiment queue is exhausted.",
+        "Auto-filed by `twopercent research`: the overnight loop has run out of work — "
+        "both the curated queue and the tier-1 auto-search grid are exhausted.",
         "",
         state,
         "",
-        "The nightly runner will **no-op every night until the queue is refilled** — it "
-        "ran, found nothing to research, and exited with a warning. This issue exists so "
+        "The nightly runner will **no-op every night until new work is added** — it ran, "
+        "found nothing left to research, and exited with a warning. This issue exists so "
         "that goes noticed instead of silently repeating.",
         "",
-        "## How to refill",
+        "## What refill means now",
         "",
-        "Add new configs to `research/queue.json` **via a pull request** — the queue is "
-        "git-tracked so every experiment the overnight GPU runs stays auditable (per the "
-        "repo workflow; the runner never edits the queue itself).",
+        "Auto-search only permutes hyperparameters of the EXISTING strategies, and it has "
+        "now covered its grid. Adding more hyperparameter configs to `research/queue.json` "
+        "**will not unstick the loop** — those variants are already recorded. The lever "
+        "that plateaued was the model space, so the remaining work is **new kinds of "
+        "signal**:",
         "",
-        "- Use the `strategy-researcher` agent to propose new strategies/params and the "
-        "`validate-new-strategy` skill to turn them into referee-ready candidates before "
-        "they go in the queue.",
-        "- The full sweep run so far is queryable from the experiments ledger: "
+        "- **New features / algorithms** — the autonomous-research tiers (issues labeled "
+        "`autonomous-research`, T2/T3): new challenger features or model types, isolated "
+        "from the champion, evaluated through the same referee.",
+        "- Use the `strategy-researcher` agent to survey literature and file referee-ready "
+        "`strategy-proposal` design docs; turn approved ones into challengers via the "
+        "`validate-new-strategy` skill.",
+        "- If you DO want more hyperparameter coverage, widen the grid in `generate.py` "
+        "(mind `MAX_AUTO_FAMILY` and the promotion-band accounting, issue #60) via a PR — "
+        "not by hand-adding near-duplicate queue configs.",
+        "- The full sweep so far is queryable from the experiments ledger: "
         "`twopercent experiments`.",
         "",
         "This issue is deduped by label (`" + QUEUE_EMPTY_LABEL + "`): it stays open and "
-        "is not re-filed each night — close it after refilling the queue.",
+        "is not re-filed each night — close it after adding new work.",
     ]
     return "\n".join(lines) + "\n"
 
@@ -476,6 +497,34 @@ def _file_queue_empty_issue(report: ResearchReport, n_recorded: int) -> None:
         )
 
 
+def _fill_generated(
+    batch: list[QueueEntry],
+    budget: int,
+    done: set[tuple[str, str]],
+    entries: list[QueueEntry],
+) -> int:
+    """Append auto-search configs to `batch` (in place) until it reaches budget.
+
+    Skips configs already recorded in the ledger, already in the curated queue,
+    or already in this batch — so the same trial is never run twice. Returns the
+    number appended. Mirrors QueueEntry.key() identity (canonical params), the
+    one used everywhere for done-matching."""
+    if len(batch) >= budget:
+        return 0
+    seen = set(done) | {e.key() for e in entries} | {b.key() for b in batch}
+    added = 0
+    for cfg in generate.grid_configs():
+        if len(batch) >= budget:
+            break
+        entry = QueueEntry(cfg["strategy"], cfg["params"], cfg["note"])
+        if entry.key() in seen:
+            continue
+        seen.add(entry.key())
+        batch.append(entry)
+        added += 1
+    return added
+
+
 def run(
     db_path: Path | str = store.DEFAULT_DB_PATH,
     budget: int = DEFAULT_BUDGET,
@@ -511,30 +560,27 @@ def run(
         report.add("queue", FAIL, f"queue {queue_path} missing or unreadable")
         report.fatal = True
         return report
-    if not entries:
-        detail = "queue is empty — nothing to research"
-        if report.n_malformed:
-            detail = (
-                f"queue is empty after skipping {report.n_malformed} malformed "
-                "entries — nothing to research"
-            )
-        report.add("queue", WARN, detail)
-        report.queue_exhausted = True
-        _file_queue_empty_issue(report, n_recorded=0)
-        return report
 
     done = recorded_configs(con)
     pending = [e for e in entries if e.key() not in done]
     report.n_skipped_done = len(entries) - len(pending)
     batch = pending[:budget]
+    # Top up spare budget from the auto-search grid so the GPU never idles once
+    # the curated queue is worked through. Generation is idempotent — grid
+    # configs already in the ledger or the curated queue are skipped, so a
+    # config is never run twice (state is the ledger, not a queue-file write).
+    n_appended = _fill_generated(batch, budget, done, entries)
+    generated_keys = {b.key() for b in batch[len(batch) - n_appended :]} if n_appended else set()
     report.add(
         "queue",
         WARN if (report.n_malformed or not batch) else OK,
-        f"{len(entries)} valid config(s): {len(pending)} pending, "
+        f"{len(entries)} curated config(s): {len(pending)} pending, "
         f"{report.n_skipped_done} already recorded, {report.n_malformed} malformed; "
-        f"running {len(batch)} (budget {budget})",
+        f"running {len(batch)} ({n_appended} auto-generated queued, budget {budget})",
     )
     if not batch:
+        # Curated queue AND the bounded auto-search grid are both exhausted —
+        # only genuinely new kinds of work (features, algorithms) remain.
         report.queue_exhausted = True
         _file_queue_empty_issue(report, n_recorded=len(entries))
         return report
@@ -602,6 +648,11 @@ def run(
             )
             continue
         report.n_ran += 1
+        if entry.key() in generated_keys:
+            # Count auto-generated configs that actually RAN, so the digest's
+            # "N run (M auto-generated)" can never read M > N when the window
+            # closes mid-batch and some queued generated configs never start.
+            report.n_generated += 1
         # Single-process, single-writer store: the newest experiments row is
         # the one run_benchmark just recorded (atomically, with daily rows).
         exp_id, rec_params_json, rec_test_end = con.execute(
@@ -664,8 +715,13 @@ def run(
         if winner == "challenger":
             halves_ok, halves_detail = _halves_hold(con, report.best["experiment_id"], champ_id)
             if halves_ok:
+                # True family for the multiple-comparisons caveat: every distinct
+                # config with a recorded standard benchmark to date (already-done
+                # + tonight's), NOT just tonight's runs — the selection inflating
+                # this winner spans the whole sweep, curated and auto-generated.
+                family = len(done) + report.n_ran
                 _file_candidate_issue(
-                    report, report.best, report.n_ran, champ, champ_id, champ_metrics, halves_detail
+                    report, report.best, family, champ, champ_id, champ_metrics, halves_detail
                 )
             else:
                 report.add(

@@ -165,6 +165,85 @@ Locked decisions (v1, 2026-07-18):
 - Your role: "keep prediction quality above X, keep data clean, surface
   anything unusual" — monitor by exception.
 
+## Autonomous research engine (self-refilling loop, decided 2026-07-23)
+
+The idle 3090 should never sit out of work. The hand-curated 24-config queue
+plateaued (~2.1–2.19 lift, no promotion) and then emptied; rather than no-op
+until a human refills it, the loop **generates its own work** and, once earned
+on forward data, **promotes autonomously**. The user's steer: maximum autonomy,
+keep the GPU busy with new features, algorithms, and (as filler) hyperparameter
+search. This section supersedes two Level-4 locked decisions — noted inline.
+
+**The one invariant that makes full autonomy safe — research is isolated from
+production; the ONLY bridge to the live champion is a forward shadow gate.**
+Every generated feature/algorithm is a *challenger* evaluated in the research
+loop and the ledger; none can reach the morning email (real trade suggestions)
+except by earning it on genuinely-future, un-gameable live data. Because a bad
+idea physically cannot go live on backtest results alone, agents can be bold.
+
+- **Generator tiers** (all bounded, all provenance-tagged, none touch the
+  champion): **T1 — hyperparameter search** (this build): when the curated
+  queue is exhausted, the runner enumerates a fixed, auditable search grid of
+  existing strategies and runs the not-yet-recorded configs, topping every
+  night up to `--budget`. State stays the ledger (no queue-file writes, no repo
+  dirtying); the grid is bounded on purpose (each config is another trial
+  against the same folds). When the grid is also exhausted, the runner files
+  the existing `research-queue-empty` signal — now meaning "even auto-search is
+  tapped out; add new *kinds* of work." **Supersedes** the Level-4 "queue
+  edited only via PR / runner never edits the queue" decision: the runner now
+  proposes work, but only hyperparameter variants of existing strategies, only
+  from a checked-in grid, and still writes nothing but ledger rows.
+  **T2 — feature generator** and **T3 — algorithm generator**: a builder agent
+  autonomously writes new challenger features / model types (isolated from the
+  champion's production path), self-reviews via `quant-skeptic` + `reviewer`,
+  trains on the GPU, and logs results. Fed by `strategy-researcher` literature
+  proposals (the standing idea backlog).
+- **Forward shadow gate → autonomous promotion. Supersedes** the Level-4
+  "champion promotion is HUMAN-ONLY by PR" decision. A challenger promotes only
+  after two stages: (1) **backtest** — beats the champion beyond the promotion
+  band + both-halves rule (candidate only); (2) **forward shadow** — runs live
+  in parallel each morning (picks generated, logged, scored next day) but NOT
+  emailed, and still beats the champion on that never-seen forward window.
+  Forward live data removes the *backtest* selection bias — but it is NOT
+  automatically "immune to multiple comparisons": promoting whoever wins among K
+  concurrently-shadowed challengers is a max-over-K and reintroduces selection
+  (quant-skeptic D-1). So the gate needs a concurrency cap and a forward margin
+  that scales with K (~`sqrt(2·ln K)·SE`), and the window length must be DERIVED
+  from a target power at a target edge — not asserted. quant-skeptic's power
+  arithmetic (D-2) puts a meaningful window at **~87 trading days even under
+  optimistic independence, and ~250–870 once daily cross-sectional correlation
+  is priced in** — so any "~20 days" placeholder is far too short and is not the
+  spec. On promotion: swap `champion.json` autonomously, **email + file an issue
+  announcing it with evidence** (a silent champion swap would itself be a
+  dangerous silent success), and keep the prior champion for rollback.
+- **Auto-rollback (must not oscillate):** a freshly auto-promoted champion
+  reverts to its predecessor if it underperforms early — but a naive trailing-5
+  check is even noisier than the promote gate and will false-revert good
+  champions and flap (quant-skeptic D-3). Requires **hysteresis** (rollback
+  threshold below the promote threshold), a **minimum dwell time**, **burning a
+  reverted config** so it can't be re-nominated and re-win by luck, and
+  **quarantining promote/rollback churn from the reported live record** so the
+  emailed track record isn't polluted by a flapping model.
+- **Multiple-comparisons accounting (open design item, quant-skeptic-gated):**
+  bounded generator families cap the backtest-stage trial count, but the shadow
+  stage is itself a multiple-comparison if many challengers are shadowed at
+  once — so the shadow gate needs a concurrency cap and a forward-margin
+  threshold that scales with the number concurrently shadowed. The promotion
+  band scales with total trials (tier 1 already bumped 0.25→0.27 for the ~56
+  family; the dynamic version lives here). Two further contamination leaks to
+  design against (quant-skeptic D-4): **window reuse** — a challenger's shadow
+  days later roll into the training/benchmark window that selects the *next*
+  generation, so promotion-decision windows must be excluded from subsequent
+  selection folds; and **single-regime promotion** — a forward window inside one
+  regime is a one-regime win, so pair the forward gate with a base-rate-adjusted
+  (lift-style) metric or require it to span more than one regime. Reviewed as a
+  design before any promotion code lands.
+
+Build order: T1 generator (GPU busy now) → challenger isolation + shadow-trading
+engine → forward shadow-gate promotion + notify + rollback → T2/T3 autonomous
+builder integration → MC accounting. Each lands as a reviewed PR; quant-skeptic
+reviews the promotion design before it is built.
+
 ## Status
 
 Live tracking is on GitHub: **milestones** (one per level) and **issues**

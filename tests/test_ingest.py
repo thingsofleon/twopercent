@@ -86,6 +86,53 @@ def test_frames_to_rows_drops_invalid_opens_loudly(caplog):
     assert "dropped for invalid open/close" in caplog.text
 
 
+def _yf_frame_ohlc(symbol: str, bars: list[tuple[float, float, float, float]]) -> pd.DataFrame:
+    """Single-symbol yf.download frame from explicit (open, high, low, close) bars."""
+    frame = pd.DataFrame(
+        {
+            "Open": [b[0] for b in bars],
+            "High": [b[1] for b in bars],
+            "Low": [b[2] for b in bars],
+            "Close": [b[3] for b in bars],
+            "Adj Close": [b[3] for b in bars],
+            "Volume": np.full(len(bars), 1_000_000.0),
+        },
+        index=pd.bdate_range("2026-01-05", periods=len(bars)),
+    )
+    return pd.concat({symbol: frame}, axis=1)
+
+
+def test_frames_to_rows_drops_ohlc_ordering_violations_loudly(caplog):
+    # Adversarial non-round prices. Bar 2 is the ENHA 2026-07-24 shape
+    # (open=3.51, high=3.40 — high below open); the valid bars from the same
+    # symbol survive, and the drop is counted loudly (issue #31).
+    bars = [
+        (3.51, 3.62, 3.40, 3.58),  # valid
+        (3.51, 3.40, 2.90, 2.92),  # high < open — impossible
+        (7.13, 7.90, 7.50, 7.40),  # low > close — impossible
+        (4.05, 4.20, 3.90, 4.11),  # valid
+    ]
+    rows = ingest.frames_to_rows(_yf_frame_ohlc("ENHA", bars), {"ENHA": "ENHA"})
+    assert rows["open"].tolist() == [3.51, 4.05]  # only the two valid bars kept
+    assert "2 bars dropped for OHLC-ordering violation" in caplog.text
+
+
+def test_frames_to_rows_drops_nan_high_bar(caplog):
+    # A NaN high with valid open/close (dropna only guards Open/Close) must be
+    # dropped, not kept — mirrors the view's isfinite(high) guard.
+    bars = [(3.51, 3.62, 3.40, 3.58), (3.51, float("nan"), 3.40, 3.58)]
+    rows = ingest.frames_to_rows(_yf_frame_ohlc("NANH", bars), {"NANH": "NANH"})
+    assert len(rows) == 1
+    assert "1 bars dropped for OHLC-ordering violation" in caplog.text
+
+
+def test_frames_to_rows_keeps_bar_touching_ohlc_bounds():
+    # Equality is valid (high == open, low == close): must not be dropped.
+    bars = [(5.00, 5.00, 4.80, 4.80)]
+    rows = ingest.frames_to_rows(_yf_frame_ohlc("TOUCH", bars), {"TOUCH": "TOUCH"})
+    assert len(rows) == 1
+
+
 def test_frames_to_rows_drops_split_artifacts_loudly_both_directions(caplog):
     # Bar 2: open 10x the prior close (pre-split scale), -90% "intraday".
     # Bar 4: open at a tenth of the prior close, +940% "intraday".

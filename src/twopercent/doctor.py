@@ -74,9 +74,15 @@ def stale_symbols(
 def invalid_bars(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
     """Per-symbol count of price rows the daily_returns view silently excludes.
 
-    These rows (open <= 0/NULL or non-finite open/close) are invisible to the
-    gap and extreme checks yet make a symbol look fresh to the stale check —
-    corrupt recent bars would otherwise report a healthy store.
+    These rows are invisible to the gap and extreme checks yet make a symbol
+    look fresh to the stale check — corrupt recent bars would otherwise report
+    a healthy store. Two exclusion classes, mirroring the view exactly:
+    open <= 0/NULL or non-finite open/close, AND OHLC-ordering violations
+    (high below open/close or low above open/close — an impossible bar, e.g.
+    ENHA 2026-07-24 open=3.51 high=3.40). A NaN high/low is caught by the
+    NOT isfinite() clause; the `high < open` direction is used for the finite
+    checks because in DuckDB NaN < open is FALSE (NaN >= open is TRUE), so the
+    isfinite guard, not the comparison, must flag a NaN.
     """
     return con.execute(
         """
@@ -85,6 +91,9 @@ def invalid_bars(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
         FROM prices
         WHERE open IS NULL OR open <= 0 OR NOT isfinite(open)
            OR close IS NULL OR NOT isfinite(close)
+           OR high IS NULL OR NOT isfinite(high)
+           OR low IS NULL OR NOT isfinite(low)
+           OR high < open OR high < close OR low > open OR low > close
         GROUP BY symbol
         ORDER BY invalid DESC, symbol
         """
@@ -336,7 +345,8 @@ def format_report(report: DoctorReport, examples: int = 10) -> list[str]:
     invalid_total = 0 if report.invalid.empty else int(report.invalid["invalid"].sum())
     lines.append(
         f"{_mark(len(report.invalid))} invalid: {len(report.invalid)} symbols with "
-        f"{invalid_total} bars excluded from scans (open <= 0/NULL or non-finite open/close)"
+        f"{invalid_total} bars excluded from scans (open <= 0/NULL, non-finite "
+        f"open/high/low/close, or OHLC-ordering violation)"
     )
     for row in report.invalid.head(examples).itertuples():
         lines.append(

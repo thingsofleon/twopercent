@@ -309,5 +309,12 @@ truth for *decisions and plan shape*; GitHub is the source of truth for
   RenderUnavailable and the step WARNs and falls back to the #48 composed
   text email with attachment — render failure never kills the email.
   One-time box setup: `uv run playwright install chromium`.
+  Shipped (#31, partial): OHLC-ordering data gate — invalid bars where
+  `high < open/close` or `low > open/close` (e.g. ENHA 2026-07-24 open=3.51
+  high=3.40, an impossible −16.8% that distorted the live Top-1 track) are
+  now excluded by the `daily_returns` view, flagged by `doctor.invalid_bars`,
+  and dropped loudly at ingest, joining the open<=0 gate. Non-destructive
+  (the 123 store-wide offenders stay in `prices`); #31's scale-break refetch
+  (stale pre-split history) remains open.
   Exit criterion: a real degradation → investigation cycle observed, or at
   minimum both timers proven live — NOT complete yet.

@@ -43,6 +43,15 @@ supervised autonomy → AI-native).
   seed_history vary_volume). Real market data never triggers this. An all-NaN
   feature column crashes the same way — seeded test universes need non-empty
   sectors or the sector features are all NaN (Batch 1b).
+- **A price bar is only usable if `open > 0` AND the OHLC ordering holds
+  (`high >= open,close` and `low <= open,close`).** yfinance occasionally
+  serves an impossible bar (ENHA 2026-07-24: open=3.51, high=3.40) whose
+  open>0/finite passes the old gate but computes a garbage open-to-close move
+  that reached scoring, base rates, and features (2 landed in scored top-20).
+  All three gates — the `daily_returns` view, `doctor.invalid_bars`, and the
+  ingest validity mask — must guard ordering, and each `isfinite(high/low)`
+  MUST precede its `>=/<=` (DuckDB `NaN >= x` is TRUE, so a NaN high sails
+  through otherwise). Non-destructive, exactly like the open<=0 gate.
 - **Diagnostics must read raw tables, never filtered views.** The doctor's
   first draft read daily_returns — whose WHERE clause hides exactly the
   corrupt bars a doctor exists to find, while making broken symbols look

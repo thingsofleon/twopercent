@@ -44,7 +44,12 @@ CREATE OR REPLACE VIEW daily_returns AS
     SELECT symbol, date, open, high, low, close, volume,
            (close - open) / open AS oc_return
     FROM prices
-    WHERE open > 0 AND isfinite(open) AND isfinite(close);
+    WHERE open > 0 AND isfinite(open) AND isfinite(close)
+      -- isfinite(high)/isfinite(low) MUST precede the >=/<= comparisons: in
+      -- DuckDB total ordering NaN >= x is TRUE, so a NaN high would otherwise
+      -- pass high >= open and leak an OHLC-impossible bar into oc_return.
+      AND isfinite(high) AND isfinite(low)
+      AND high >= open AND high >= close AND low <= open AND low <= close;
 CREATE SEQUENCE IF NOT EXISTS experiment_id_seq;
 CREATE TABLE IF NOT EXISTS experiments (
     id BIGINT PRIMARY KEY DEFAULT nextval('experiment_id_seq'),

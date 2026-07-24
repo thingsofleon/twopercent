@@ -30,8 +30,11 @@ def seeded(con):
                 "symbol": [r[0] for r in rows],
                 "date": [r[1] for r in rows],
                 "open": [r[2] for r in rows],
-                "high": [r[3] for r in rows],
-                "low": [r[2] for r in rows],
+                # high/low must bracket open & close or the OHLC-ordering gate
+                # excludes the bar (a down bar built as high=close would be
+                # high < open — impossible); ZERO/NANO stay excluded via open.
+                "high": [max(r[2], r[3]) for r in rows],
+                "low": [min(r[2], r[3]) for r in rows],
                 "close": [r[3] for r in rows],
                 "adj_close": [r[3] for r in rows],
                 "volume": [1_000_000] * len(rows),

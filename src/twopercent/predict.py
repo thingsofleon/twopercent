@@ -38,6 +38,7 @@ def predict_for(
     strategy_name: str,
     signal_date: dt.date | None = None,
     save: bool = True,
+    strategy_params: dict | None = None,
 ) -> PredictResult:
     """Score every symbol for the trading day after `signal_date`.
 
@@ -45,6 +46,11 @@ def predict_for(
     (track-record backfill), training uses only outcomes with
     target_date <= signal_date — what was knowable at that day's close —
     so backfilled predictions stay walk-forward honest.
+
+    `strategy_params` (default None → the strategy's default config) is passed
+    to the strategy constructor, so a parameterized challenger can be scored
+    with the same walk-forward machinery as the champion. The training filter
+    is unchanged (target_date <= signal_date), so params never buy lookahead.
 
     Liquidity floor (selection time ONLY): after scoring, symbols whose
     median_vol_20 (trailing median volume over the LIQUIDITY_WINDOW_BARS
@@ -74,7 +80,7 @@ def predict_for(
     if train.empty:
         raise ValueError("no labeled history to train on — ingest more data")
 
-    strategy = strategies.get(strategy_name)
+    strategy = strategies.get(strategy_name, **(strategy_params or {}))
     strategy.fit(train)
     scored = rows.assign(prob=strategy.predict_proba(rows))
 

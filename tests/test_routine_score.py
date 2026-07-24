@@ -114,6 +114,7 @@ def test_score_mode_happy_path_no_predict_no_universe_refresh(ready, monkeypatch
         "score",
         "detector",
         "dashboard",
+        "shadow",
     ]
     assert "predict" not in names and "universe" not in names
     assert "notify" not in names  # score-mode runs never email the signal

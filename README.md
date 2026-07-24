@@ -161,6 +161,38 @@ Guardrails:
 Exit codes: 0 clean or empty queue, 1 some experiments failed or queue entries
 were malformed, 2 the runner itself failed.
 
+## Shadow-trading engine (challenger isolation)
+
+Each predict morning, zero or more *challenger* strategies run IN PARALLEL with
+the champion — their picks are generated, logged, and (next day) scored against
+actuals to accumulate a genuine FORWARD live track record — but they are NEVER
+emailed and NEVER touch the champion's live record, dashboard, or signal email.
+This is the isolation foundation the forward shadow-gate promotion (#59) will
+sit on; this tier only LOGS and SCORES — it promotes nothing.
+
+- **Roster: `research/shadow.json`** — a checked-in JSON list of
+  `{strategy, params, note}` (same shape as `research/queue.json`), edited only
+  via PR. It ships **empty (`[]`)**: nothing is shadowed until a human/PR adds a
+  challenger. Add an entry (e.g.
+  `[{"strategy": "logreg_v1", "params": {}, "note": "linear yardstick"}]`) and
+  the next `twopercent routine` predict run starts shadowing it; the following
+  score run begins reporting its forward record.
+- **Concurrency cap `MAX_SHADOW` (4):** if the roster exceeds it, the first 4
+  are kept and the rest are DROPPED with a loud warning naming the count (never
+  a silent truncation). The cap bounds the compute added to each morning and is
+  the K the shadow-gate forward-margin accounting (#60) will scale against.
+- **Isolation invariant:** shadow picks live in a SEPARATE table
+  (`shadow_predictions`), keyed by challenger identity
+  (`strategy {canonical-json-params}`, so a challenger can share a strategy name
+  and differ only by params). Nothing that reads `predictions` — the track
+  record, money tiles, dashboard, or email — can see them.
+- **Crash-isolated and non-gating:** the shadow steps run LAST (after the
+  champion predict/dashboard/notify, so shadow compute never delays the real
+  signal email); one failing challenger warns and the others still run, and a
+  shadow failure WARNs but never fails the routine. Same 09:30-ET live/late
+  rule as the champion, so backfilled shadow picks are excluded from the
+  forward record exactly like the champion's money tiles.
+
 ## Scheduling (systemd user timers, local)
 
 The DuckDB store is on-box, so v1 schedules locally (cloud runs are deferred

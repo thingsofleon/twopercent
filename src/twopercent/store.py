@@ -75,6 +75,18 @@ CREATE TABLE IF NOT EXISTS predictions (
     PRIMARY KEY (strategy, signal_date, symbol)
 );
 ALTER TABLE predictions ADD COLUMN IF NOT EXISTS universe_as_of DATE;
+CREATE TABLE IF NOT EXISTS shadow_predictions (
+    challenger TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    params TEXT NOT NULL,
+    signal_date DATE NOT NULL,
+    symbol TEXT NOT NULL,
+    prob DOUBLE NOT NULL,
+    rank INTEGER NOT NULL,
+    created_ts TIMESTAMP NOT NULL,
+    universe_as_of DATE,
+    PRIMARY KEY (challenger, signal_date, symbol)
+);
 CREATE OR REPLACE VIEW latest_universe AS
     SELECT symbol, name, market_cap, as_of, sector
     FROM universe
@@ -262,6 +274,65 @@ def predicted_signal_dates(con: duckdb.DuckDBPyConnection, strategy: str) -> lis
         [strategy],
     ).fetchall()
     return [r[0] for r in rows]
+
+
+def save_shadow_predictions(
+    con: duckdb.DuckDBPyConnection,
+    challenger: str,
+    strategy: str,
+    params_json: str,
+    signal_date: dt.date,
+    df: pd.DataFrame,
+) -> int:
+    """Replace the (challenger, signal_date) slice of shadow_predictions with `df`.
+
+    The shadow twin of save_predictions: same delete-then-insert (a re-run
+    scoring fewer symbols must not leave phantom ranks behind), same
+    created_ts=now() and universe_as_of handling. Keyed by CHALLENGER identity,
+    not strategy — a challenger can share a strategy name with the champion or
+    another challenger and differ only by params. Writes ONLY shadow_predictions,
+    never the champion's predictions table.
+    """
+    con.execute(
+        "DELETE FROM shadow_predictions WHERE challenger = ? AND signal_date = ?",
+        [challenger, signal_date],
+    )
+    if df.empty:
+        return 0
+    rows = df[["symbol", "prob", "rank"]].copy()
+    rows.insert(0, "challenger", challenger)
+    rows.insert(1, "strategy", strategy)
+    rows.insert(2, "params", params_json)
+    rows.insert(3, "signal_date", signal_date)
+    as_of = con.execute("SELECT max(as_of) FROM universe").fetchone()[0]
+    con.register("shadow_predictions_in", rows)
+    con.execute(
+        """
+        INSERT INTO shadow_predictions
+        SELECT challenger, strategy, params, signal_date, symbol, prob, rank, now(), ?
+        FROM shadow_predictions_in
+        """,
+        [as_of],
+    )
+    con.unregister("shadow_predictions_in")
+    return len(rows)
+
+
+def shadow_signal_dates(con: duckdb.DuckDBPyConnection, challenger: str) -> list[dt.date]:
+    rows = con.execute(
+        "SELECT DISTINCT signal_date FROM shadow_predictions WHERE challenger = ? "
+        "ORDER BY signal_date",
+        [challenger],
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def shadow_challengers(con: duckdb.DuckDBPyConnection) -> list[tuple[str, str, str]]:
+    """(challenger, strategy, params_json) for every challenger with shadow picks."""
+    rows = con.execute(
+        "SELECT DISTINCT challenger, strategy, params FROM shadow_predictions ORDER BY challenger"
+    ).fetchall()
+    return [(c, s, p) for c, s, p in rows]
 
 
 def record_experiment(

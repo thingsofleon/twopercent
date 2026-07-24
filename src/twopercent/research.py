@@ -54,6 +54,7 @@ from zoneinfo import ZoneInfo
 import duckdb
 
 from twopercent import backtest, champion, generate, issues, store
+from twopercent.canonical import _canonical, canonical_params  # noqa: F401  (re-export)
 from twopercent.compare import compare_verdict, lift_winner
 from twopercent.routine import _RANK, FAIL, OK, WARN, Step, _market_is_open
 from twopercent.strategies import xgb_gbm
@@ -107,22 +108,6 @@ def _may_start_next(now: dt.datetime) -> bool:
     and hold the single-writer store into the 06:00 predict run."""
     t = now.time()
     return t >= WINDOW_OPEN or t < WINDOW_LAST_START
-
-
-def _canonical(value):
-    """Integral floats become ints so 200 and 200.0 are the SAME config."""
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    if isinstance(value, dict):
-        return {k: _canonical(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_canonical(v) for v in value]
-    return value
-
-
-def canonical_params(params: dict) -> str:
-    """Order- and numeric-normalized config identity for done-matching."""
-    return json.dumps(_canonical(params), sort_keys=True)
 
 
 @dataclass(frozen=True)

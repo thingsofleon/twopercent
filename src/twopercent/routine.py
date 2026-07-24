@@ -51,6 +51,7 @@ from twopercent import (
     ingest,
     issues,
     notify,
+    shadow,
     store,
     track,
     universe,
@@ -360,7 +361,27 @@ def _run_predict(
         report.add("scoring", WARN, f"track-record scoring failed: {exc}")
 
     _notify_step(report, con, name, prediction, out_path)
+    _shadow_run_step(report, con, prediction.signal_date)
     return report
+
+
+def _shadow_run_step(report: RoutineReport, con, signal_date: dt.date) -> None:
+    """FINAL predict step — run the rostered challengers IN PARALLEL with the
+    champion, logging their picks to shadow_predictions ONLY. Placed AFTER
+    predict/dashboard/notify so shadow training compute never delays the real
+    signal email. Non-gating: WARN at worst, never FAIL (the champion's
+    prediction is already logged and emailed); per-challenger errors are already
+    isolated inside run_shadow, and this wrapper catches the unexpected so a
+    shadow crash can never fail the routine."""
+    try:
+        result = shadow.run_shadow(con, signal_date)
+    except Exception as exc:
+        report.add("shadow", WARN, f"shadow run crashed (champion unaffected): {exc}")
+        return
+    if result.rostered == 0 and not result.malformed:
+        report.add("shadow", OK, "no challengers rostered (research/shadow.json empty) — skipping")
+        return
+    report.add("shadow", WARN if result.had_trouble else OK, result.summary())
 
 
 def _notify_step(
@@ -566,7 +587,33 @@ def _run_score(
         report.add("dashboard", OK, f"refreshed {out_path} (predictions log untouched)")
     except Exception as exc:
         report.add("dashboard", WARN, f"render failed (scoring is complete): {exc}")
+    _shadow_score_step(report, con)
     return report
+
+
+def _shadow_score_step(report: RoutineReport, con) -> None:
+    """FINAL score step — score each shadowed challenger's accumulating forward
+    (live-only) record, after the champion scoring + degradation steps.
+    Non-gating: WARN at worst, never FAIL, and it logs/returns only — no
+    promotion decision (that is #59)."""
+    try:
+        result = shadow.score_shadow(con)
+    except Exception as exc:
+        report.add("shadow", WARN, f"shadow scoring crashed (champion unaffected): {exc}")
+        return
+    if not result.scores and not result.failed:
+        report.add("shadow", OK, "no challengers in shadow_predictions — nothing to score")
+        return
+    detail = result.summary()
+    if result.scores:
+        lifts = ", ".join(
+            f"{s.challenger} lift {s.mean_lift:.2f}x over {s.live_days}d"
+            if s.mean_lift is not None
+            else f"{s.challenger} n/a ({s.live_days} live d)"
+            for s in result.scores
+        )
+        detail += f"; forward records: {lifts}"
+    report.add("shadow", WARN if result.had_trouble else OK, detail)
 
 
 AUTO_DEGRADATION_LABEL = "auto-degradation"

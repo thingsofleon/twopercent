@@ -92,6 +92,7 @@ def test_routine_happy_path_completes_all_steps(ready):
         "dashboard",
         "scoring",
         "notify",
+        "shadow",
     ]
     assert report.status in ("ok", "warn")
     assert report.top_candidates
@@ -329,7 +330,7 @@ def _capture_resend(monkeypatch):
 
 def test_notify_unconfigured_skips_without_degrading_exit(ready):
     report = routine.run(db_path=_db(ready))
-    step = report.steps[-1]
+    step = next(s for s in report.steps if s.name == "notify")
     assert step.name == "notify"
     assert step.status == "ok"  # deliberate non-setup is not an exception
     assert "not configured" in step.detail and "skipping" in step.detail

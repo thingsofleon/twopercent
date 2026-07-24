@@ -161,26 +161,37 @@ def daily_base_rates(con: duckdb.DuckDBPyConnection, dates: list[dt.date]) -> di
     return {d: float(rate) for d, rate in rows}
 
 
-def _late_lookup(con: duckdb.DuckDBPyConnection, strategy: str):
-    """Callable target_date -> late flag, shared by every scorer.
+def _created_by_target(
+    con: duckdb.DuckDBPyConnection, table: str, id_col: str, id_val: str
+) -> dict:
+    """target_date -> max(created_ts) for a prediction-shaped table.
 
-    A prediction is LIVE only if created before the target day's open
-    (09:30 ET). Date-granularity comparison would count an evening-of-target
-    save — outcome fully known — as live. When multiple signal dates resolve
-    to ONE target date (missing intermediate bars), the day takes the max
-    created_ts across all of them: any-late means late, so a half-backfilled
-    day can never pass as live. Unknown target dates are late."""
-    created = dict(
+    `table`/`id_col` are internal constants ('predictions'/'strategy' or
+    'shadow_predictions'/'challenger'), never user input — no injection surface.
+    When multiple signal dates resolve to ONE target date (missing intermediate
+    bars), the day takes the max created_ts across all of them: any-late means
+    late, so a half-backfilled day can never pass as live."""
+    return dict(
         con.execute(
-            "SELECT target_date, max(created_ts) FROM ("
-            "  SELECT min(d.date) AS target_date, max(pr.created_ts) AS created_ts"
-            "  FROM predictions pr"
-            "  JOIN (SELECT DISTINCT date FROM daily_returns) d ON d.date > pr.signal_date"
-            "  WHERE pr.strategy = ? GROUP BY pr.signal_date"
-            ") GROUP BY target_date",
-            [strategy],
+            f"SELECT target_date, max(created_ts) FROM ("
+            f"  SELECT min(d.date) AS target_date, max(pr.created_ts) AS created_ts"
+            f"  FROM {table} pr"
+            f"  JOIN (SELECT DISTINCT date FROM daily_returns) d ON d.date > pr.signal_date"
+            f"  WHERE pr.{id_col} = ? GROUP BY pr.signal_date"
+            f") GROUP BY target_date",
+            [id_val],
         ).fetchall()
     )
+
+
+def _late_from_created(created: dict):
+    """THE one live/late definition in the codebase: a prediction is LIVE only
+    if created before the target day's open (09:30 ET). Date-granularity
+    comparison would count an evening-of-target save — outcome fully known — as
+    live. Unknown target dates are late. Both the champion (predictions) and the
+    shadow challengers (shadow_predictions) build their `created` map differently
+    but score liveness through THIS closure, so the forward record means the same
+    thing for both."""
     eastern = ZoneInfo("America/New_York")
     local = dt.datetime.now().astimezone().tzinfo
 
@@ -192,6 +203,20 @@ def _late_lookup(con: duckdb.DuckDBPyConnection, strategy: str):
         return created_ts.replace(tzinfo=local) > open_et
 
     return _is_late
+
+
+def _late_lookup(con: duckdb.DuckDBPyConnection, strategy: str):
+    """Callable target_date -> late flag for the champion's predictions table."""
+    return _late_from_created(_created_by_target(con, "predictions", "strategy", strategy))
+
+
+def _shadow_late_lookup(con: duckdb.DuckDBPyConnection, challenger: str):
+    """Callable target_date -> late flag for a shadow challenger's picks — the
+    SAME 09:30-ET rule as the champion, so backfilled shadow picks are excluded
+    from the forward record exactly like the champion's money tiles."""
+    return _late_from_created(
+        _created_by_target(con, "shadow_predictions", "challenger", challenger)
+    )
 
 
 def daily_rank_outcomes(
@@ -413,21 +438,32 @@ class TrackRecord:
         return int(self.scored["late"].sum()) if not self.scored.empty else 0
 
 
-def score_predictions(
-    con: duckdb.DuckDBPyConnection, strategy: str, top_n: int = 20
+def _score_table(
+    con: duckdb.DuckDBPyConnection,
+    table: str,
+    id_col: str,
+    id_val: str,
+    top_n: int,
+    late_lookup,
+    signal_dates: list[dt.date],
 ) -> TrackRecord:
-    """Per-day outcome of the top-N logged predictions.
+    """Per-day top-N outcome for a prediction-shaped table.
 
-    The target day is the first trading date in the store after each
-    signal_date. Days whose target isn't ingested yet are returned in
-    `pending`, never silently dropped.
-    """
+    Shared by the champion (predictions/strategy) and shadow challengers
+    (shadow_predictions/challenger) so both compute precision/base-rate/lift
+    identically. `table`/`id_col` are internal constants, never user input.
+
+    ONE definition of live in the codebase: `late_lookup` is the 09:30-ET
+    any-late rule (_late_from_created), the same flag the money metrics use.
+    A plain date-granularity comparison here would count an evening-of-target
+    save (outcome fully known) as live and feed the degradation detector weaker
+    evidence than the dashboard shows."""
     threshold = DEFAULT_THRESHOLD - _THRESHOLD_EPSILON
     scored = con.execute(
-        """
+        f"""
         WITH days AS (SELECT DISTINCT date FROM daily_returns),
         pred_days AS (
-            SELECT DISTINCT signal_date FROM predictions WHERE strategy = ?
+            SELECT DISTINCT signal_date FROM {table} WHERE {id_col} = ?
         ),
         resolved AS (
             SELECT p.signal_date, min(d.date) AS target_date
@@ -438,10 +474,10 @@ def score_predictions(
             SELECT r.signal_date, r.target_date,
                    count(*) AS n_scored,
                    sum(CASE WHEN dr.oc_return >= ? THEN 1 ELSE 0 END) AS hits
-            FROM predictions pr
+            FROM {table} pr
             JOIN resolved r ON pr.signal_date = r.signal_date
             JOIN daily_returns dr ON dr.symbol = pr.symbol AND dr.date = r.target_date
-            WHERE pr.strategy = ? AND pr.rank <= ?
+            WHERE pr.{id_col} = ? AND pr.rank <= ?
             GROUP BY r.signal_date, r.target_date
         ),
         base AS (
@@ -455,18 +491,51 @@ def score_predictions(
         FROM top_hits t JOIN base b ON b.date = t.target_date
         ORDER BY t.signal_date
         """,
-        [strategy, threshold, strategy, top_n, threshold],
+        [id_val, threshold, id_val, top_n, threshold],
     ).df()
 
     if not scored.empty:
-        # ONE definition of live in the codebase: _late_lookup's 09:30-ET
-        # any-late rule, the same flag the money metrics use. A plain
-        # date-granularity comparison here would count an evening-of-target
-        # save (outcome fully known) as live — exactly the drift
-        # _late_lookup's docstring warns about — and would feed the
-        # degradation detector weaker evidence than the dashboard shows.
-        is_late = _late_lookup(con, strategy)
-        scored["late"] = [is_late(td) for td in scored["target_date"]]
+        scored["late"] = [late_lookup(td) for td in scored["target_date"]]
     resolved = set(pd.to_datetime(scored["signal_date"]).dt.date) if not scored.empty else set()
-    pending = [d for d in store.predicted_signal_dates(con, strategy) if d not in resolved]
+    pending = [d for d in signal_dates if d not in resolved]
     return TrackRecord(scored=scored, pending=pending)
+
+
+def score_predictions(
+    con: duckdb.DuckDBPyConnection, strategy: str, top_n: int = 20
+) -> TrackRecord:
+    """Per-day outcome of the top-N logged predictions.
+
+    The target day is the first trading date in the store after each
+    signal_date. Days whose target isn't ingested yet are returned in
+    `pending`, never silently dropped.
+    """
+    return _score_table(
+        con,
+        "predictions",
+        "strategy",
+        strategy,
+        top_n,
+        _late_lookup(con, strategy),
+        store.predicted_signal_dates(con, strategy),
+    )
+
+
+def score_shadow_predictions(
+    con: duckdb.DuckDBPyConnection, challenger: str, top_n: int = 20
+) -> TrackRecord:
+    """Per-day outcome of ONE shadow challenger's top-N logged picks.
+
+    The shadow twin of score_predictions, reading shadow_predictions keyed by
+    challenger identity and using the same 09:30-ET live/late rule — so the
+    challenger's forward record means the same thing as the champion's. Reads
+    ONLY shadow_predictions; the champion's track record is untouched."""
+    return _score_table(
+        con,
+        "shadow_predictions",
+        "challenger",
+        challenger,
+        top_n,
+        _shadow_late_lookup(con, challenger),
+        store.shadow_signal_dates(con, challenger),
+    )

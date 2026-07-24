@@ -244,6 +244,22 @@ engine → forward shadow-gate promotion + notify + rollback → T2/T3 autonomou
 builder integration → MC accounting. Each lands as a reviewed PR; quant-skeptic
 reviews the promotion design before it is built.
 
+Shipped (#58, tier-2-foundation): the **shadow-trading engine**. Rostered
+challengers (`research/shadow.json`, `{strategy, params, note}`, PR-edited,
+ships empty, `MAX_SHADOW=4` with loud over-cap drops) run in parallel with the
+champion each predict morning via `shadow.run_shadow` — picks generated with the
+same walk-forward `predict_for(..., save=False, strategy_params=...)` and logged
+to a SEPARATE `shadow_predictions` table keyed by challenger identity, never the
+`predictions` table. `shadow.score_shadow` scores each challenger's accumulating
+FORWARD (live-only) record next day, reusing the champion's one 09:30-ET
+live/late rule. Both routine steps run LAST (after notify) and are non-gating
+(WARN at worst; per-challenger crash isolation). The ONE invariant — nothing
+reading `predictions` can see shadow picks — is proven byte-for-byte in tests.
+Import cycle broken by extracting `canonical.py` (research/generate keep
+`research.canonical_params` via re-export). This tier LOGS and SCORES only; it
+promotes nothing — that is #59 (forward shadow-gate), separately quant-skeptic-
+gated, and #60 (MC accounting) scales the band/window off `MAX_SHADOW`.
+
 ## Status
 
 Live tracking is on GitHub: **milestones** (one per level) and **issues**

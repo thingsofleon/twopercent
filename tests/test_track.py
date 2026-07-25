@@ -251,6 +251,47 @@ def test_save_predictions_rerun_replaces_whole_slice(con):
     assert rows["rank"].tolist() == list(range(1, 20))  # contiguous, no phantom rank 1
 
 
+def test_pick_performance_excludes_ohlc_corrupt_rank1_and_substitutes(con, caplog):
+    # The exact bug: a rank-1 pick whose target-day bar has high < open (the
+    # ENHA 2026-07-24 shape, open=3.51 high=3.40, a -16.8% impossible move) must
+    # be excluded from the basket so the dashboard's Top-1 number is NOT computed
+    # from the corrupt bar; the top-1 substitutes to the next available rank and
+    # the substitution is disclosed (top1_rank > 1, n_avail < top_n, warning).
+    oc = {
+        "BADHI": [0.001] * 25,  # target-day bar overwritten to the ENHA shape below
+        "GOOD1": [0.001] * 24 + [0.021],  # +2.1% on the target day
+        "GOOD2": [0.001] * 25,  # flat
+    }
+    seed_history(con, oc)
+    dates = sorted(pd.bdate_range("2026-01-05", periods=25).date)
+    con.execute(
+        "UPDATE prices SET open = 3.51, high = 3.40, low = 2.90, close = 2.92 "
+        "WHERE symbol = 'BADHI' AND date = ?",
+        [dates[-1]],
+    )
+    store.save_predictions(
+        con,
+        "test_strat",
+        dates[-2],
+        pd.DataFrame(
+            {"symbol": ["BADHI", "GOOD1", "GOOD2"], "prob": [0.9, 0.5, 0.1], "rank": [1, 2, 3]}
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="twopercent.track"):
+        perf = track.daily_pick_performance(con, "test_strat", top_n=3)
+
+    assert len(perf.daily) == 1
+    row = perf.daily.iloc[0]
+    assert pd.Timestamp(row["target_date"]).date() == dates[-1]
+    assert row["top1_symbol"] == "GOOD1"  # corrupt rank-1 excluded, substituted
+    assert row["top1_rank"] == 2  # substitution disclosed
+    assert row["n_avail"] == 2  # BADHI's corrupt bar never counted
+    assert abs(row["top1_return"] - 0.021) < 1e-9  # NOT the -16.8% corrupt move
+    assert row["top1_return"] > 0
+    assert "substituted next available" in caplog.text
+
+
 # --- degradation detector -----------------------------------------------------
 
 

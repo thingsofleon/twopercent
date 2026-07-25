@@ -74,12 +74,30 @@ def frames_to_rows(
             raise ValueError("expected group_by='ticker' MultiIndex columns")
     out: list[pd.DataFrame] = []
     dropped_invalid = 0
+    dropped_ohlc = 0
     dropped_split = 0
     split_symbols: list[str] = []
     for yf_sym in data.columns.get_level_values(0).unique():
         sub = data[yf_sym].dropna(subset=["Open", "Close"], how="any")
-        valid = (sub["Open"] > 0) & np.isfinite(sub["Open"]) & np.isfinite(sub["Close"])
-        dropped_invalid += int((~valid).sum())
+        open_close_ok = (sub["Open"] > 0) & np.isfinite(sub["Open"]) & np.isfinite(sub["Close"])
+        # OHLC-ordering guard (issue #31): reject impossible bars where the high
+        # sits below the open/close or the low above them (e.g. ENHA 2026-07-24
+        # open=3.51 high=3.40). isfinite() precedes the >=/<= comparisons so a
+        # NaN high/low is rejected here, not silently kept — numpy propagates
+        # NaN through comparisons as False, which would otherwise fail the mask
+        # anyway, but the explicit isfinite keeps the intent legible and matches
+        # the view/doctor gates. Only same-bar OHLC is consulted (no lookahead).
+        ohlc_ok = (
+            np.isfinite(sub["High"])
+            & np.isfinite(sub["Low"])
+            & (sub["High"] >= sub["Open"])
+            & (sub["High"] >= sub["Close"])
+            & (sub["Low"] <= sub["Open"])
+            & (sub["Low"] <= sub["Close"])
+        )
+        dropped_invalid += int((~open_close_ok).sum())
+        dropped_ohlc += int((open_close_ok & ~ohlc_ok).sum())
+        valid = open_close_ok & ohlc_ok
         sub = sub[valid]
         if sub.empty:
             continue
@@ -126,6 +144,12 @@ def frames_to_rows(
     if dropped_invalid:
         logger.warning(
             "%d rows dropped for invalid open/close (<=0 or non-finite)", dropped_invalid
+        )
+    if dropped_ohlc:
+        logger.warning(
+            "%d bars dropped for OHLC-ordering violation (high < open/close or "
+            "low > open/close, or non-finite high/low)",
+            dropped_ohlc,
         )
     if dropped_split:
         logger.warning(

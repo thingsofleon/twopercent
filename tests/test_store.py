@@ -121,6 +121,55 @@ def test_all_universe_symbols_unions_snapshots(con):
     assert symbols[0] == "NVDA"  # largest cap first
 
 
+def _ohlc_row(symbol, open_, high, low, close):
+    return {
+        "symbol": symbol,
+        "date": dt.date(2026, 1, 5),
+        "open": open_,
+        "high": high,
+        "low": low,
+        "close": close,
+        "adj_close": close,
+        "volume": 1_000_000,
+    }
+
+
+def test_daily_returns_excludes_ohlc_ordering_violations(con):
+    # Adversarial non-round prices (CLAUDE.md: test boundaries at ugly values).
+    # The NANHIGH case is the DuckDB total-ordering trap: NaN >= open is TRUE,
+    # so without the isfinite(high) guard preceding the >= it would leak in.
+    nan = float("nan")
+    rows = [
+        _ohlc_row("VALID", 3.51, 3.62, 3.40, 3.58),  # ordinary bar — present
+        _ohlc_row("HIGHLOW", 3.51, 3.40, 2.90, 2.92),  # high < open (the ENHA shape)
+        _ohlc_row("HIGHBELOWCLOSE", 4.07, 4.10, 3.90, 4.55),  # high < close
+        _ohlc_row("LOWABOVEOPEN", 5.00, 6.20, 5.30, 6.10),  # low > open
+        _ohlc_row("LOWABOVECLOSE", 7.13, 7.90, 7.50, 7.40),  # low > close
+        _ohlc_row("NANHIGH", 3.51, nan, 3.40, 3.58),  # NaN high — the NaN>=x trap
+        _ohlc_row("NANLOW", 3.51, 3.62, nan, 3.58),  # NaN low
+    ]
+    store.upsert_prices(con, pd.DataFrame(rows))
+
+    present = {r[0] for r in con.execute("SELECT DISTINCT symbol FROM daily_returns").fetchall()}
+    assert present == {"VALID"}
+    # The corrupt bars are NON-DESTRUCTIVELY retained in prices, only hidden.
+    assert store.price_row_count(con) == len(rows)
+    # oc_return for the ENHA-shaped bar never reaches a consumer.
+    assert (
+        con.execute("SELECT count(*) FROM daily_returns WHERE symbol = 'HIGHLOW'").fetchone()[0]
+        == 0
+    )
+
+
+def test_daily_returns_keeps_bar_touching_ohlc_bounds(con):
+    # Equality is allowed (high == open, low == close): a doji-like bar whose
+    # high equals the open must NOT be excluded by the >= / <= guards.
+    store.upsert_prices(con, pd.DataFrame([_ohlc_row("TOUCH", 5.00, 5.00, 4.80, 4.80)]))
+    assert (
+        con.execute("SELECT count(*) FROM daily_returns WHERE symbol = 'TOUCH'").fetchone()[0] == 1
+    )
+
+
 def _experiment(con, strategy="s", test_start=dt.date(2026, 1, 5), test_end=dt.date(2026, 2, 27)):
     return store.record_experiment(
         con,

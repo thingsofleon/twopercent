@@ -211,6 +211,76 @@ def test_invalid_bars_null_open_and_close(con):
     assert inv["invalid"].tolist() == [2]
 
 
+def _ohlc(symbol, open_, high, low, close):
+    return {
+        "symbol": symbol,
+        "date": START,
+        "open": open_,
+        "high": high,
+        "low": low,
+        "close": close,
+        "adj_close": close,
+        "volume": 1_000_000,
+    }
+
+
+def test_invalid_bars_counts_ohlc_ordering_and_open_le_zero(con):
+    # Adversarial non-round prices. invalid_bars must flag both the legacy
+    # open<=0 class AND the new OHLC-ordering class (issue #31 / ENHA shape).
+    nan = float("nan")
+    store.upsert_prices(
+        con,
+        pd.DataFrame(
+            [
+                _ohlc("VALID", 3.51, 3.62, 3.40, 3.58),  # clean — never flagged
+                _ohlc("ZEROOPEN", 0.0, 3.62, 0.0, 3.58),  # legacy open<=0 class
+                _ohlc("HIGHLOW", 3.51, 3.40, 2.90, 2.92),  # high < open (ENHA)
+                _ohlc("LOWHIGH", 7.13, 7.90, 7.50, 7.40),  # low > close
+                _ohlc("NANHIGH", 3.51, nan, 3.40, 3.58),  # NaN high (NaN>=x trap)
+            ]
+        ),
+    )
+    inv = doctor.invalid_bars(con)
+    assert set(inv["symbol"]) == {"ZEROOPEN", "HIGHLOW", "LOWHIGH", "NANHIGH"}
+    assert inv.set_index("symbol")["invalid"].to_dict() == {
+        "ZEROOPEN": 1,
+        "HIGHLOW": 1,
+        "LOWHIGH": 1,
+        "NANHIGH": 1,
+    }
+
+
+def test_invalid_bars_flags_exactly_the_rows_the_view_excludes(con):
+    # The docstring's contract: invalid_bars counts precisely the rows
+    # daily_returns silently excludes. Prove the two sets coincide row-for-row
+    # so the doctor can never under- or over-report the view's hidden data loss.
+    nan = float("nan")
+    store.upsert_prices(
+        con,
+        pd.DataFrame(
+            [
+                _ohlc("VALID", 3.51, 3.62, 3.40, 3.58),
+                _ohlc("ZEROOPEN", 0.0, 3.62, 0.0, 3.58),
+                _ohlc("NANCLOSE", 3.51, 3.62, 3.40, nan),
+                _ohlc("HIGHLOW", 3.51, 3.40, 2.90, 2.92),
+                _ohlc("HIGHBELOWCLOSE", 4.07, 4.10, 3.90, 4.55),
+                _ohlc("LOWABOVEOPEN", 5.00, 6.20, 5.30, 6.10),
+                _ohlc("NANHIGH", 3.51, nan, 3.40, 3.58),
+                _ohlc("NANLOW", 3.51, 3.62, nan, 3.58),
+            ]
+        ),
+    )
+    view_excluded = {
+        r[0]
+        for r in con.execute(
+            "SELECT symbol FROM prices EXCEPT SELECT symbol FROM daily_returns"
+        ).fetchall()
+    }
+    flagged = set(doctor.invalid_bars(con)["symbol"])
+    assert view_excluded == flagged
+    assert "VALID" not in flagged
+
+
 def test_coverage_universe_symbol_without_prices(defective):
     assert doctor.universe_symbols_without_prices(defective) == ["GHOST"]
 

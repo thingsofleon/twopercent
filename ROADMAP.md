@@ -305,6 +305,45 @@ so the BASE RATE rises sharply and raw hit rate looks high — **lift and
 calibration become the honesty metrics**, not headline reach-rate. Threshold
 stays 2% (parameterizable later). Walk-forward preserved throughout.
 
+**quant-skeptic design review (2026-07-25) — must resolve IN Stage A:**
+- **Core claim PASS** — open-to-high label is lookahead-free (target day's own
+  bar only). Measured on the real store: touch base rate **14.7% → 30.8%** mean
+  (~2×). Keep `high` in the leakage-canary UPDATE and add a `cnt_2pct_20d`
+  future-invariance assertion (the canary now leans on the high mutation).
+- **M1 — metric-definition cutover silently re-scores everything ~2×.** Every
+  metric keys on `oc_return >= threshold` re-derived at read time, and stored
+  artifacts don't carry the definition. Flipping it retroactively re-scores the
+  whole experiments ledger AND the live track record under touch (hit rates
+  ~double with zero model change → false step-change), and compares close-based
+  champions vs touch-based challengers (nonsense promotion/degradation). FIX:
+  stamp `event = open_to_high | open_to_close` on every experiments row and
+  scoring path; wall off pre-pivot rows; force a champion re-benchmark under
+  touch; record the cutover date. **Live track record: clean cutover** (the
+  touch record starts fresh from the touch-trained model; close-era days are
+  archived/labeled, not silently re-scored).
+- **M2 — high-spike guard is an INTERSECTION, not an absolute cap.** 1,126 bars
+  (0.10% of touch bars) have an isolated high ≥1.15× surroundings, but **73%
+  carry ≥2× volume — real small-cap squeezes a +2% limit WOULD have filled**;
+  an absolute cap would false-reject the exact violent moves the model exists
+  to predict. Only ~150 bars in 5yr (~0.014%) are glitch-suspect: isolated high
+  AND below-average volume AND the touch is decided by the high alone
+  (`close < open×1.02`). Guard = that intersection, in the shared
+  `daily_returns` path (so all consumers agree), loud-counted, surfaced in
+  `doctor` like the OHLC gate.
+- **M3 — degradation detector false-fires under touch base rates.** Its
+  trailing-5 `lift < 1.0` trip was calibrated for close base rates; under touch
+  the lift ceiling is `1/base_rate` and 133/1260 days have base rate ≥0.5
+  (ceiling <2). A hot high-base-rate streak drags mean lift toward 1.0 with no
+  decay → false auto-degradation issue + investigator cycle. Re-derive the
+  detector baseline for the touch regime before touch metrics feed it.
+- **N-notes:** single source for the touch predicate (define once, ideally a
+  `daily_returns` column — 5 call sites must agree); lift dynamic range
+  compresses (max ~3.25 vs ~6.8) so lead ranking on **AUC (base-rate-invariant)**
+  + `precision − base_rate` excess; Stage-C calibration must use a **Brier skill
+  score vs the daily base rate** and check reliability CONDITIONED on regime
+  (base rate swings 7%→98% daily; raw Brier drops "for free" at cutover);
+  reaffirm touch labels are never resolved onto incomplete days (#66).
+
 ## Status
 
 Live tracking is on GitHub: **milestones** (one per level) and **issues**

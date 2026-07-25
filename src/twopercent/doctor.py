@@ -11,6 +11,11 @@ import pandas as pd
 
 from twopercent import scan
 from twopercent.ingest import _SPLIT_EPSILON, SPLIT_ARTIFACT_OC, SPLIT_ARTIFACT_SCALE
+from twopercent.track import (
+    COMPLETENESS_MEDIAN_WINDOW,
+    COMPLETENESS_MIN_FRACTION,
+    COMPLETENESS_MIN_PRIOR_DATES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +101,60 @@ def invalid_bars(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
            OR high < open OR high < close OR low > open OR low > close
         GROUP BY symbol
         ORDER BY invalid DESC, symbol
+        """
+    ).df()
+
+
+def incomplete_days(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """Trading days whose coverage is materially short of the recent norm — a
+    provisional/in-progress day the scoring & predict gate holds back (#65).
+
+    Reads RAW `prices` counts, per the "diagnostics read raw tables, never
+    filtered views" rule: the daily_returns view could hide a shortfall behind
+    its own WHERE clause, and the doctor exists to SEE the shortfall. bar_count
+    is the raw row count for the date; valid_count (daily_returns) is shown for
+    context — a large bar_count/valid_count gap means the shortfall is corrupt
+    bars, a small gap means genuinely-missing symbols (the provisional-day case,
+    e.g. 2026-07-24's pre-market partial). Same trailing-only window and 0.9
+    fraction as store.complete_trading_days, judged once a date has >= 5 prior
+    dates (track.py owns the constants).
+
+    NOTE — the diagnostic and the gate can disagree on a borderline day BY DESIGN:
+    this check ranks by RAW `prices` counts (per the "diagnostics read raw tables"
+    rule) while store.complete_trading_days gates on VALID `daily_returns` counts,
+    so their ratios differ whenever a day has corrupt-but-present bars. That is a
+    conscious choice — the doctor must SEE a shortfall the view could hide — not a
+    bug; use valid_count (shown here) to reconcile the two. bar_count/
+    trailing_median are non-null integer counts — always finite, no isfinite()
+    guard — and the 1e-9 slack keeps an exactly-0.9 boundary day OFF the list
+    (complete). Worst (lowest ratio) first.
+    """
+    return con.execute(
+        f"""
+        WITH raw_counts AS (
+            SELECT date, count(*) AS bar_count FROM prices GROUP BY date
+        ),
+        valid_counts AS (
+            SELECT date, count(*) AS valid_count FROM daily_returns GROUP BY date
+        ),
+        windowed AS (
+            SELECT date, bar_count,
+                   count(*) OVER w AS prior_days,
+                   median(bar_count) OVER w AS trailing_median
+            FROM raw_counts
+            WINDOW w AS (
+                ORDER BY date ROWS BETWEEN {COMPLETENESS_MEDIAN_WINDOW} PRECEDING AND 1 PRECEDING
+            )
+        )
+        SELECT w.date, w.bar_count,
+               coalesce(v.valid_count, 0) AS valid_count,
+               w.trailing_median,
+               w.bar_count / w.trailing_median AS ratio
+        FROM windowed w
+        LEFT JOIN valid_counts v ON v.date = w.date
+        WHERE w.prior_days >= {COMPLETENESS_MIN_PRIOR_DATES}
+          AND w.bar_count < {COMPLETENESS_MIN_FRACTION} * w.trailing_median - 1e-9
+        ORDER BY ratio, w.date
         """
     ).df()
 
@@ -253,6 +312,7 @@ class DoctorReport:
     extreme: pd.DataFrame
     zero_runs: pd.DataFrame
     invalid: pd.DataFrame
+    incomplete: pd.DataFrame
     universe_missing_prices: list[str]
     prices_missing_meta: list[str]
 
@@ -264,6 +324,7 @@ class DoctorReport:
             + len(self.extreme)
             + len(self.zero_runs)
             + len(self.invalid)
+            + len(self.incomplete)
             + len(self.universe_missing_prices)
             + len(self.prices_missing_meta)
         )
@@ -285,6 +346,7 @@ def run(con: duckdb.DuckDBPyConnection, stale_days: int = DEFAULT_STALE_DAYS) ->
         extreme=extreme_bars(con),
         zero_runs=zero_volume_runs(con),
         invalid=invalid_bars(con),
+        incomplete=incomplete_days(con),
         universe_missing_prices=universe_symbols_without_prices(con),
         prices_missing_meta=price_symbols_without_meta(con),
     )
@@ -354,6 +416,20 @@ def format_report(report: DoctorReport, examples: int = 10) -> list[str]:
             f"{row.first_invalid:%Y-%m-%d} and {row.last_invalid:%Y-%m-%d}"
         )
     _overflow(lines, len(report.invalid), examples)
+
+    lines.append(
+        f"{_mark(len(report.incomplete))} incomplete: {len(report.incomplete)} trading "
+        f"day(s) with raw coverage < {COMPLETENESS_MIN_FRACTION:.0%} of the trailing "
+        f"{COMPLETENESS_MEDIAN_WINDOW}-day median (provisional/in-progress days the "
+        f"scoring & predict gate holds back)"
+    )
+    for row in report.incomplete.head(examples).itertuples():
+        lines.append(
+            f"    {pd.Timestamp(row.date):%Y-%m-%d} {int(row.bar_count)} raw bars "
+            f"({int(row.valid_count)} valid) vs trailing median "
+            f"{float(row.trailing_median):.0f} — ratio {float(row.ratio):.2f}"
+        )
+    _overflow(lines, len(report.incomplete), examples)
 
     coverage = len(report.universe_missing_prices) + len(report.prices_missing_meta)
     lines.append(

@@ -88,6 +88,7 @@ def test_routine_happy_path_completes_all_steps(ready):
         "ingest",
         "freshness",
         "recheck",
+        "completeness",
         "predict",
         "dashboard",
         "scoring",

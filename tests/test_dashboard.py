@@ -257,6 +257,10 @@ def test_dashboard_renders_live_substitution_note(modeled, tmp_path):
     import datetime as dt
 
     dates = sorted(pd.bdate_range("2026-01-05", periods=60).date)
+    # Pad the universe so removing ONE pick's target-day bar keeps the day
+    # COMPLETE (coverage vs trailing median, #65) — in an 8-name fixture a single
+    # deletion is a 12% cliff that the gate would hold; in production it is ~0.03%.
+    seed_history(modeled, {f"PAD{i:02d}": FLAT_OC for i in range(12)}, vary_volume=True)
     predict_for(modeled, "baseline_gbm_v1", signal_date=dates[-2], save=True)
     # Stamp the save live (created before the target day's open)...
     modeled.execute(

@@ -111,6 +111,7 @@ def test_score_mode_happy_path_no_predict_no_universe_refresh(ready, monkeypatch
         "ingest",
         "freshness",
         "recheck",
+        "completeness",
         "score",
         "detector",
         "dashboard",

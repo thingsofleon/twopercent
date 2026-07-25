@@ -316,5 +316,39 @@ truth for *decisions and plan shape*; GitHub is the source of truth for
   and dropped loudly at ingest, joining the open<=0 gate. Non-destructive
   (the 123 store-wide offenders stay in `prices`); #31's scale-break refetch
   (stale pre-split history) remains open.
+  Shipped (#65): trading-day COMPLETENESS/FINALITY gate. The predict run's
+  provisional pre-market bar (2026-07-24: 2,438 of ~3,035 symbols) was being
+  scored as a finished day — the money tiles, degradation detector, and emailed
+  dashboard counted a day still trading, and predict's default signal day would
+  forecast FROM it. A date is now COMPLETE iff its valid-bar coverage is ≥ 90%
+  of the median over the 20 dates strictly before it (trailing-only window → no
+  lookahead). A date is judged as soon as it has >= 5 prior trading dates (median
+  over up to 20 trailing dates); a store younger than 5 days can't judge its edge
+  day and treats it complete, but that regime is LOUD (predict + routine WARN it's
+  unjudgeable) so a from-scratch backfill never silently scores/forecasts from a
+  provisional edge day. One definition — the `complete_trading_days` view — gates
+  target resolution in `score_predictions`/`daily_pick_performance`/
+  `daily_rank_outcomes` (an unresolvable incomplete target stays PENDING,
+  "Awaiting outcomes"), `daily_base_rates` (incomplete dates return ABSENT), and
+  `predict_for`'s default signal day (falls back to the latest complete day,
+  WARNs). A doctor `incomplete` check reads RAW `prices` counts (deliberately a
+  different lens than the view's valid-bar gate — see its docstring), and the
+  routine's `completeness` step WARNs (non-fatal) when an edge day is held. No-op
+  on complete data (coverage = symbol count, so a low-volume/holiday day is
+  unaffected). On the live store today the gate holds exactly 2026-07-24 (ratio
+  0.765), all prior days complete.
+  Scope / honesty (reviewer-flagged): the "one definition" gates scoring, base
+  rates, and predict's default signal day ONLY — it does NOT extend to
+  `features.py` (training labels via per-symbol `LEAD` on raw `daily_returns`) or
+  `backtest.py` (consumes `did_2pct_next`/`target_date` directly), so the
+  benchmark and training are not completeness-gated on the live edge. Harmless for
+  the default predict path (predict uses the latest complete day; training is
+  filtered `target_date <= signal_date`), but an explicit `signal_date` on the
+  provisional day would train/score off it. Known limits (doc-only, not fixed
+  here): (1) the gate is a COVERAGE proxy for FINALITY — `ingest.classify_missing`
+  retains a morning partial bar when a later refetch returns empty (rate-limit),
+  so a stale mid-session bar can count toward coverage (refetch/finality tracking
+  is #34/#31); (2) a mass-halt / mass-delist day (>10% of the universe halted at
+  once) will false-HOLD as incomplete — rare, and arguably desirable to flag.
   Exit criterion: a real degradation → investigation cycle observed, or at
   minimum both timers proven live — NOT complete yet.

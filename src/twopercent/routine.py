@@ -262,6 +262,54 @@ def _recheck_step(
     return True
 
 
+def _completeness_step(report: RoutineReport, con) -> None:
+    """WARN (non-fatal) when the newest trading day is held back as INCOMPLETE —
+    a provisional pre-market/partial day the scoring & predict gate excludes
+    (#65). Expected pre-close (the morning predict run ingests today's partial
+    bar, and the score run ingests before all names post their final bar), so a
+    held-back edge day is NOT a failure — but it must be VISIBLE, not silent: it
+    is exactly why today's prediction is forecast from yesterday and why today
+    won't appear in the track record until it completes."""
+    try:
+        coverage = store.trading_day_coverage(con)
+    except Exception as exc:
+        report.add("completeness", WARN, f"coverage check failed: {exc}")
+        return
+    if coverage.empty:
+        report.add("completeness", OK, "no trading days to judge")
+        return
+    latest = coverage.sort_values("date").iloc[-1]
+    day = pd.Timestamp(latest["date"]).date()
+    held = coverage[~coverage["complete"].astype(bool)]
+    if not bool(latest["complete"]):
+        report.add(
+            "completeness",
+            WARN,
+            f"newest day {day} held back as INCOMPLETE: {int(latest['bar_count'])} valid bars "
+            f"vs trailing median {float(latest['trailing_median']):.0f} — scoring resolves "
+            f"targets only onto complete days and predict forecasts from the latest complete "
+            f"day ({len(held)} incomplete day(s) total)",
+        )
+    elif int(latest["prior_days"]) < track.COMPLETENESS_MIN_PRIOR_DATES:
+        # Young store (from-scratch backfill): can't judge the edge day, so it is
+        # treated complete and USED — loud, never silent, so the regime is visible.
+        report.add(
+            "completeness",
+            WARN,
+            f"newest day {day} treated complete but UNJUDGEABLE: only {int(latest['prior_days'])} "
+            f"prior trading day(s) (need {track.COMPLETENESS_MIN_PRIOR_DATES}) — store too young "
+            "to assess coverage; scored/forecast from it without a completeness check",
+        )
+    elif len(held):
+        report.add(
+            "completeness",
+            WARN,
+            f"newest day {day} complete; {len(held)} older incomplete day(s) held back",
+        )
+    else:
+        report.add("completeness", OK, f"newest day {day} complete")
+
+
 def _run_predict(
     report: RoutineReport,
     now: dt.datetime,
@@ -326,6 +374,8 @@ def _run_predict(
 
     if not _recheck_step(report, pre, post):
         return report
+
+    _completeness_step(report, con)
 
     try:
         name = champion.get_champion()
@@ -535,6 +585,8 @@ def _run_score(
 
     if not _recheck_step(report, pre, post):
         return report
+
+    _completeness_step(report, con)
 
     try:
         # Always the top-20 basket, whatever --top says: the detector's lift

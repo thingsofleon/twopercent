@@ -261,6 +261,10 @@ def test_pick_performance_excludes_ohlc_corrupt_rank1_and_substitutes(con, caplo
         "BADHI": [0.001] * 25,  # target-day bar overwritten to the ENHA shape below
         "GOOD1": [0.001] * 24 + [0.021],  # +2.1% on the target day
         "GOOD2": [0.001] * 25,  # flat
+        # Filler names give the target day realistic coverage: excluding ONE
+        # corrupt bar (BADHI) must not trip the completeness gate (#65) — in a
+        # 3-name universe it would be a 33% cliff, in production ~0.03%.
+        **{f"FILL{i:02d}": [0.001] * 25 for i in range(12)},
     }
     seed_history(con, oc)
     dates = sorted(pd.bdate_range("2026-01-05", periods=25).date)

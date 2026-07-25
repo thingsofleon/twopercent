@@ -11,6 +11,7 @@ import pandas as pd
 
 from twopercent import store, strategies
 from twopercent.features import feature_frame
+from twopercent.track import COMPLETENESS_MIN_PRIOR_DATES
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,72 @@ class PredictResult:
     trained_rows: int
 
 
+def _default_signal_date(con: duckdb.DuckDBPyConnection, frame: pd.DataFrame) -> dt.date:
+    """The latest COMPLETE signal day in `frame` — never forecast from a
+    provisional edge day (#65).
+
+    The raw latest signal day may be an in-progress day carrying only a
+    pre-market/partial bar (store.complete_trading_days judges it incomplete).
+    Forecasting from it would build features from a fraction of the universe, so
+    the default falls back to the latest complete day and WARNs loudly (naming
+    the held-back date and its coverage vs the trailing-median norm). An EXPLICIT
+    signal_date argument bypasses this entirely and is honored verbatim — backfill
+    and testing must keep working, including deliberately predicting from a
+    provisional day.
+
+    Young-store regime: a date with fewer than COMPLETENESS_MIN_PRIOR_DATES prior
+    trading dates cannot be judged (no baseline) and is treated complete — but if
+    the latest signal day is USED while unjudgeable, that is WARNed loudly too, so
+    a from-scratch backfill never silently forecasts from a genuinely-provisional
+    edge day.
+    """
+    signal_dates = set(frame["signal_date"])
+    raw_latest = max(signal_dates)
+    coverage = store.trading_day_coverage(con)
+    complete_dates = set(pd.to_datetime(coverage.loc[coverage["complete"], "date"]).dt.date)
+    candidates = signal_dates & complete_dates
+    if not candidates:
+        logger.warning(
+            "no complete signal day available (store too small to judge coverage) — "
+            "defaulting to latest signal day %s",
+            raw_latest,
+        )
+        return raw_latest
+    chosen = max(candidates)
+    if chosen != raw_latest:
+        held = coverage[pd.to_datetime(coverage["date"]).dt.date == raw_latest]
+        cov = ""
+        if not held.empty:
+            row = held.iloc[0]
+            cov = (
+                f" ({int(row['bar_count'])} valid bars vs trailing-median "
+                f"{float(row['trailing_median']):.0f})"
+            )
+        logger.warning(
+            "latest signal day %s held back as INCOMPLETE%s — forecasting from the "
+            "latest COMPLETE signal day %s instead (never predict from a provisional "
+            "pre-market bar)",
+            raw_latest,
+            cov,
+            chosen,
+        )
+        return chosen
+    # chosen == raw_latest: either genuinely complete, or too young to judge.
+    latest_row = coverage[pd.to_datetime(coverage["date"]).dt.date == raw_latest]
+    if not latest_row.empty:
+        prior_days = int(latest_row.iloc[0]["prior_days"])
+        if prior_days < COMPLETENESS_MIN_PRIOR_DATES:
+            logger.warning(
+                "latest signal day %s used but UNJUDGEABLE for completeness (only %d prior "
+                "trading day(s), need %d) — store too young to assess coverage; forecasting "
+                "from it without a completeness check",
+                raw_latest,
+                prior_days,
+                COMPLETENESS_MIN_PRIOR_DATES,
+            )
+    return chosen
+
+
 def predict_for(
     con: duckdb.DuckDBPyConnection,
     strategy_name: str,
@@ -42,8 +109,9 @@ def predict_for(
 ) -> PredictResult:
     """Score every symbol for the trading day after `signal_date`.
 
-    Defaults to the latest date in the store. For a PAST signal date
-    (track-record backfill), training uses only outcomes with
+    Defaults to the latest COMPLETE date in the store (never a provisional
+    in-progress edge day — see _default_signal_date, #65). For a PAST signal
+    date (track-record backfill), training uses only outcomes with
     target_date <= signal_date — what was knowable at that day's close —
     so backfilled predictions stay walk-forward honest.
 
@@ -71,7 +139,7 @@ def predict_for(
         signal_date=pd.to_datetime(frame["signal_date"]).dt.date,
         target_date=pd.to_datetime(frame["target_date"]).dt.date,
     )
-    signal_date = signal_date or frame["signal_date"].max()
+    signal_date = signal_date or _default_signal_date(con, frame)
 
     rows = frame[frame["signal_date"] == signal_date]
     if rows.empty:

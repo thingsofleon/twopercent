@@ -66,6 +66,26 @@ supervised autonomy → AI-native).
   string-assertion tests and was caught only by rendering a screenshot.
   Verify visual output by rendering it (Playwright) before shipping; always
   declare `<meta charset="utf-8">` in generated HTML.
+- **Never score or predict from an incomplete trading day.** Every predict/score
+  run ingests a provisional pre-market bar for today covering a fraction of the
+  universe (2026-07-24: 2,438 of ~3,035). Because scoring resolves the target as
+  `min(date > signal_date)`, that in-progress day silently became a scored target
+  (money tiles, degradation detector, emailed dashboard all counted a day that
+  hadn't finished trading), and predict's default signal day forecast FROM it.
+  Completeness = coverage vs the trailing median: a date is complete iff its
+  valid-bar count is ≥ 90% of the median count over the 20 dates STRICTLY BEFORE
+  it (trailing-only → no lookahead; the key test is that appending later dates
+  never changes an earlier date's verdict). ONE definition
+  (`store.complete_trading_days`), reused by target resolution, base rates, and
+  predict's default signal day — but NOT training labels (features.py) or the
+  benchmark (backtest.py), which stay ungated on the live edge (harmless: predict
+  uses the latest complete day, training is filtered `target_date <= signal_date`).
+  It is a coverage PROXY for finality, so a retained morning partial bar (ingest
+  rate-limit path, #34/#31) can still slip through. Must be a NO-OP on complete
+  data (coverage =
+  symbol count, not volume — a holiday/low-volume day still has ~full coverage).
+  A held edge day is expected pre-close: WARN loudly (routine + doctor), never
+  silently drop or silently score (Batch #65).
 - **Network code test pattern:** offline unit tests against canned payloads
   (fixtures in tests/conftest.py) plus `@pytest.mark.live` smoke tests; CI
   runs offline only. Follow it; don't invent a new pattern per module.

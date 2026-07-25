@@ -11,6 +11,7 @@ import pandas as pd
 
 from twopercent import store, strategies
 from twopercent.features import feature_frame
+from twopercent.track import COMPLETENESS_MIN_PRIOR_DATES
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,12 @@ def _default_signal_date(con: duckdb.DuckDBPyConnection, frame: pd.DataFrame) ->
     signal_date argument bypasses this entirely and is honored verbatim — backfill
     and testing must keep working, including deliberately predicting from a
     provisional day.
+
+    Young-store regime: a date with fewer than COMPLETENESS_MIN_PRIOR_DATES prior
+    trading dates cannot be judged (no baseline) and is treated complete — but if
+    the latest signal day is USED while unjudgeable, that is WARNed loudly too, so
+    a from-scratch backfill never silently forecasts from a genuinely-provisional
+    edge day.
     """
     signal_dates = set(frame["signal_date"])
     raw_latest = max(signal_dates)
@@ -76,6 +83,20 @@ def _default_signal_date(con: duckdb.DuckDBPyConnection, frame: pd.DataFrame) ->
             cov,
             chosen,
         )
+        return chosen
+    # chosen == raw_latest: either genuinely complete, or too young to judge.
+    latest_row = coverage[pd.to_datetime(coverage["date"]).dt.date == raw_latest]
+    if not latest_row.empty:
+        prior_days = int(latest_row.iloc[0]["prior_days"])
+        if prior_days < COMPLETENESS_MIN_PRIOR_DATES:
+            logger.warning(
+                "latest signal day %s used but UNJUDGEABLE for completeness (only %d prior "
+                "trading day(s), need %d) — store too young to assess coverage; forecasting "
+                "from it without a completeness check",
+                raw_latest,
+                prior_days,
+                COMPLETENESS_MIN_PRIOR_DATES,
+            )
     return chosen
 
 

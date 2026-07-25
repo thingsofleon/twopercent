@@ -62,11 +62,33 @@ CREATE OR REPLACE VIEW daily_returns AS
 -- rows that would actually score), never raw prices. The window is TRAILING ONLY
 -- (ROWS ... 20 PRECEDING AND 1 PRECEDING — strictly before D), so a date's
 -- verdict uses no future data and never changes when later dates arrive. A date
--- with fewer than a full 20-date prior window (the earliest ones) can't be judged
--- against a stable baseline and is treated complete (historical/backfilled
--- anyway). bar_count/trailing_median are counts of non-null rows, always finite,
--- so no isfinite() guard is needed; the 1e-9 slack keeps an exactly-0.9 boundary
--- day complete despite FP (0.9 is not representable).
+-- is JUDGED as soon as it has >= 5 prior trading dates (the median is taken over
+-- whatever exists, up to 20 trailing dates); a date with FEWER than 5 priors (a
+-- from-scratch backfill / brand-new store) can't be judged against a baseline and
+-- is treated complete — but that regime is made LOUD at the use sites (predict +
+-- routine WARN when the latest day is used yet unjudgeable), never silent. The
+-- 0.9 / 20 / 5 literals are the SQL copy of track.COMPLETENESS_MIN_FRACTION,
+-- track.COMPLETENESS_MEDIAN_WINDOW, and track.COMPLETENESS_MIN_PRIOR_DATES (that
+-- module is the source of truth). bar_count/trailing_median are counts of
+-- non-null rows, always finite, so no isfinite() guard is needed; the 1e-9 slack
+-- keeps an exactly-0.9 boundary day complete despite FP (0.9 is not representable).
+--
+-- LOAD-BEARING ASSUMPTION: this is a COVERAGE proxy for FINALITY — a symbol
+-- present in daily_returns for date D is treated as posting its FINAL bar for D.
+-- One known path violates it: ingest.classify_missing RETAINS a morning partial
+-- bar when a later refetch returns empty (a provider rate-limit), so a stale
+-- mid-session bar can count toward coverage and let a day pass as complete. That
+-- is a pre-existing limit of the coverage approach (not introduced by #65); the
+-- real fix is refetch/finality tracking at ingest — see #34 / #31 — and is out of
+-- scope here. SCOPE: this view gates track.py scoring, daily_base_rates, and
+-- predict's default signal day. It deliberately does NOT gate features.py
+-- (training labels, built from raw daily_returns via per-symbol LEAD) or
+-- backtest.py (consumes did_2pct_next/target_date directly) — the benchmark and
+-- training are NOT completeness-gated on the live edge day. That is harmless for
+-- the default predict path (predict uses the latest COMPLETE day and training is
+-- filtered target_date <= signal_date, so the incomplete edge is excluded), but
+-- an EXPLICIT signal_date on the provisional day, or a benchmark run whose window
+-- reaches it, would train/score labels off the partial bar.
 CREATE OR REPLACE VIEW complete_trading_days AS
     WITH daily_counts AS (
         SELECT date, count(*) AS bar_count FROM daily_returns GROUP BY date
@@ -80,7 +102,7 @@ CREATE OR REPLACE VIEW complete_trading_days AS
     )
     SELECT date, bar_count, prior_days, trailing_median
     FROM windowed
-    WHERE prior_days < 20  -- no full prior window: can't judge, treat complete
+    WHERE prior_days < 5  -- < 5 priors: too little history to judge, treat complete
        OR bar_count >= 0.9 * trailing_median - 1e-9;
 CREATE SEQUENCE IF NOT EXISTS experiment_id_seq;
 CREATE TABLE IF NOT EXISTS experiments (

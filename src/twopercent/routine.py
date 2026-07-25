@@ -290,6 +290,16 @@ def _completeness_step(report: RoutineReport, con) -> None:
             f"targets only onto complete days and predict forecasts from the latest complete "
             f"day ({len(held)} incomplete day(s) total)",
         )
+    elif int(latest["prior_days"]) < track.COMPLETENESS_MIN_PRIOR_DATES:
+        # Young store (from-scratch backfill): can't judge the edge day, so it is
+        # treated complete and USED — loud, never silent, so the regime is visible.
+        report.add(
+            "completeness",
+            WARN,
+            f"newest day {day} treated complete but UNJUDGEABLE: only {int(latest['prior_days'])} "
+            f"prior trading day(s) (need {track.COMPLETENESS_MIN_PRIOR_DATES}) — store too young "
+            "to assess coverage; scored/forecast from it without a completeness check",
+        )
     elif len(held):
         report.add(
             "completeness",

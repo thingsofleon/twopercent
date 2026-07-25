@@ -68,17 +68,58 @@ def test_boundary_at_exactly_nine_tenths_median(con):
     assert last not in _complete_dates(con), "just below 0.9*median must be held"
 
 
-def test_earliest_days_without_full_window_are_complete(con):
-    # Fewer than 20 prior dates → can't judge against a stable baseline → complete,
-    # even though these early days are wildly uneven.
+def test_earliest_days_without_min_window_are_complete(con):
+    # Fewer than COMPLETENESS_MIN_PRIOR_DATES (5) prior dates → can't judge against
+    # a baseline → treated complete, even though these early days are wildly uneven.
     seed_history(
         con,
         {"A": [0.001] * 5, "B": [0.001] * 3, "C": [0.001] * 1},
         vary_volume=True,
     )
     dates = sorted(pd.bdate_range("2026-01-05", periods=5).date)
-    # every seeded date has < 20 prior days, so all are treated complete
+    # every seeded date has < 5 prior days, so all are treated complete
     assert _complete_dates(con) == set(dates)
+
+
+def test_short_history_store_holds_provisional_latest_day(con):
+    # The reviewer's silent blind spot: a store YOUNGER than a full 20-day window
+    # but with >= 5 prior dates must still judge — and HOLD — a provisional latest
+    # day. Before FIX 1 (prior_days < 20 → complete) this 8-day store silently
+    # scored the 17%-coverage edge day; now it is held.
+    oc, dates = _seed_uniform(con, n_symbols=12, n_days=8)
+    _save(con, "strat", dates[-2], ["S00", "S01", "S02"])
+    # ~17% coverage on the last day: 2 of 12 symbols (a provisional pre-market bar).
+    _drop_last_day_bars(con, [f"S{i:02d}" for i in range(2, 12)], dates[-1])
+
+    assert dates[-1] not in _complete_dates(con)  # judged on the 7-date partial window
+    record = track.score_predictions(con, "strat", top_n=3)
+    assert record.scored.empty  # not scored against the partial bar...
+    assert dates[-2] in record.pending  # ...stays pending instead
+
+
+def test_very_young_store_latest_treated_complete_but_warns(con, caplog):
+    from twopercent import routine
+
+    # A brand-new store (< 5 trading days, a from-scratch backfill): the latest day
+    # CANNOT be judged, so it is treated complete and USED — but that must be LOUD,
+    # never silent, in both the routine step and predict's default signal day.
+    _, dates = _seed_uniform(con, n_symbols=10, n_days=4)
+    assert _complete_dates(con) == set(dates)  # all treated complete (too young)
+
+    report = routine.RoutineReport()
+    routine._completeness_step(report, con)
+    step = report.steps[-1]
+    assert step.status == routine.WARN
+    assert "UNJUDGEABLE" in step.detail and str(dates[-1]) in step.detail
+
+    # predict._default_signal_date fires the same loud warning (called directly:
+    # feature_frame needs >= 20 days of history, so a 4-day store never reaches
+    # predict_for — the warning is the defensive disclosure for that regime).
+    frame = pd.DataFrame({"signal_date": dates})
+    with caplog.at_level(logging.WARNING, logger="twopercent.predict"):
+        chosen = predict._default_signal_date(con, frame)
+    assert chosen == dates[-1]  # used, since there is nothing better
+    assert any("UNJUDGEABLE" in r.message and str(dates[-1]) in r.message for r in caplog.records)
 
 
 # --- no lookahead: the key methodological test --------------------------------

@@ -19,16 +19,26 @@ logger = logging.getLogger(__name__)
 # Completeness gate (issue #65): a trading day is COMPLETE (trustworthy to score
 # or predict from) iff its valid-bar coverage is not materially short of the
 # recent norm — count(valid bars on D) >= COMPLETENESS_MIN_FRACTION * median(count
-# over the COMPLETENESS_MEDIAN_WINDOW dates STRICTLY BEFORE D). This module is the
-# SOURCE OF TRUTH for these constants; the store.complete_trading_days view (which
-# the scoring queries below and daily_base_rates SELECT from) hardcodes the same
-# 0.9 / 20 with a comment pointing back here. Never score or predict from an
-# incomplete day: an in-progress day carries only a provisional pre-market/partial
-# bar covering a fraction of the universe, and scoring it counts a day that has
-# not finished trading. The window is trailing-only, so the verdict never uses
-# future data (a later date can never change an earlier date's verdict).
+# over up to the COMPLETENESS_MEDIAN_WINDOW dates STRICTLY BEFORE D). This module
+# is the SOURCE OF TRUTH for these constants; the store.complete_trading_days view
+# (which the scoring queries below and daily_base_rates SELECT from) hardcodes the
+# same 0.9 / 20 / 5 with a comment pointing back here. Never score or predict from
+# an incomplete day: an in-progress day carries only a provisional pre-market/
+# partial bar covering a fraction of the universe, and scoring it counts a day
+# that has not finished trading. The window is trailing-only, so the verdict never
+# uses future data (a later date can never change an earlier date's verdict).
+#
+# A date is JUDGED as soon as it has >= COMPLETENESS_MIN_PRIOR_DATES prior trading
+# dates, using the median over up to COMPLETENESS_MEDIAN_WINDOW trailing dates
+# (whatever exists, >= the minimum). A date with fewer priors (a from-scratch
+# backfill / brand-new store younger than the minimum) is treated complete — too
+# little history to judge a baseline — but that regime is LOUD, never silent:
+# predict._default_signal_date and the routine completeness step WARN when the
+# latest day is USED yet unjudgeable, so a young store never silently scores or
+# forecasts from a genuinely-provisional edge day (the whole point of #65).
 COMPLETENESS_MIN_FRACTION = 0.9
 COMPLETENESS_MEDIAN_WINDOW = 20
+COMPLETENESS_MIN_PRIOR_DATES = 5
 
 # Assumed round-trip trading cost (entry + exit) per daily position, applied
 # to every simulated day. 30 bps is a deliberate, documented GUESS pitched for

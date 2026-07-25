@@ -11,7 +11,11 @@ import pandas as pd
 
 from twopercent import scan
 from twopercent.ingest import _SPLIT_EPSILON, SPLIT_ARTIFACT_OC, SPLIT_ARTIFACT_SCALE
-from twopercent.track import COMPLETENESS_MEDIAN_WINDOW, COMPLETENESS_MIN_FRACTION
+from twopercent.track import (
+    COMPLETENESS_MEDIAN_WINDOW,
+    COMPLETENESS_MIN_FRACTION,
+    COMPLETENESS_MIN_PRIOR_DATES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,11 +116,18 @@ def incomplete_days(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
     context — a large bar_count/valid_count gap means the shortfall is corrupt
     bars, a small gap means genuinely-missing symbols (the provisional-day case,
     e.g. 2026-07-24's pre-market partial). Same trailing-only window and 0.9
-    fraction as store.complete_trading_days (track.py owns the constants); a date
-    is judged only once it has a full prior window, so a store's ragged earliest
-    dates never false-flag. bar_count/trailing_median are non-null integer counts
-    — always finite, no isfinite() guard needed — and the 1e-9 slack keeps an
-    exactly-0.9 boundary day OFF the list (complete). Worst (lowest ratio) first.
+    fraction as store.complete_trading_days, judged once a date has >= 5 prior
+    dates (track.py owns the constants).
+
+    NOTE — the diagnostic and the gate can disagree on a borderline day BY DESIGN:
+    this check ranks by RAW `prices` counts (per the "diagnostics read raw tables"
+    rule) while store.complete_trading_days gates on VALID `daily_returns` counts,
+    so their ratios differ whenever a day has corrupt-but-present bars. That is a
+    conscious choice — the doctor must SEE a shortfall the view could hide — not a
+    bug; use valid_count (shown here) to reconcile the two. bar_count/
+    trailing_median are non-null integer counts — always finite, no isfinite()
+    guard — and the 1e-9 slack keeps an exactly-0.9 boundary day OFF the list
+    (complete). Worst (lowest ratio) first.
     """
     return con.execute(
         f"""
@@ -141,7 +152,7 @@ def incomplete_days(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
                w.bar_count / w.trailing_median AS ratio
         FROM windowed w
         LEFT JOIN valid_counts v ON v.date = w.date
-        WHERE w.prior_days >= {COMPLETENESS_MEDIAN_WINDOW}
+        WHERE w.prior_days >= {COMPLETENESS_MIN_PRIOR_DATES}
           AND w.bar_count < {COMPLETENESS_MIN_FRACTION} * w.trailing_median - 1e-9
         ORDER BY ratio, w.date
         """

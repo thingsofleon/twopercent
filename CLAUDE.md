@@ -77,7 +77,12 @@ supervised autonomy → AI-native).
   it (trailing-only → no lookahead; the key test is that appending later dates
   never changes an earlier date's verdict). ONE definition
   (`store.complete_trading_days`), reused by target resolution, base rates, and
-  predict's default signal day; must be a NO-OP on complete data (coverage =
+  predict's default signal day — but NOT training labels (features.py) or the
+  benchmark (backtest.py), which stay ungated on the live edge (harmless: predict
+  uses the latest complete day, training is filtered `target_date <= signal_date`).
+  It is a coverage PROXY for finality, so a retained morning partial bar (ingest
+  rate-limit path, #34/#31) can still slip through. Must be a NO-OP on complete
+  data (coverage =
   symbol count, not volume — a holiday/low-volume day still has ~full coverage).
   A held edge day is expected pre-close: WARN loudly (routine + doctor), never
   silently drop or silently score (Batch #65).

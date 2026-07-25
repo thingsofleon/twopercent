@@ -293,8 +293,16 @@ def test_run_collects_every_problem(defective):
     report = doctor.run(defective)
     assert not report.ok
     # 1 gap symbol + 2 stale + 2 extreme bars + 1 zero run + 1 invalid symbol
-    # + GHOST (no prices) + WILD (no meta)
-    assert report.problem_count == 9
+    # + GHOST (no prices) + WILD (no meta) = 9, plus 4 incomplete days: 2026-01-12
+    # (GAPPY gap + STALE ended → 6 of 8 raw) and 2026-01-21..23 (STALE + TAIL ended).
+    assert report.problem_count == 13
+    incomplete_dates = {pd.Timestamp(d).date() for d in report.incomplete["date"]}
+    assert incomplete_dates == {
+        dt.date(2026, 1, 12),
+        dt.date(2026, 1, 21),
+        dt.date(2026, 1, 22),
+        dt.date(2026, 1, 23),
+    }
     text = "\n".join(doctor.format_report(report))
     for symbol in ["GAPPY", "STALE", "TAIL", "WILD", "FLAT", "BADO", "GHOST"]:
         assert symbol in text

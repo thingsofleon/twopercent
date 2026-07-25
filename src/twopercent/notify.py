@@ -72,8 +72,9 @@ _DISCLAIMER = (
     "This message is automated model output from the twopercent research "
     "system. Model scores are statistical estimates, not calibrated "
     "probabilities — on any given day most named candidates will not make a "
-    "2% move. Simulated and benchmark results assume perfect fills at the "
-    "open and close with estimated round-trip trading costs, and are subject "
+    "2% move. Simulated and benchmark results are gross open-to-close returns, "
+    "before trading costs, and assume perfect fills at the open and close; "
+    "real commissions and slippage would reduce them. They are also subject "
     "to survivorship bias in the historical candidate pool and to regime "
     "change. Nothing in this message is investment advice."
 )
@@ -239,7 +240,7 @@ def _time_et(generated_at: dt.datetime) -> str:
 
 _RATIONALE = (
     "in walk-forward simulation the top-5 equal-weight basket was the only "
-    "configuration with a positive compounded return net of assumed trading costs."
+    "configuration with a positive compounded gross return, before trading costs."
 )
 
 

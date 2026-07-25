@@ -93,9 +93,9 @@ def test_sim_windows_top1_exact_week_math():
     assert [w["label"] for w in summary.windows] == ["1 week"]
     week = summary.windows[0]
     assert week["days"] == 5
-    # Hand-derived per-day multipliers: 1 + ret − COST_ROUND_TRIP (0.003).
+    # Hand-derived per-day multipliers: 1 + ret (GROSS — no cost subtracted).
     # Rank 2 (the loud 0.9 returns) must not leak into a top-1 basket.
-    expected = 1.0173 * 0.9853 * 1.0299 * 1.001 * 0.9961
+    expected = 1.0203 * 0.9883 * 1.0329 * 1.004 * 0.9991
     assert abs(week["growth"] - expected) < 1e-9
     assert abs(week["hit_rate"] - 2 / 5) < 1e-12
     assert week["short_days"] == 0
@@ -116,9 +116,7 @@ def test_sim_windows_basket_mean_and_short_day():
     assert week["short_days"] == 1
     full_mean = sum(full) / 10
     short_mean = sum(short) / 6
-    expected = (1 + full_mean - track.COST_ROUND_TRIP) ** 4 * (
-        1 + short_mean - track.COST_ROUND_TRIP
-    )
+    expected = (1 + full_mean) ** 4 * (1 + short_mean)  # GROSS — no cost subtracted
     assert abs(week["growth"] - expected) < 1e-9
     # Hit rate: mean of day fractions — 3/10 on full days, 3/6 on the short day
     # (0.0203, 0.0329, 0.0251 clear 2% among its six picks).
@@ -144,9 +142,11 @@ def test_sim_windows_use_trailing_days_only():
     assert summary.days_available == 21
     assert [w["label"] for w in summary.windows] == ["1 week", "1 month"]
     week, month = summary.windows
-    assert abs(week["growth"] - (1 + 0.0007 - track.COST_ROUND_TRIP) ** 5) < 1e-9
+    assert abs(week["growth"] - (1 + 0.0007) ** 5) < 1e-9  # GROSS — no cost
     assert week["hit_rate"] == 0.0
-    assert week["growth"] < 1 < month["growth"]
+    # The quiet trailing-5 week must compound far below the month, which also
+    # includes the 16 loud +5.17% days — else the week silently spans them.
+    assert week["growth"] < month["growth"]
     assert abs(month["hit_rate"] - 16 / 21) < 1e-12
 
 

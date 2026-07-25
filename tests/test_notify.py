@@ -119,6 +119,11 @@ def test_bodies_carry_basket_table_and_generated_time():
         assert "generated pre-open at 8:00 AM ET" in body
         assert "Nothing in this message is investment advice" in body
         assert "not calibrated probabilities" in body
+        # GROSS relabeling (#67): the invented trading cost is out of the math
+        # AND the wording — the email says results are gross/before-costs, never
+        # "net of assumed trading costs".
+        assert "gross" in body and "before trading costs" in body
+        assert "net of assumed" not in body
 
 
 def test_stats_come_from_the_ledger_never_hardcoded(con):

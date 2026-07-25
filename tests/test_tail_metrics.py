@@ -47,8 +47,8 @@ def test_pick_performance_math_and_costed_growth(con):
     assert row["n_avail"] == 3
 
     assert picks.precision_at_1() == 1.0
-    # Growth is net of the assumed round-trip cost.
-    assert abs(picks.growth("top1_return") - (1 + 0.04 - track.COST_ROUND_TRIP)) < 1e-12
+    # Growth is GROSS — no trading cost subtracted.
+    assert abs(picks.growth("top1_return") - (1 + 0.04)) < 1e-12
 
 
 def test_pick_performance_top1_is_best_available(con):
@@ -76,12 +76,12 @@ def test_benchmark_reports_tail_metrics_and_sim(con, monkeypatch):
     metrics = backtest.run_benchmark(con, "baseline_gbm_v1", months=2, top_n=5)
 
     # Runners do +3.0–3.4% every day and are perfectly identifiable: the top
-    # pick hits every day and $1 compounds at roughly (1 + 3.2% − cost)^days.
+    # pick hits every day and $1 compounds GROSS at roughly (1 + 3.2%)^days.
     assert metrics["precision_at_1"] == 1.0
     assert metrics["precision_at_5"] == 1.0
     days = metrics["test_days"]
-    low = (1 + 0.030 - track.COST_ROUND_TRIP) ** days
-    high = (1 + 0.034 - track.COST_ROUND_TRIP) ** days
+    low = (1 + 0.030) ** days
+    high = (1 + 0.034) ** days
     assert low * 0.99 <= metrics["sim_top1_growth"] <= high * 1.01
     assert metrics["sim_top5_growth"] > 1.0
     assert len(metrics["sim_top1_growth_by_fold"]) == metrics["folds"]
@@ -143,3 +143,7 @@ def test_dashboard_shows_pick_tiles_and_column(con_with_universe, tmp_path):
     assert "$1 → top pick daily (live)" in content
     assert "<th>Top pick" in content  # column header (now carries an info icon)
     assert "WIN" in content
+    # GROSS relabeling (#67): the money tile labels the top-5 figure honestly as
+    # gross/before-costs, never "net of assumed costs".
+    assert "gross, before trading costs" in content
+    assert "assumed costs" not in content

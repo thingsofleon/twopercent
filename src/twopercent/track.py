@@ -40,12 +40,6 @@ COMPLETENESS_MIN_FRACTION = 0.9
 COMPLETENESS_MEDIAN_WINDOW = 20
 COMPLETENESS_MIN_PRIOR_DATES = 5
 
-# Assumed round-trip trading cost (entry + exit) per daily position, applied
-# to every simulated day. 30 bps is a deliberate, documented GUESS pitched for
-# liquid-ish small caps at open/close; real spreads on thin names can be far
-# worse. The simulation is an upper bound on execution quality, not a promise.
-COST_ROUND_TRIP = 0.003
-
 
 @dataclass
 class PickPerformance:
@@ -77,13 +71,13 @@ class PickPerformance:
         return float(frame["top1_hit"].mean()) if len(frame) else None
 
     def growth(self, column: str = "top1_return", include_late: bool = False) -> float | None:
-        """Growth of $1 compounding `column` daily, net of COST_ROUND_TRIP.
+        """Growth of $1 compounding `column` daily, GROSS (before any trading costs).
 
         Live days only by default — see class docstring."""
         frame = self.daily if include_late else self.live
         if not len(frame):
             return None
-        return float((1 + frame[column] - COST_ROUND_TRIP).prod())
+        return float((1 + frame[column]).prod())
 
 
 # Trailing windows for the simulated walk-forward record, in TRADING days.
@@ -124,7 +118,7 @@ def sim_windows(daily: pd.DataFrame, n: int) -> SimWindows:
     is the mean ret of ranks <= n present that day; days with fewer than n
     ranks use what exists and are counted in the window's `short_days` (the
     caller must disclose them — partial coverage is never silent). Growth
-    compounds daily net of COST_ROUND_TRIP, same formula as
+    compounds daily GROSS (before any trading costs), same formula as
     PickPerformance.growth. Hits were computed at benchmark time with the
     epsilon-guarded threshold — no re-derivation here. Windows longer than
     the available history are omitted. A non-finite ret/hit raises: skipna
@@ -153,7 +147,7 @@ def sim_windows(daily: pd.DataFrame, n: int) -> SimWindows:
             {
                 "label": label,
                 "days": w,
-                "growth": float((1 + tail["ret"] - COST_ROUND_TRIP).prod()),
+                "growth": float((1 + tail["ret"]).prod()),
                 "hit_rate": float(tail["hit"].mean()),
                 "short_days": int((tail["picks"] < n).sum()),
             }

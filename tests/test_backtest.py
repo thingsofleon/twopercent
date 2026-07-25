@@ -92,13 +92,11 @@ def test_benchmark_persists_per_rank_daily_rows(con, monkeypatch):
 
     # The persisted rank rows recompound to exactly the recorded aggregates:
     # rank 1 → sim_top1_growth, mean of ranks 1-5 → sim_top5_growth.
-    from twopercent import track
-
     top1 = daily[daily["rank"] == 1]
-    growth1 = float((1 + top1["ret"] - track.COST_ROUND_TRIP).prod())
+    growth1 = float((1 + top1["ret"]).prod())  # GROSS — no cost subtracted
     assert abs(round(growth1, 4) - metrics["sim_top1_growth"]) < 1e-9
     day5 = daily[daily["rank"] <= 5].groupby("target_date")["ret"].mean()
-    growth5 = float((1 + day5 - track.COST_ROUND_TRIP).prod())
+    growth5 = float((1 + day5).prod())  # GROSS — no cost subtracted
     assert abs(round(growth5, 4) - metrics["sim_top5_growth"]) < 1e-9
 
     result = store.latest_experiment_daily(con, "baseline_gbm_v1")

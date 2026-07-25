@@ -164,6 +164,12 @@ def test_dashboard_explorer_defaults_match_python_math(modeled, tmp_path):
     assert "itself a form of selection" in content
     assert "dominated by a handful of days" in content
     assert "The live record above is the clean test." in content
+    # GROSS relabeling (#67): the invented trading cost is out of the math AND
+    # the wording — the caveat says figures are gross, never "net of assumed".
+    assert "figures are GROSS" in content
+    assert "NO trading costs" in content
+    assert "net of assumed" not in content
+    assert "30 bps" not in content
     assert '<meta charset="utf-8">' in content
 
 
@@ -181,7 +187,7 @@ def test_dashboard_explorer_payload_json(modeled, tmp_path):
     match = re.search(r'<script type="application/json" id="tp-data">(.*?)</script>', content)
     assert match, "payload script tag missing"
     payload = json.loads(match.group(1))
-    assert payload["cost"] == track.COST_ROUND_TRIP
+    assert "cost" not in payload  # cost removed from the math and the payload (GROSS)
     assert len(payload["sim"]) == 6
     day0 = payload["sim"][0]
     assert day0["d"] == "2026-01-05"
@@ -222,7 +228,7 @@ def test_summarize_days_first_available_substitution_and_short_days():
     ]
     s1 = dashboard._summarize_days(days, 1)
     # First-available rule: day a's top pick is rank 2 (the trader takes it).
-    expected = (1 + 0.0203 - track.COST_ROUND_TRIP) * (1 + 0.04 - track.COST_ROUND_TRIP)
+    expected = (1 + 0.0203) * (1 + 0.04)  # GROSS — no cost subtracted
     assert abs(s1["growth"] - expected) < 1e-12
     assert s1["hit"] == 1.0
     assert s1["short"] == 0

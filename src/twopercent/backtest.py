@@ -16,7 +16,7 @@ import duckdb
 import pandas as pd
 from sklearn.metrics import brier_score_loss, roc_auc_score
 
-from twopercent import store, strategies, track
+from twopercent import store, strategies
 from twopercent.features import feature_frame
 from twopercent.predict import LIQUIDITY_MIN_MEDIAN_VOLUME
 
@@ -155,7 +155,7 @@ def run_benchmark(
             )
         fold_growth = 1.0
         for _, ret, _, _, _ in daily_picks[fold_pick_start:]:
-            fold_growth *= 1 + ret - track.COST_ROUND_TRIP
+            fold_growth *= 1 + ret
         fold_top1_growth.append(round(fold_growth, 4))
         logger.info("fold %s..%s: %d train, %d test", month_start, month_end, len(train), len(test))
 
@@ -192,8 +192,8 @@ def run_benchmark(
     picks = pd.DataFrame(
         daily_picks, columns=["target_date", "top1_ret", "top1_hit", "top5_ret", "top5_hits"]
     )
-    sim_top1 = float((1 + picks["top1_ret"] - track.COST_ROUND_TRIP).prod())
-    sim_top5 = float((1 + picks["top5_ret"] - track.COST_ROUND_TRIP).prod())
+    sim_top1 = float((1 + picks["top1_ret"]).prod())
+    sim_top5 = float((1 + picks["top5_ret"]).prod())
     metrics = {
         "precision_at_n": round(precision_at_n, 4),
         "top_n": top_n,
@@ -204,9 +204,9 @@ def run_benchmark(
         "precision_at_1": round(float(picks["top1_hit"].mean()), 4),
         "precision_at_5": round(float(picks["top5_hits"].mean()), 4),
         # Growth of $1 trading the daily pick(s) open-to-close over the whole
-        # test window, net of track.COST_ROUND_TRIP per day. Caveats, all
-        # flattering: assumed costs and perfect fills at open/close; the
-        # candidate pool is today's universe applied to history and requires
+        # test window — GROSS, before any trading costs. Caveats, all
+        # flattering: perfect fills at open/close and no commissions/slippage;
+        # the candidate pool is today's universe applied to history and requires
         # a next-day bar, so delisted names can never hand the sim their
         # final catastrophic day (survivorship — see ROADMAP/#24/#31); and a
         # compounded product is tail-dominated (one hot month can carry it —

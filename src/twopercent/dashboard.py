@@ -158,8 +158,8 @@ _INFO_TEXT = {
     "t_live1": "Of live days (picks logged before the market opened), the share "
     "where the #1 ranked pick moved +2%. Backfilled days excluded.",
     "t_growth": "Value today of $1 placed each live day on the #1 pick — and, "
-    "alongside, on the top-5 equal-weight basket — net of assumed round-trip "
-    "costs. Live days only.",
+    "alongside, on the top-5 equal-weight basket — gross (before any trading "
+    "costs). Live days only.",
     "t_cands": "How many symbols the model ranked for the next trading day.",
     # Candidates table columns
     "c_rank": "Rank by model probability — 1 is the most likely to move +2%.",
@@ -188,7 +188,8 @@ _INFO_TEXT = {
     "e_record": "SIM is walk-forward simulation: the model never trains on the days "
     "it predicts, but the system was built with this history visible. LIVE is the "
     "picks actually logged before each open — the clean test.",
-    "e_growth": "Compounded value of $1 over the selected window, net of assumed round-trip costs.",
+    "e_growth": "Compounded value of $1 over the selected window, gross "
+    "(before any trading costs).",
     "e_hit": "Share of the basket that moved +2%, averaged over the window.",
     "e_base": "Average share of all symbols that moved +2% over the window.",
     "e_lift": "Hit rate ÷ base rate over the window. Above 1× beats random.",
@@ -313,8 +314,8 @@ def _tiles(
                 f'<div class="tile"><span class="label">$1 → top pick daily (live)'
                 f"{_info('t_growth')}</span>"
                 f'<b class="{"up" if g1 >= 1 else ""}">${g1:.3f}</b>'
-                f'<span class="cmp">top-5: ${g5:.3f} · net of '
-                f"{track.COST_ROUND_TRIP:.1%}/day assumed costs{late_note}</span></div>"
+                f'<span class="cmp">top-5: ${g5:.3f} · gross, before trading '
+                f"costs{late_note}</span></div>"
             )
         else:
             tiles += (
@@ -335,8 +336,9 @@ def _tiles(
 
 _SIM_CAVEAT = (
     "Walk-forward simulation: the model never trains on the days it predicts, "
-    "but the system was designed with this history visible. Assumes 30 bps "
-    "round-trip cost and perfect open/close fills; picks require a next-day "
+    "but the system was designed with this history visible. Assumes perfect "
+    "open/close fills and NO trading costs — figures are GROSS; real "
+    "commissions/slippage would reduce them. Picks require a next-day "
     "bar and today's universe is applied to history, so delisted names can "
     "never contribute their final catastrophic day — the dollar figures are "
     "biased up. Browsing basket and window combinations is itself a form of "
@@ -386,8 +388,8 @@ def _summarize_days(days: list[dict], n: int) -> dict:
     """Basket stats over payload days — EXACT server-side mirror of the inline
     JS summarize(): basket = first n picks of each day (rank order; taking the
     next available name IS the substitution rule), day return/hit = basket
-    means, growth compounds net of COST_ROUND_TRIP. Non-finite days are
-    counted as corrupt, never silently averaged around."""
+    means, growth compounds GROSS (before any trading costs). Non-finite days
+    are counted as corrupt, never silently averaged around."""
     growth, hit_sum, base_sum = 1.0, 0.0, 0.0
     base_known = short = subst = corrupt = 0
     for day in days:
@@ -404,7 +406,7 @@ def _summarize_days(days: list[dict], n: int) -> dict:
         if not (math.isfinite(ret) and math.isfinite(hit)):
             corrupt += 1
             continue
-        growth *= 1 + ret - track.COST_ROUND_TRIP
+        growth *= 1 + ret
         hit_sum += hit
         base = day.get("base")
         if base is not None and math.isfinite(base):
@@ -579,7 +581,7 @@ _JS = """
   if (!dataEl || !basket || !win) return;
   var data = JSON.parse(dataEl.textContent);
   var DASH = "\\u2014";
-  function summarize(days, n, cost) {
+  function summarize(days, n) {
     var growth = 1, hitSum = 0, baseSum = 0;
     var baseKnown = 0, shortDays = 0, substDays = 0, corrupt = 0;
     for (var i = 0; i < days.length; i++) {
@@ -593,7 +595,7 @@ _JS = """
       if (sub) substDays += 1;
       ret /= picks.length; hit /= picks.length;
       if (!isFinite(ret) || !isFinite(hit)) { corrupt += 1; continue; }
-      growth *= 1 + ret - cost;
+      growth *= 1 + ret;
       hitSum += hit;
       var b = days[i].base;
       if (b != null && isFinite(b)) { baseSum += b; baseKnown += 1; }
@@ -646,7 +648,7 @@ _JS = """
       notes.push("SIM: needs " + w + " trading days " + DASH + " " +
                  data.sim.length + " available");
     } else {
-      var s = summarize(data.sim.slice(-w), n, data.cost);
+      var s = summarize(data.sim.slice(-w), n);
       if (s.corrupt) {
         setRow("sim", null);
         notes.push("SIM: " + s.corrupt + " corrupt day(s) in window " + DASH + " data error");
@@ -659,7 +661,7 @@ _JS = """
     for (var i = 0; i < data.live.length; i++) if (!data.live[i].late) live.push(data.live[i]);
     if (!live.length) { setRow("live", null); notes.push("LIVE: no live days yet"); }
     else {
-      var s2 = summarize(live.slice(-Math.min(w, live.length)), n, data.cost);
+      var s2 = summarize(live.slice(-Math.min(w, live.length)), n);
       if (s2.corrupt) {
         setRow("live", null);
         notes.push("LIVE: " + s2.corrupt + " corrupt day(s) " + DASH + " data error");
@@ -791,7 +793,7 @@ def build_html(
     sim_days = _payload_days(sim[1], bases, "ret") if sim is not None else []
     live_days = _payload_days(outcomes, bases, "oc_return", late=True) if len(outcomes) else []
     explorer = _record_explorer(sim[0] if sim is not None else None, sim_days, live_days)
-    data_tag = _embed_json({"cost": track.COST_ROUND_TRIP, "sim": sim_days, "live": live_days})
+    data_tag = _embed_json({"sim": sim_days, "live": live_days})
 
     return (
         head

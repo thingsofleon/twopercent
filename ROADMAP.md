@@ -20,7 +20,7 @@ Every trading day, many tickers move 2%+. The system:
 |---|---|---|
 | Universe | Top 3000 US stocks by market cap (Russell 3000 proxy), via NASDAQ screener API | Changed in Session 1: iShares IWV holdings CSV no longer plainly downloadable; screener is free, keyless, self-updating. **Known limitations:** survivorship bias — today's constituents applied to history omit delisted/faded names (accepted for v1; quant-skeptic's first target at level 2); unlike the real Russell 3000, foreign-domiciled US-listed ordinaries (e.g. Shopify) are included — deliberate widening, they trade here and can do 2% days. Ingest uses the union of all universe snapshots so rank-3000 boundary churn doesn't truncate histories. This pattern now also feeds the sector features and log_mcap (latest snapshot applied to all of history), making historical feature values refresh-dependent — reproduce a logged experiment only against the same universe snapshot |
 | Data source | yfinance (free) | Daily OHLCV, batched + cached locally; no true real-time/pre-market. Revisit paid API (e.g. Polygon) if used daily |
-| "Did 2%" definition | Open-to-close: `(close − open) / open ≥ 2%` | Regular-hours move only; gaps excluded; +2% direction only |
+| "Did 2%" definition | **Intraday reach (open-to-high): `(high − open) / open ≥ 2%`** — CHANGED 2026-07-25 | Was open-to-close through 2026-07-24. The event is "did the stock REACH +2% intraday" (a pre-placed +2% limit would have filled — deterministic on the day's high, not lookahead), NOT "did it close +2%". Regular-hours only; +2% direction only. See "Reach-predictor pivot" below. Open-to-close return stays available as a FEATURE, not the label. |
 | Signals/prediction | ML model from the start | Gradient boosting on engineered features; **walk-forward validation only** — no lookahead. **Known limitation (#25, 2026-07-17):** selection-time liquidity floor (trailing median 20-bar volume ≥ 100k shares) excludes thin names from prediction rankings AND from the benchmark's top-N selection, so reported precision matches the shipped product — but labels, training, and the AUC/brier/base-rate populations deliberately remain all-names, so trained base rates include moves the ranking will never surface |
 | Storage | DuckDB / parquet | Columnar, local, zero server; fits 3,000 tickers × years of daily bars |
 | Language/tooling | Python, `uv`, `pytest`, `ruff` | |
@@ -259,6 +259,51 @@ Import cycle broken by extracting `canonical.py` (research/generate keep
 `research.canonical_params` via re-export). This tier LOGS and SCORES only; it
 promotes nothing — that is #59 (forward shadow-gate), separately quant-skeptic-
 gated, and #60 (MC accounting) scales the band/window off `MAX_SHADOW`.
+
+## Reach-predictor pivot (decided 2026-07-25) — separate PREDICTION from TRADING
+
+Locked-in reframing (supersedes the original open-to-close target and the
+trading-P&L presentation). Two principles from the user:
+
+1. **This app is a PURE PREDICTOR.** Its only job: rank tickers by the
+   probability of REACHING ≥2% intraday, so the user can decide how to trade
+   them. It reports prediction QUALITY, never trading P&L.
+2. **Trading strategy is a SEPARATE application.** Limit-sell-at-2%, stop-loss,
+   trailing-stop, etc. are the user's decision and belong in a downstream app
+   that CONSUMES these rankings. The existing backtest/$-growth machinery is the
+   seed of that app; it is REMOVED from this one.
+
+Design (staged, each a reviewed PR; quant-skeptic mandatory on Stage A):
+
+- **Stage A — target redefinition.** The "+2% event" becomes `high ≥ open ×
+  (1 + threshold)` (open-to-high / intraday touch), replacing close-based
+  everywhere it defines the EVENT: the training label (`did_2pct_next` →
+  reached-2%), the scanner (`scan.daily_movers`), the base rate and hit/
+  precision (`track.py`, `backtest.py`), and the rolling-count feature
+  (`cnt_2pct_20d` → count of touch-days). Open-to-close return REMAINS as a
+  predictive FEATURE (momentum), just not the label. No lookahead: the label
+  uses only the target day's own `high`/`open`. **New data-quality surface:**
+  the label now depends on `high` — the field the OHLC-ordering gate (#64) and
+  completeness gate (#66) hardened, but a spurious high SPIKE (bad print, high
+  implausibly above open/close/prior-close with no corroboration) would FAKE a
+  touch. Stage A must add a high-spike guard (bound `(high−open)/open` sanity
+  vs the day's own range / prior close) — quant-skeptic sizes it so real
+  spikes are kept and glitches rejected.
+- **Stage B — remove the trading-P&L layer.** Delete `PickPerformance.growth`,
+  `sim_windows` growth, `backtest` sim_top1/top5 growth, the $-money tiles, and
+  the SIM/LIVE $-growth explorer. Lead with prediction quality: reach-rate
+  (precision), base rate, lift, per-day chart; the explorer becomes Top-N ×
+  window on reach-rate + lift, not dollars. (This subsumes the fee-removal
+  PR #68 — no growth number left to be gross or net.)
+- **Stage C — calibration as first-class.** The output is P(reach 2%) and the
+  user acts on the number, so it must be honest: add walk-forward calibration
+  (bucket predicted probs vs realized reach-frequency; reliability table +
+  a metric alongside the existing Brier). "40% must mean ~40%."
+
+Reinterpretation to expect: touching +2% is far more common than closing +2%,
+so the BASE RATE rises sharply and raw hit rate looks high — **lift and
+calibration become the honesty metrics**, not headline reach-rate. Threshold
+stays 2% (parameterizable later). Walk-forward preserved throughout.
 
 ## Status
 

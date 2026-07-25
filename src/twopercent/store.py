@@ -50,6 +50,38 @@ CREATE OR REPLACE VIEW daily_returns AS
       -- pass high >= open and leak an OHLC-impossible bar into oc_return.
       AND isfinite(high) AND isfinite(low)
       AND high >= open AND high >= close AND low <= open AND low <= close;
+-- Which trading days are COMPLETE (trustworthy to score/predict from) vs
+-- PROVISIONAL (an in-progress day whose pre-market/partial bar covers only a
+-- fraction of the universe). The ONE definition, reused by track.py scoring,
+-- base rates, and predict's default signal day. A date D is complete iff its
+-- valid-bar coverage is not materially short of the recent norm:
+--   count(valid bars on D) >= 0.9 * median(count over the 20 dates before D).
+-- The 0.9 / 20 literals below are the SQL copy of track.COMPLETENESS_MIN_FRACTION
+-- and track.COMPLETENESS_MEDIAN_WINDOW (that module is the source of truth; keep
+-- them in sync). Counts come from daily_returns (post-OHLC-gate valid bars — the
+-- rows that would actually score), never raw prices. The window is TRAILING ONLY
+-- (ROWS ... 20 PRECEDING AND 1 PRECEDING — strictly before D), so a date's
+-- verdict uses no future data and never changes when later dates arrive. A date
+-- with fewer than a full 20-date prior window (the earliest ones) can't be judged
+-- against a stable baseline and is treated complete (historical/backfilled
+-- anyway). bar_count/trailing_median are counts of non-null rows, always finite,
+-- so no isfinite() guard is needed; the 1e-9 slack keeps an exactly-0.9 boundary
+-- day complete despite FP (0.9 is not representable).
+CREATE OR REPLACE VIEW complete_trading_days AS
+    WITH daily_counts AS (
+        SELECT date, count(*) AS bar_count FROM daily_returns GROUP BY date
+    ),
+    windowed AS (
+        SELECT date, bar_count,
+               count(*) OVER w AS prior_days,
+               median(bar_count) OVER w AS trailing_median
+        FROM daily_counts
+        WINDOW w AS (ORDER BY date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING)
+    )
+    SELECT date, bar_count, prior_days, trailing_median
+    FROM windowed
+    WHERE prior_days < 20  -- no full prior window: can't judge, treat complete
+       OR bar_count >= 0.9 * trailing_median - 1e-9;
 CREATE SEQUENCE IF NOT EXISTS experiment_id_seq;
 CREATE TABLE IF NOT EXISTS experiments (
     id BIGINT PRIMARY KEY DEFAULT nextval('experiment_id_seq'),
@@ -237,6 +269,39 @@ def record_ingest_from(
 
 def price_row_count(con: duckdb.DuckDBPyConnection) -> int:
     return con.execute("SELECT count(*) FROM prices").fetchone()[0]
+
+
+def trading_day_coverage(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """Per-date valid-bar coverage, the trailing-median norm, and the complete
+    verdict — the diagnostic frame behind complete_trading_days, with the
+    INCOMPLETE dates retained and a `complete` flag, for callers that must WARN
+    about a held-back day (predict, routine).
+
+    Columns: date, bar_count (valid rows in daily_returns), prior_days,
+    trailing_median, complete. bar_count/trailing_median are recomputed here for
+    display only; the `complete` flag is derived by joining the view, so the
+    0.9/20 THRESHOLD lives in exactly one place (the view, #65) and this helper
+    can never disagree with the gate the scoring queries use.
+    """
+    return con.execute(
+        """
+        WITH daily_counts AS (
+            SELECT date, count(*) AS bar_count FROM daily_returns GROUP BY date
+        ),
+        windowed AS (
+            SELECT date, bar_count,
+                   count(*) OVER w AS prior_days,
+                   median(bar_count) OVER w AS trailing_median
+            FROM daily_counts
+            WINDOW w AS (ORDER BY date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING)
+        )
+        SELECT w.date, w.bar_count, w.prior_days, w.trailing_median,
+               (c.date IS NOT NULL) AS complete
+        FROM windowed w
+        LEFT JOIN complete_trading_days c ON c.date = w.date
+        ORDER BY w.date
+        """
+    ).df()
 
 
 def save_predictions(

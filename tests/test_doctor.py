@@ -316,7 +316,7 @@ def test_clean_store_passes_every_check(clean):
     assert doctor.price_symbols_without_meta(clean) == []
     text = "\n".join(doctor.format_report(report))
     assert "[FAIL]" not in text
-    assert text.count("[ OK ]") == 5
+    assert text.count("[ OK ]") == 6
 
 
 def test_missing_universe_warns_but_does_not_fail(con):

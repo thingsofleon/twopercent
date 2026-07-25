@@ -35,7 +35,8 @@ exception (exit 0 clean / 1 ran-with-warnings / 2 failed-or-degraded):
 
 - **predict mode** (default, pre-open): market-hours guard → doctor baseline →
   universe refresh (if stale) → tail ingest → freshness + corruption gates →
-  champion predict (logged) → dashboard → track-record scoring → signal email
+  completeness note → champion predict (logged) → dashboard → track-record
+  scoring → signal email
   (skipped loudly when unconfigured — see "Daily signal email").
 - **score mode** (post-close): refuses before 16:15 ET on weekdays; weekends
   may run — scoring time never affects the live/late flag, which depends only
@@ -43,9 +44,25 @@ exception (exit 0 clean / 1 ran-with-warnings / 2 failed-or-degraded):
   open (a Friday-created prediction scored on Saturday is still live; an
   after-open backfill is late no matter when it gets scored). Then: doctor
   baseline → tail ingest of today's final bars → freshness + corruption
-  gates → score pending predictions → **degradation detector** → dashboard
-  refresh. Score mode never writes to the predictions log and never
+  gates → completeness note → score pending predictions → **degradation
+  detector** → dashboard refresh. Score mode never writes to the predictions
+  log and never
   refreshes the universe.
+
+**Complete trading days (data invariant):** scoring and prediction never touch
+an INCOMPLETE (provisional, in-progress) day. Every predict/score run ingests a
+partial pre-market bar for today covering only a fraction of the universe (e.g.
+2026-07-24 held 2,438 of ~3,035 symbols); resolving a prediction's target onto
+that day, or forecasting from it, would count/forecast a day that has not
+finished trading. A date is COMPLETE iff its valid-bar coverage is at least 90%
+of the median coverage over the 20 trading days *strictly before* it
+(trailing-only window → no lookahead; a later day never changes an earlier day's
+verdict). The single definition lives in the `complete_trading_days` view
+(store.py) and gates target resolution, base rates, and predict's default signal
+day. A held-back edge day is expected pre-close (not a failure): the routine's
+`completeness` step and the doctor's `incomplete` check WARN loudly, the
+prediction is forecast from the latest complete day, and the day shows "Awaiting
+outcomes" until it completes.
 
 **Degradation detector:** over scored days with `late == false` (ordered by
 target date), once ≥5 such live days exist, the model is DEGRADED when the

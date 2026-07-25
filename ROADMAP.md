@@ -316,5 +316,20 @@ truth for *decisions and plan shape*; GitHub is the source of truth for
   and dropped loudly at ingest, joining the open<=0 gate. Non-destructive
   (the 123 store-wide offenders stay in `prices`); #31's scale-break refetch
   (stale pre-split history) remains open.
+  Shipped (#65): trading-day COMPLETENESS/FINALITY gate. The predict run's
+  provisional pre-market bar (2026-07-24: 2,438 of ~3,035 symbols) was being
+  scored as a finished day — the money tiles, degradation detector, and emailed
+  dashboard counted a day still trading, and predict's default signal day would
+  forecast FROM it. A date is now COMPLETE iff its valid-bar coverage is ≥ 90%
+  of the median over the 20 dates strictly before it (trailing-only window → no
+  lookahead). One definition — the `complete_trading_days` view — gates target
+  resolution in `score_predictions`/`daily_pick_performance`/`daily_rank_outcomes`
+  (an unresolvable incomplete target stays PENDING, "Awaiting outcomes"),
+  `daily_base_rates` (incomplete dates return ABSENT), and `predict_for`'s default
+  signal day (falls back to the latest complete day, WARNs). A doctor `incomplete`
+  check reads RAW `prices` counts, and the routine's `completeness` step WARNs
+  (non-fatal) when an edge day is held. No-op on complete data (coverage = symbol
+  count, so a low-volume/holiday day is unaffected). On the live store today the
+  gate holds exactly 2026-07-24 (ratio 0.765), all prior days complete.
   Exit criterion: a real degradation → investigation cycle observed, or at
   minimum both timers proven live — NOT complete yet.

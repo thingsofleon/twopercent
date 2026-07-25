@@ -16,6 +16,20 @@ from twopercent.scan import _THRESHOLD_EPSILON, DEFAULT_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
+# Completeness gate (issue #65): a trading day is COMPLETE (trustworthy to score
+# or predict from) iff its valid-bar coverage is not materially short of the
+# recent norm — count(valid bars on D) >= COMPLETENESS_MIN_FRACTION * median(count
+# over the COMPLETENESS_MEDIAN_WINDOW dates STRICTLY BEFORE D). This module is the
+# SOURCE OF TRUTH for these constants; the store.complete_trading_days view (which
+# the scoring queries below and daily_base_rates SELECT from) hardcodes the same
+# 0.9 / 20 with a comment pointing back here. Never score or predict from an
+# incomplete day: an in-progress day carries only a provisional pre-market/partial
+# bar covering a fraction of the universe, and scoring it counts a day that has
+# not finished trading. The window is trailing-only, so the verdict never uses
+# future data (a later date can never change an earlier date's verdict).
+COMPLETENESS_MIN_FRACTION = 0.9
+COMPLETENESS_MEDIAN_WINDOW = 20
+
 # Assumed round-trip trading cost (entry + exit) per daily position, applied
 # to every simulated day. 30 bps is a deliberate, documented GUESS pitched for
 # liquid-ish small caps at open/close; real spreads on thin names can be far
@@ -138,11 +152,15 @@ def sim_windows(daily: pd.DataFrame, n: int) -> SimWindows:
 
 
 def daily_base_rates(con: duckdb.DuckDBPyConnection, dates: list[dt.date]) -> dict[dt.date, float]:
-    """Share of ALL stored names doing >= 2% open-to-close on each date.
+    """Share of ALL stored names doing >= 2% open-to-close on each COMPLETE date.
 
     The epsilon-guarded threshold, same as the scoring queries. Dates missing
     from daily_returns are absent from the result — the caller must render
-    that as unknown, never as zero."""
+    that as unknown, never as zero. INCOMPLETE dates (a provisional in-progress
+    day, per store.complete_trading_days) are likewise absent: their base rate
+    is computed over a fraction of the universe and is unreliable, so it is
+    returned as unknown, never as a number — consistent with the scoring queries
+    refusing to resolve targets onto those days."""
     if not dates:
         return {}
     threshold = DEFAULT_THRESHOLD - _THRESHOLD_EPSILON
@@ -150,10 +168,11 @@ def daily_base_rates(con: duckdb.DuckDBPyConnection, dates: list[dt.date]) -> di
     con.register("base_dates_in", frame)
     rows = con.execute(
         """
-        SELECT date, avg(CASE WHEN oc_return >= ? THEN 1.0 ELSE 0.0 END)
-        FROM daily_returns
-        WHERE date IN (SELECT CAST(date AS DATE) FROM base_dates_in)
-        GROUP BY date
+        SELECT dr.date, avg(CASE WHEN dr.oc_return >= ? THEN 1.0 ELSE 0.0 END)
+        FROM daily_returns dr
+        JOIN complete_trading_days c ON c.date = dr.date
+        WHERE dr.date IN (SELECT CAST(date AS DATE) FROM base_dates_in)
+        GROUP BY dr.date
         """,
         [threshold],
     ).fetchall()
@@ -170,13 +189,18 @@ def _created_by_target(
     'shadow_predictions'/'challenger'), never user input — no injection surface.
     When multiple signal dates resolve to ONE target date (missing intermediate
     bars), the day takes the max created_ts across all of them: any-late means
-    late, so a half-backfilled day can never pass as live."""
+    late, so a half-backfilled day can never pass as live.
+
+    Target resolution uses complete_trading_days (NOT raw daily_returns), so the
+    late-flag lookup keys on the SAME target date the scoring queries resolve —
+    otherwise a live day whose next bar is provisional would resolve to a later
+    complete day here and get a None (→ wrongly late) created_ts."""
     return dict(
         con.execute(
             f"SELECT target_date, max(created_ts) FROM ("
             f"  SELECT min(d.date) AS target_date, max(pr.created_ts) AS created_ts"
             f"  FROM {table} pr"
-            f"  JOIN (SELECT DISTINCT date FROM daily_returns) d ON d.date > pr.signal_date"
+            f"  JOIN complete_trading_days d ON d.date > pr.signal_date"
             f"  WHERE pr.{id_col} = ? GROUP BY pr.signal_date"
             f") GROUP BY target_date",
             [id_val],
@@ -235,7 +259,7 @@ def daily_rank_outcomes(
     threshold = DEFAULT_THRESHOLD - _THRESHOLD_EPSILON
     frame = con.execute(
         """
-        WITH days AS (SELECT DISTINCT date FROM daily_returns),
+        WITH days AS (SELECT date FROM complete_trading_days),  -- gate: complete days only (#65)
         resolved AS (
             SELECT p.signal_date, min(d.date) AS target_date
             FROM (SELECT DISTINCT signal_date FROM predictions WHERE strategy = ?) p
@@ -278,7 +302,7 @@ def daily_pick_performance(
     threshold = DEFAULT_THRESHOLD - _THRESHOLD_EPSILON
     daily = con.execute(
         """
-        WITH days AS (SELECT DISTINCT date FROM daily_returns),
+        WITH days AS (SELECT date FROM complete_trading_days),  -- gate: complete days only (#65)
         resolved AS (
             SELECT p.signal_date, min(d.date) AS target_date
             FROM (SELECT DISTINCT signal_date FROM predictions WHERE strategy = ?) p
@@ -461,7 +485,7 @@ def _score_table(
     threshold = DEFAULT_THRESHOLD - _THRESHOLD_EPSILON
     scored = con.execute(
         f"""
-        WITH days AS (SELECT DISTINCT date FROM daily_returns),
+        WITH days AS (SELECT date FROM complete_trading_days),  -- gate: complete days only (#65)
         pred_days AS (
             SELECT DISTINCT signal_date FROM {table} WHERE {id_col} = ?
         ),
@@ -506,9 +530,12 @@ def score_predictions(
 ) -> TrackRecord:
     """Per-day outcome of the top-N logged predictions.
 
-    The target day is the first trading date in the store after each
-    signal_date. Days whose target isn't ingested yet are returned in
-    `pending`, never silently dropped.
+    The target day is the first COMPLETE trading date in the store after each
+    signal_date (store.complete_trading_days — a provisional in-progress day is
+    NOT a resolvable target, #65). Days whose target isn't a complete trading
+    day yet are returned in `pending`, never silently dropped — exactly like a
+    signal date with no next day ingested at all: the dashboard shows "Awaiting
+    outcomes", never a row scored against a partial pre-market bar.
     """
     return _score_table(
         con,

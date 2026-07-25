@@ -37,13 +37,23 @@ def screener_rows():
 
 
 def seed_history(
-    con, oc_returns: dict[str, list[float]], start="2026-01-05", vary_volume: bool = False
+    con,
+    oc_returns: dict[str, list[float]],
+    start="2026-01-05",
+    vary_volume: bool = False,
+    high_returns: dict[str, list[float]] | None = None,
 ) -> pd.DataFrame:
     """Seed prices for symbols with exact open-to-close returns per business day.
 
     open is always 100.0, so close = 100 * (1 + oc). vary_volume avoids
     constant feature columns (sklearn's binner rejects single-valued columns).
-    """
+
+    By default high sits 0.1% above max(open, close), so the intraday REACH
+    (open-to-high) barely exceeds the close — a close-based and touch-based event
+    coincide. Pass `high_returns[symbol]` (per-day (high-open)/open) to seed bars
+    that TOUCH +2% intraday while closing below it — the Stage-A case that
+    separates the touch label from the old close label. Highs are clamped to keep
+    OHLC valid (high >= max(open, close))."""
     from twopercent import store
 
     frames = []
@@ -52,6 +62,11 @@ def seed_history(
         dates = pd.bdate_range(start, periods=n)
         opens = np.full(n, 100.0)
         closes = opens * (1 + np.asarray(ocs))
+        if high_returns is not None and symbol in high_returns:
+            seeded_high = opens * (1 + np.asarray(high_returns[symbol]))
+            highs = np.maximum(seeded_high, np.maximum(opens, closes))
+        else:
+            highs = np.maximum(opens, closes) * 1.001
         volume = 1_000_000 + (np.arange(n) % 17) * 1_000 if vary_volume else 1_000_000
         frames.append(
             pd.DataFrame(
@@ -59,7 +74,7 @@ def seed_history(
                     "symbol": symbol,
                     "date": dates.date,
                     "open": opens,
-                    "high": np.maximum(opens, closes) * 1.001,
+                    "high": highs,
                     "low": np.minimum(opens, closes) * 0.999,
                     "close": closes,
                     "adj_close": closes,

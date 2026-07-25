@@ -11,6 +11,7 @@ import pandas as pd
 
 from twopercent import scan
 from twopercent.ingest import _SPLIT_EPSILON, SPLIT_ARTIFACT_OC, SPLIT_ARTIFACT_SCALE
+from twopercent.store import _HIGH_GLITCH_MULTIPLE, _HIGH_GLITCH_VOL_WINDOW
 from twopercent.track import (
     COMPLETENESS_MEDIAN_WINDOW,
     COMPLETENESS_MIN_FRACTION,
@@ -101,6 +102,50 @@ def invalid_bars(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
            OR high < open OR high < close OR low > open OR low > close
         GROUP BY symbol
         ORDER BY invalid DESC, symbol
+        """
+    ).df()
+
+
+def glitch_bars(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """Bars flagged high_glitch_suspect (M2): a touch decided by an implausible
+    high SPIKE, not a real move.
+
+    Mirrors the store.daily_returns guard exactly — an isolated high
+    (>= _HIGH_GLITCH_MULTIPLE × max(open, close, prior close)) that the close did
+    NOT confirm (oc_return < threshold) and that volume did not corroborate (below
+    the trailing-_HIGH_GLITCH_VOL_WINDOW PRIOR average) — but reads RAW `prices`,
+    per the "diagnostics read raw tables, never filtered views" rule: the doctor
+    must SEE these bars to size the guard, not view them through the very filter
+    that hides them. Every float compare is isfinite-guarded (DuckDB total
+    ordering: NaN >= x is TRUE), and prev_close/volume use same-bar + PRIOR data
+    only (no lookahead — this is the label's guard). Worst (largest fake reach)
+    first. Real high-volume squeezes are absent by construction (they fail the
+    below-average-volume clause) — that is the point (quant-skeptic M2).
+    """
+    return con.execute(
+        f"""
+        WITH seq AS (
+            SELECT symbol, date, open, high, low, close, volume,
+                   LAG(close) OVER w AS prev_close,
+                   avg(volume) OVER wv AS trailing_avg_vol
+            FROM prices
+            WINDOW
+                w AS (PARTITION BY symbol ORDER BY date),
+                wv AS (PARTITION BY symbol ORDER BY date
+                       ROWS BETWEEN {_HIGH_GLITCH_VOL_WINDOW} PRECEDING AND 1 PRECEDING)
+        )
+        SELECT symbol, date,
+               (high - open) / open AS high_return,
+               (close - open) / open AS oc_return,
+               volume, trailing_avg_vol
+        FROM seq
+        WHERE open > 0 AND isfinite(open) AND isfinite(close) AND isfinite(high)
+          AND (high - open) / open >= {scan.DEFAULT_THRESHOLD}
+          AND (close - open) / open < {scan.DEFAULT_THRESHOLD}
+          AND high >= {_HIGH_GLITCH_MULTIPLE} * greatest(open, close, coalesce(prev_close, 0))
+          AND trailing_avg_vol IS NOT NULL AND isfinite(trailing_avg_vol)
+          AND volume < trailing_avg_vol
+        ORDER BY high_return DESC, symbol, date
         """
     ).df()
 
@@ -312,6 +357,7 @@ class DoctorReport:
     extreme: pd.DataFrame
     zero_runs: pd.DataFrame
     invalid: pd.DataFrame
+    glitch: pd.DataFrame
     incomplete: pd.DataFrame
     universe_missing_prices: list[str]
     prices_missing_meta: list[str]
@@ -324,6 +370,7 @@ class DoctorReport:
             + len(self.extreme)
             + len(self.zero_runs)
             + len(self.invalid)
+            + len(self.glitch)
             + len(self.incomplete)
             + len(self.universe_missing_prices)
             + len(self.prices_missing_meta)
@@ -346,6 +393,7 @@ def run(con: duckdb.DuckDBPyConnection, stale_days: int = DEFAULT_STALE_DAYS) ->
         extreme=extreme_bars(con),
         zero_runs=zero_volume_runs(con),
         invalid=invalid_bars(con),
+        glitch=glitch_bars(con),
         incomplete=incomplete_days(con),
         universe_missing_prices=universe_symbols_without_prices(con),
         prices_missing_meta=price_symbols_without_meta(con),
@@ -416,6 +464,19 @@ def format_report(report: DoctorReport, examples: int = 10) -> list[str]:
             f"{row.first_invalid:%Y-%m-%d} and {row.last_invalid:%Y-%m-%d}"
         )
     _overflow(lines, len(report.invalid), examples)
+
+    lines.append(
+        f"{_mark(len(report.glitch))} high-spike glitches: {len(report.glitch)} bar(s) "
+        f"reaching +{scan.DEFAULT_THRESHOLD:.0%} on an isolated, close-unconfirmed, "
+        f"below-average-volume high (excluded from the touch event, not from prices)"
+    )
+    for row in report.glitch.head(examples).itertuples():
+        lines.append(
+            f"    {row.symbol:<8} {pd.Timestamp(row.date):%Y-%m-%d} "
+            f"high +{row.high_return:.1%} (close {row.oc_return:+.1%}), "
+            f"vol {int(row.volume):,} vs trailing avg {float(row.trailing_avg_vol):,.0f}"
+        )
+    _overflow(lines, len(report.glitch), examples)
 
     lines.append(
         f"{_mark(len(report.incomplete))} incomplete: {len(report.incomplete)} trading "

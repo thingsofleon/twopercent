@@ -299,88 +299,129 @@ def test_pick_performance_excludes_ohlc_corrupt_rank1_and_substitutes(con, caplo
 # --- degradation detector -----------------------------------------------------
 
 
-def _scored_frame(lifts, late=None, start="2026-06-01"):
-    """Craft a score_predictions-shaped frame with the given lifts, in
-    target_date order (NaN lift = zero-base-rate day)."""
-    n = len(lifts)
+def _scored_frame(days, late=None, start="2026-06-01"):
+    """score_predictions-shaped frame from per-day (hits, n_scored, base_rate)
+    tuples, in target_date order.
+
+    precision = hits/n_scored and lift = precision/base_rate are DERIVED so the
+    frame is internally consistent — the recalibrated detector pools hits/
+    n_scored/base_rate, and lift only gates null-day exclusion and the
+    days-below-base disclosure. base_rate 0 → NaN lift (zero-base-rate day)."""
+    n = len(days)
     dates = pd.bdate_range(start, periods=n)
+    hits = [float(h) for h, _, _ in days]
+    n_scored = [float(s) for _, s, _ in days]
+    base = [float(b) for _, _, b in days]
+    precision = [h / s if s else float("nan") for h, s in zip(hits, n_scored, strict=True)]
+    lift = [p / b if b > 0 else float("nan") for p, b in zip(precision, base, strict=True)]
     return pd.DataFrame(
         {
             "signal_date": dates - pd.tseries.offsets.BDay(1),
             "target_date": dates,
-            "hits": [1] * n,
-            "n_scored": [20] * n,
-            "precision": [0.05] * n,
-            "base_rate": [0.10] * n,
-            "lift": lifts,
+            "hits": hits,
+            "n_scored": n_scored,
+            "precision": precision,
+            "base_rate": base,
+            "lift": lift,
             "late": [False] * n if late is None else late,
         }
     )
 
 
 def test_detector_fires_at_exactly_five_live_days():
-    verdict = track.degradation_verdict(_scored_frame([0.99] * 5))
+    # 5 live days pooling precision 0.05 (1/20) vs base rate 0.10 → excess -0.05.
+    verdict = track.degradation_verdict(_scored_frame([(1, 20, 0.10)] * 5))
     assert verdict.degraded and verdict.armed
     assert verdict.live_days == 5
-    assert abs(verdict.trailing_mean_lift - 0.99) < 1e-12
+    assert abs(verdict.pooled_precision - 0.05) < 1e-12
+    assert abs(verdict.pooled_base_rate - 0.10) < 1e-12
+    assert abs(verdict.pooled_excess_precision - (-0.05)) < 1e-12
     assert "DEGRADED" in verdict.detail
 
 
 def test_detector_epsilon_boundary_adversarial():
-    # Comparison rule (track._LIFT_DEGRADE_EPSILON): DEGRADED iff
-    # mean lift < 1.0 - 1e-9. A mean 1e-7 below 1.0 fires (far outside FP
-    # noise); a mean above never does; exactly 1.0 or within epsilon below
-    # resolves to NOT degraded — the detector never fires on rounding error.
-    assert track.degradation_verdict(_scored_frame([0.9999999] * 5)).degraded
-    assert not track.degradation_verdict(_scored_frame([1.0000001] * 5)).degraded
-    assert not track.degradation_verdict(_scored_frame([1.0] * 5)).degraded
-    assert not track.degradation_verdict(_scored_frame([1.0 - 1e-12] * 5)).degraded
-    # Pin the guard band itself: 2e-9 below 1.0 is strictly outside the 1e-9
-    # epsilon and fires; 0.5e-9 below is inside the band and must not.
-    assert track.degradation_verdict(_scored_frame([1.0 - 2e-9] * 5)).degraded
-    assert not track.degradation_verdict(_scored_frame([1.0 - 0.5e-9] * 5)).degraded
+    # Comparison rule (track._EXCESS_DEGRADE_EPSILON): DEGRADED iff pooled excess
+    # precision < 0 - 1e-9. Pooled precision here is 1/4 = 0.25 (exactly
+    # representable); the base rate is nudged around it so the excess lands on
+    # the guard band. Outside the band fires; inside/at/above never does — the
+    # detector never fires on rounding error.
+    assert track.degradation_verdict(_scored_frame([(1, 4, 0.25 + 1e-7)] * 5)).degraded
+    assert not track.degradation_verdict(_scored_frame([(1, 4, 0.25 - 1e-7)] * 5)).degraded
+    assert not track.degradation_verdict(_scored_frame([(1, 4, 0.25)] * 5)).degraded
+    assert not track.degradation_verdict(_scored_frame([(1, 4, 0.25 - 1e-12)] * 5)).degraded
+    # Pin the guard band itself: excess 2e-9 below 0 is strictly outside the
+    # 1e-9 epsilon and fires; 0.5e-9 below is inside the band and must not.
+    assert track.degradation_verdict(_scored_frame([(1, 4, 0.25 + 2e-9)] * 5)).degraded
+    assert not track.degradation_verdict(_scored_frame([(1, 4, 0.25 + 0.5e-9)] * 5)).degraded
+
+
+def test_detector_high_base_rate_streak_does_not_false_fire():
+    # M3: the OLD mean-of-daily-lift-RATIOS rule false-fired on a hot
+    # high-base-rate streak. Two low-base days the model narrowly missed (lift
+    # 0.8) plus three high-base days it beat (lift ~1.09): the mean of ratios is
+    # < 1.0, yet in POOLED absolute terms the picks beat the base rate (0.604 vs
+    # 0.56). The recalibrated detector must NOT fire.
+    days = [(4, 100, 0.05)] * 2 + [(98, 100, 0.90)] * 3
+    frame = _scored_frame(days)
+    old_mean_lift = float(frame["lift"].mean())
+    assert old_mean_lift < 1.0  # the old rule would have tripped
+    verdict = track.degradation_verdict(frame)
+    assert not verdict.degraded and verdict.armed
+    assert verdict.pooled_excess_precision > 0
+    assert abs(verdict.pooled_precision - 0.604) < 1e-9
+    assert abs(verdict.pooled_base_rate - 0.56) < 1e-9
+
+
+def test_detector_fires_when_picks_stop_beating_base_rate():
+    # M3 flip side: when the picks genuinely stop beating the base rate — pooled
+    # precision 0.02 under a 0.30 base rate every day — the detector DOES fire.
+    verdict = track.degradation_verdict(_scored_frame([(2, 100, 0.30)] * 5))
+    assert verdict.degraded and verdict.armed
+    assert verdict.pooled_excess_precision < 0
 
 
 def test_detector_not_armed_below_five_live_days():
-    verdict = track.degradation_verdict(_scored_frame([0.5] * 4))
+    verdict = track.degradation_verdict(_scored_frame([(1, 20, 0.30)] * 4))
     assert not verdict.degraded and not verdict.armed
     assert verdict.live_days == 4
-    assert verdict.trailing_mean_lift is None
+    assert verdict.pooled_excess_precision is None
+    assert verdict.pooled_precision is None and verdict.pooled_base_rate is None
     assert "armed after 1 more live day" in verdict.detail  # loud, never silent
 
 
 def test_detector_excludes_late_days_from_window():
-    # 5 awful live days then 3 stellar LATE days (most recent) — a backfill
-    # with known outcomes must never mask a live degradation.
+    # 5 awful live days (precision 0.05 vs base 0.20) then 3 stellar LATE days
+    # (most recent) — a backfill with known outcomes must never mask a live
+    # degradation.
     verdict = track.degradation_verdict(
-        _scored_frame([0.5] * 5 + [5.0] * 3, late=[False] * 5 + [True] * 3)
+        _scored_frame([(1, 20, 0.20)] * 5 + [(19, 20, 0.20)] * 3, late=[False] * 5 + [True] * 3)
     )
     assert verdict.degraded and verdict.live_days == 5
 
     # And late days never count TOWARD arming either: 3 live + 4 late = unarmed.
     verdict = track.degradation_verdict(
         _scored_frame(
-            [0.5, 5.0, 0.5, 5.0, 0.5, 5.0, 5.0],
+            [(1, 20, 0.20), (19, 20, 0.20)] * 3 + [(19, 20, 0.20)],
             late=[False, True, False, True, False, True, True],
         )
     )
     assert not verdict.armed and verdict.live_days == 3
 
 
-def test_detector_discloses_days_below_one_when_mean_survives():
-    # False-negative mode of the mean: one lucky low-base-rate spike day
-    # (lift 5.0) carries four zero days to a mean of exactly 1.0. The locked
-    # trigger stays quiet — but the per-day count must not let it hide.
-    verdict = track.degradation_verdict(_scored_frame([0.0, 0.0, 0.0, 0.0, 5.0]))
+def test_detector_discloses_days_below_base_when_pool_survives():
+    # False-negative mode of pooling: four zero-hit days plus one big day
+    # (60/100 at a 0.10 base) leave pooled precision 0.12 > base 0.10, so the
+    # trigger stays quiet — but the per-day below-base count must not hide.
+    verdict = track.degradation_verdict(_scored_frame([(0, 100, 0.10)] * 4 + [(60, 100, 0.10)]))
     assert not verdict.degraded and verdict.armed
     assert verdict.days_below_1 == 4
-    assert "4 of 5 window day(s) below 1.0" in verdict.detail
+    assert "4 of 5 window day(s) below the base rate" in verdict.detail
 
 
 def test_detector_excludes_null_lift_days_with_warning(caplog):
     # Most recent live day has NULL lift (zero base rate): excluded loudly,
-    # the window falls back to the 5 defined-lift days.
-    frame = _scored_frame([0.5] * 5 + [float("nan")])
+    # the window falls back to the 5 defined-lift days (each 0.05 vs 0.10).
+    frame = _scored_frame([(1, 20, 0.10)] * 5 + [(0, 20, 0.0)])
     with caplog.at_level(logging.WARNING, logger="twopercent.track"):
         verdict = track.degradation_verdict(frame)
     assert verdict.degraded and verdict.live_days == 5

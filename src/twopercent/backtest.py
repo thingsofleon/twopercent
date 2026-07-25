@@ -16,7 +16,7 @@ import duckdb
 import pandas as pd
 from sklearn.metrics import brier_score_loss, roc_auc_score
 
-from twopercent import store, strategies, track
+from twopercent import scan, store, strategies, track
 from twopercent.features import feature_frame
 from twopercent.predict import LIQUIDITY_MIN_MEDIAN_VOLUME
 
@@ -49,11 +49,16 @@ def latest_standard_experiment(
     benchmark (pre-research rows lack the key entirely; that counts as
     default-config). Shared reader: research's champion reference and the
     signal email both quote exactly this row.
+
+    Touch era ONLY (M1): filters event = TOUCH_EVENT, so a close-era archive row
+    is never quoted, compared, or promoted against a touch challenger. Returns
+    None until a champion re-benchmark under touch is recorded (required
+    post-merge step) — callers degrade gracefully rather than fall back to close.
     """
     rows = con.execute(
-        "SELECT id, params, metrics, test_start, test_end FROM experiments WHERE strategy = ? "
-        "ORDER BY run_ts DESC, id DESC",
-        [strategy],
+        "SELECT id, params, metrics, test_start, test_end FROM experiments "
+        "WHERE strategy = ? AND event = ? ORDER BY run_ts DESC, id DESC",
+        [strategy, scan.TOUCH_EVENT],
     ).fetchall()
     for exp_id, params_json, metrics_json, test_start, test_end in rows:
         try:
@@ -247,6 +252,7 @@ def run_benchmark(
                 test_start=first_run_start,
                 test_end=folds[-1][1],
                 metrics=metrics,
+                event=scan.TOUCH_EVENT,
             )
             # Per-day per-rank pick outcomes land in experiment_daily (dashboard
             # SIM panel), never in the metrics JSON above.

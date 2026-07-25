@@ -53,7 +53,7 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 
-from twopercent import backtest, champion, generate, issues, store
+from twopercent import backtest, champion, generate, issues, scan, store
 from twopercent.canonical import _canonical, canonical_params  # noqa: F401  (re-export)
 from twopercent.compare import compare_verdict, lift_winner
 from twopercent.routine import _RANK, FAIL, OK, WARN, Step, _market_is_open
@@ -222,9 +222,15 @@ def load_queue(path: Path | str = QUEUE_PATH) -> tuple[list[QueueEntry] | None, 
 def recorded_configs(con: duckdb.DuckDBPyConnection) -> set[tuple[str, str]]:
     """(strategy, canonical strategy_params JSON) for every recorded STANDARD
     benchmark — the queue's done-ledger. Non-standard runs (other months/top_n)
-    never satisfy a queue config."""
+    never satisfy a queue config.
+
+    Touch era ONLY (M1): filters event = TOUCH_EVENT, so a config recorded only in
+    the close era is NOT counted done and IS re-run under touch — the forced
+    champion/queue re-benchmark after the cutover."""
     keys: set[tuple[str, str]] = set()
-    for strategy, params_json in con.execute("SELECT strategy, params FROM experiments").fetchall():
+    for strategy, params_json in con.execute(
+        "SELECT strategy, params FROM experiments WHERE event = ?", [scan.TOUCH_EVENT]
+    ).fetchall():
         try:
             params = json.loads(params_json) if params_json else {}
         except json.JSONDecodeError:

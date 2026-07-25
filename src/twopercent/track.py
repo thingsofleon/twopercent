@@ -11,8 +11,8 @@ import duckdb
 import numpy as np
 import pandas as pd
 
-from twopercent import store
-from twopercent.scan import _THRESHOLD_EPSILON, DEFAULT_THRESHOLD
+from twopercent import scan, store
+from twopercent.scan import _THRESHOLD_EPSILON, DEFAULT_THRESHOLD, touch_event_predicate
 
 logger = logging.getLogger(__name__)
 
@@ -162,10 +162,13 @@ def sim_windows(daily: pd.DataFrame, n: int) -> SimWindows:
 
 
 def daily_base_rates(con: duckdb.DuckDBPyConnection, dates: list[dt.date]) -> dict[dt.date, float]:
-    """Share of ALL stored names doing >= 2% open-to-close on each COMPLETE date.
+    """Share of ALL stored names REACHING >= 2% intraday (touch) on each COMPLETE date.
 
-    The epsilon-guarded threshold, same as the scoring queries. Dates missing
-    from daily_returns are absent from the result — the caller must render
+    The touch event (scan.touch_event_predicate), epsilon-guarded, same as the
+    scoring queries — so the base rate the lift divides by means the same thing
+    the picks are scored against. Touching +2% is far more common than closing
+    +2%, so this base rate is markedly higher than the close-era one (M1). Dates
+    missing from daily_returns are absent from the result — the caller must render
     that as unknown, never as zero. INCOMPLETE dates (a provisional in-progress
     day, per store.complete_trading_days) are likewise absent: their base rate
     is computed over a fraction of the universe and is unreliable, so it is
@@ -177,8 +180,10 @@ def daily_base_rates(con: duckdb.DuckDBPyConnection, dates: list[dt.date]) -> di
     frame = pd.DataFrame({"date": pd.to_datetime(sorted(set(dates)))})
     con.register("base_dates_in", frame)
     rows = con.execute(
-        """
-        SELECT dr.date, avg(CASE WHEN dr.oc_return >= ? THEN 1.0 ELSE 0.0 END)
+        f"""
+        SELECT dr.date,
+               avg(CASE WHEN {touch_event_predicate("dr.high_return", "dr.high_glitch_suspect")}
+                        THEN 1.0 ELSE 0.0 END)
         FROM daily_returns dr
         JOIN complete_trading_days c ON c.date = dr.date
         WHERE dr.date IN (SELECT CAST(date AS DATE) FROM base_dates_in)
@@ -204,14 +209,18 @@ def _created_by_target(
     Target resolution uses complete_trading_days (NOT raw daily_returns), so the
     late-flag lookup keys on the SAME target date the scoring queries resolve —
     otherwise a live day whose next bar is provisional would resolve to a later
-    complete day here and get a None (→ wrongly late) created_ts."""
+    complete day here and get a None (→ wrongly late) created_ts.
+
+    Touch era ONLY (M1): filters event = TOUCH_EVENT so a pre-cutover (NULL-event)
+    prediction resolving to the same target date can never bleed its created_ts
+    into the touch record's late flags."""
     return dict(
         con.execute(
             f"SELECT target_date, max(created_ts) FROM ("
             f"  SELECT min(d.date) AS target_date, max(pr.created_ts) AS created_ts"
             f"  FROM {table} pr"
             f"  JOIN complete_trading_days d ON d.date > pr.signal_date"
-            f"  WHERE pr.{id_col} = ? GROUP BY pr.signal_date"
+            f"  WHERE pr.{id_col} = ? AND pr.event = '{scan.TOUCH_EVENT}' GROUP BY pr.signal_date"
             f") GROUP BY target_date",
             [id_val],
         ).fetchall()
@@ -265,22 +274,28 @@ def daily_rank_outcomes(
     rule — a missing rank 1 makes rank 2 the traded top pick.
 
     Columns: target_date, rank, oc_return, hit, late (the whole day's
-    predictions created at/after that day's 09:30 ET open)."""
+    predictions created at/after that day's 09:30 ET open). hit is the touch
+    event; oc_return is kept as the (open-to-close) return magnitude. Touch era
+    only (event = TOUCH_EVENT): pre-cutover predictions are archived out (M1)."""
     threshold = DEFAULT_THRESHOLD - _THRESHOLD_EPSILON
     frame = con.execute(
-        """
+        f"""
         WITH days AS (SELECT date FROM complete_trading_days),  -- gate: complete days only (#65)
         resolved AS (
             SELECT p.signal_date, min(d.date) AS target_date
-            FROM (SELECT DISTINCT signal_date FROM predictions WHERE strategy = ?) p
+            FROM (
+                SELECT DISTINCT signal_date FROM predictions
+                WHERE strategy = ? AND event = '{scan.TOUCH_EVENT}'
+            ) p
             JOIN days d ON d.date > p.signal_date GROUP BY p.signal_date
         )
         SELECT r.target_date, pr.rank, dr.oc_return,
-               CASE WHEN dr.oc_return >= ? THEN 1 ELSE 0 END AS hit
+               CASE WHEN {touch_event_predicate("dr.high_return", "dr.high_glitch_suspect")}
+                    THEN 1 ELSE 0 END AS hit
         FROM predictions pr
         JOIN resolved r ON pr.signal_date = r.signal_date
         JOIN daily_returns dr ON dr.symbol = pr.symbol AND dr.date = r.target_date
-        WHERE pr.strategy = ? AND pr.rank <= ?
+        WHERE pr.strategy = ? AND pr.rank <= ? AND pr.event = '{scan.TOUCH_EVENT}'
         ORDER BY r.target_date, pr.rank
         """,
         [strategy, threshold, strategy, top_n],
@@ -311,34 +326,41 @@ def daily_pick_performance(
     tradeable picks are dropped from the simulation."""
     threshold = DEFAULT_THRESHOLD - _THRESHOLD_EPSILON
     daily = con.execute(
-        """
+        f"""
         WITH days AS (SELECT date FROM complete_trading_days),  -- gate: complete days only (#65)
         resolved AS (
             SELECT p.signal_date, min(d.date) AS target_date
-            FROM (SELECT DISTINCT signal_date FROM predictions WHERE strategy = ?) p
+            FROM (
+                SELECT DISTINCT signal_date FROM predictions
+                WHERE strategy = ? AND event = '{scan.TOUCH_EVENT}'
+            ) p
             JOIN days d ON d.date > p.signal_date GROUP BY p.signal_date
         ),
         picks AS (
-            SELECT r.target_date, pr.rank, pr.symbol, dr.oc_return
+            -- hit is the TOUCH event, computed per row; top1_return / topn_return
+            -- keep the open-to-close magnitude (Stage B owns the $-growth tiles).
+            SELECT r.target_date, pr.rank, pr.symbol, dr.oc_return,
+                   CASE WHEN {touch_event_predicate("dr.high_return", "dr.high_glitch_suspect")}
+                        THEN 1 ELSE 0 END AS hit
             FROM predictions pr
             JOIN resolved r ON pr.signal_date = r.signal_date
             JOIN daily_returns dr ON dr.symbol = pr.symbol AND dr.date = r.target_date
-            WHERE pr.strategy = ? AND pr.rank <= ?
+            WHERE pr.strategy = ? AND pr.rank <= ? AND pr.event = '{scan.TOUCH_EVENT}'
         )
         SELECT
             target_date,
             arg_min(symbol, rank) AS top1_symbol,
             min(rank) AS top1_rank,
             arg_min(oc_return, rank) AS top1_return,
-            CASE WHEN arg_min(oc_return, rank) >= ? THEN 1 ELSE 0 END AS top1_hit,
+            arg_min(hit, rank) AS top1_hit,
             avg(oc_return) AS topn_return,
-            sum(CASE WHEN oc_return >= ? THEN 1 ELSE 0 END) AS topn_hits,
+            sum(hit) AS topn_hits,
             count(*) AS n_avail
         FROM picks
         GROUP BY target_date
         ORDER BY target_date
         """,
-        [strategy, strategy, top_n, threshold, threshold],
+        [strategy, threshold, strategy, top_n],
     ).df()
     if not daily.empty:
         is_late = _late_lookup(con, strategy)
@@ -370,10 +392,15 @@ def daily_pick_performance(
 
 # Trailing window (in LIVE scored days) for the degradation detector.
 DEGRADATION_WINDOW = 5
-# Comparison rule: DEGRADED iff mean lift < 1.0 − 1e-9 — strictly below the
-# baseline by more than FP noise. A mean within epsilon of 1.0 (or above)
-# is NOT degraded, so the detector never fires on rounding error alone.
-_LIFT_DEGRADE_EPSILON = 1e-9
+# Comparison rule (M3): DEGRADED iff POOLED EXCESS PRECISION < 0 − 1e-9 — the
+# window's pooled hit rate (Σhits / Σpicks) is below its pooled base rate by more
+# than FP noise. This REPLACES the old trailing-5 mean-of-daily-lift-RATIOS < 1.0
+# rule, which was calibrated for close base rates and false-fires under touch:
+# lift is capped at 1/base_rate, so a hot high-base-rate streak (base rate near
+# the ceiling) drags a mean of ratios toward 1.0 even while the picks beat the
+# base rate in absolute, pooled terms. Averaging ratios across heterogeneous
+# base rates is the bug; pooling before dividing is base-rate-invariant.
+_EXCESS_DEGRADE_EPSILON = 1e-9
 
 
 @dataclass
@@ -384,12 +411,17 @@ class DegradationVerdict:
     armed: bool  # enough live days for the window to be meaningful
     live_days: int
     window: int
-    trailing_mean_lift: float | None  # None until armed
+    # Pooled over the trailing window: precision = Σhits/Σpicks, base rate is
+    # pick-weighted so it sits on the same footing, excess = precision − base.
+    # All None until armed. DEGRADED iff pooled_excess_precision < 0 (epsilon).
+    pooled_excess_precision: float | None
+    pooled_precision: float | None
+    pooled_base_rate: float | None
     excluded_null_lift: int
-    # Window days individually below 1.0: the mean has a false-negative mode
-    # (one lucky low-base-rate spike day can carry four zero days past 1.0),
-    # so the per-day count is always disclosed even when the trigger stays
-    # quiet. Before arming, counted over the live days seen so far.
+    # Window days individually below the base rate (lift < 1). Pooling has its own
+    # false-negative mode (one huge low-base-rate day can lift the pooled precision
+    # while most days lose), so the per-day count is always disclosed even when the
+    # trigger stays quiet. Before arming, counted over the live days seen so far.
     days_below_1: int
     detail: str
 
@@ -401,10 +433,14 @@ def degradation_verdict(
 
     Live days only (`late == False`), ordered by target_date: late/backfilled
     days have known outcomes, so including them would let a backfill mask or
-    manufacture a degradation. Days with NULL lift (zero base rate — lift is
-    undefined, not zero) are excluded with a loud warning. Fewer than `window`
-    live days means the detector is not yet armed and SAYS so — it never
-    silently reports healthy.
+    manufacture a degradation. Days with NULL lift (zero base rate — the pooled
+    base rate would be undefined for that day) are excluded with a loud warning.
+    Fewer than `window` live days means the detector is not yet armed and SAYS
+    so — it never silently reports healthy.
+
+    The trip is POOLED EXCESS PRECISION over the window (see _EXCESS_DEGRADE_EPSILON):
+    pooled precision Σhits/Σpicks minus the pick-weighted pooled base rate. Under
+    touch base rates this is robust where the old mean-of-lift-ratios false-fired.
     """
     excluded = 0
     if scored.empty:
@@ -423,38 +459,56 @@ def degradation_verdict(
         live = live[has_lift]
     n = len(live)
     suffix = f"; {excluded} zero-base-rate day(s) excluded" if excluded else ""
+
+    def _below(frame: pd.DataFrame) -> int:
+        return (
+            int((frame["lift"].astype(float) < 1.0 - _EXCESS_DEGRADE_EPSILON).sum())
+            if len(frame)
+            else 0
+        )
+
     if n < window:
-        below = int((live["lift"].astype(float) < 1.0 - _LIFT_DEGRADE_EPSILON).sum()) if n else 0
-        so_far = f", mean live lift so far {float(live['lift'].mean()):.7g}" if n else ""
         return DegradationVerdict(
             degraded=False,
             armed=False,
             live_days=n,
             window=window,
-            trailing_mean_lift=None,
+            pooled_excess_precision=None,
+            pooled_precision=None,
+            pooled_base_rate=None,
             excluded_null_lift=excluded,
-            days_below_1=below,
+            days_below_1=_below(live),
             detail=(
                 f"armed after {window - n} more live day(s) — {n}/{window} live days "
-                f"scored{so_far}; detector cannot fire yet{suffix}"
+                f"scored; detector cannot fire yet{suffix}"
             ),
         )
-    window_lifts = live["lift"].tail(window).astype(float)
-    mean_lift = float(window_lifts.mean())
-    below = int((window_lifts < 1.0 - _LIFT_DEGRADE_EPSILON).sum())
-    degraded = mean_lift < 1.0 - _LIFT_DEGRADE_EPSILON
+    win = live.tail(window)
+    picks = win["n_scored"].astype(float)
+    total_picks = float(picks.sum())
+    pooled_precision = float(win["hits"].astype(float).sum() / total_picks)
+    # Pick-weighted so the base rate pools on the same footing as precision (both
+    # are Σ(numerator)/Σ(picks)); an unweighted mean of daily base rates would
+    # reintroduce the averaging-across-heterogeneous-days bias M3 warns about.
+    pooled_base_rate = float((win["base_rate"].astype(float) * picks).sum() / total_picks)
+    excess = pooled_precision - pooled_base_rate
+    below = _below(win)
+    degraded = excess < -_EXCESS_DEGRADE_EPSILON
     state = "DEGRADED" if degraded else "not degraded"
     return DegradationVerdict(
         degraded=degraded,
         armed=True,
         live_days=n,
         window=window,
-        trailing_mean_lift=mean_lift,
+        pooled_excess_precision=excess,
+        pooled_precision=pooled_precision,
+        pooled_base_rate=pooled_base_rate,
         excluded_null_lift=excluded,
         days_below_1=below,
         detail=(
-            f"{state}: trailing-{window} live mean lift {mean_lift:.7g} vs baseline 1.0 "
-            f"({below} of {window} window day(s) below 1.0){suffix}"
+            f"{state}: trailing-{window} live pooled precision {pooled_precision:.4g} vs "
+            f"pooled base {pooled_base_rate:.4g} (excess {excess:+.4g}; DEGRADED when < 0; "
+            f"{below} of {window} window day(s) below the base rate){suffix}"
         ),
     )
 
@@ -497,7 +551,10 @@ def _score_table(
         f"""
         WITH days AS (SELECT date FROM complete_trading_days),  -- gate: complete days only (#65)
         pred_days AS (
-            SELECT DISTINCT signal_date FROM {table} WHERE {id_col} = ?
+            -- Touch era only (M1): pre-cutover NULL-event predictions are archived
+            -- out of the live record — a clean reset, never a silent re-score.
+            SELECT DISTINCT signal_date FROM {table}
+            WHERE {id_col} = ? AND event = '{scan.TOUCH_EVENT}'
         ),
         resolved AS (
             SELECT p.signal_date, min(d.date) AS target_date
@@ -507,15 +564,19 @@ def _score_table(
         top_hits AS (
             SELECT r.signal_date, r.target_date,
                    count(*) AS n_scored,
-                   sum(CASE WHEN dr.oc_return >= ? THEN 1 ELSE 0 END) AS hits
+                   sum(CASE WHEN {touch_event_predicate("dr.high_return", "dr.high_glitch_suspect")}
+                            THEN 1 ELSE 0 END) AS hits
             FROM {table} pr
             JOIN resolved r ON pr.signal_date = r.signal_date
             JOIN daily_returns dr ON dr.symbol = pr.symbol AND dr.date = r.target_date
-            WHERE pr.{id_col} = ? AND pr.rank <= ?
+            WHERE pr.{id_col} = ? AND pr.rank <= ? AND pr.event = '{scan.TOUCH_EVENT}'
             GROUP BY r.signal_date, r.target_date
         ),
         base AS (
-            SELECT date, avg(CASE WHEN oc_return >= ? THEN 1.0 ELSE 0.0 END) AS base_rate
+            -- touch base rate over ALL names (the market bar the lift divides by).
+            SELECT date,
+                   avg(CASE WHEN {touch_event_predicate("high_return", "high_glitch_suspect")}
+                            THEN 1.0 ELSE 0.0 END) AS base_rate
             FROM daily_returns GROUP BY date
         )
         SELECT t.signal_date, t.target_date, t.hits, t.n_scored,

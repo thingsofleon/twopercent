@@ -28,6 +28,36 @@ uv run twopercent routine --mode score # post-close scoring + degradation check
 uv run twopercent research             # overnight experiment queue (budget 8/night)
 ```
 
+## The +2% event: intraday reach (open-to-high)
+
+The event this system predicts is **reaching +2% intraday** —
+`high >= open × (1 + 0.02)` — not closing +2%. A pre-placed +2% limit order
+would have filled on the day's high (deterministic on that day's own bar, no
+lookahead). Open-to-close return stays available as a momentum FEATURE, never
+the label. One predicate (`scan.touch_event_predicate`, a column on the
+`daily_returns` view) defines the event for the training label, the scanner, the
+base rate, precision/lift, and the rolling `cnt_2pct_20d` feature, so they can
+never disagree. A narrow **high-spike guard** (`high_glitch_suspect`) excludes
+only implausible high prints — an isolated high the close did not confirm and
+volume did not corroborate (~95 bars in 5y on the live store, 0.009% of touch
+bars); real high-volume squeezes are kept. `twopercent doctor` surfaces the
+flagged bars.
+
+Touching +2% is ~2× as common as closing +2% (live store: 14.7% → 30.8% base
+rate), so **lift and calibration are the honesty metrics**, not headline reach
+rate. Metric definitions are versioned: every experiments/predictions/shadow row
+carries `event = 'open_to_high'`; pre-pivot rows are NULL (close-era) and are
+walled off — a close-era benchmark is never compared to a touch benchmark, and
+the live track record starts fresh at the first touch prediction (earlier days
+are archived, never silently re-scored).
+
+> **Required post-merge step:** run `uv run twopercent benchmark` to record a
+> touch-era champion benchmark. Until one exists, champion-benchmark reads
+> (dashboard SIM panel, research comparison, signal email) degrade gracefully to
+> "no touch-era benchmark yet" rather than quoting a close-era number. Old
+> experiments and predictions remain as a close-era archive — there is no
+> migration.
+
 ## The daily cycle (two runs)
 
 `twopercent routine` is the whole day as two gated commands, each reporting by

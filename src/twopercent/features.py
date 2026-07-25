@@ -3,9 +3,11 @@
 Timing model: a row is keyed by (symbol, signal_date). All features are
 computed from data through the END of signal_date S — they are known after S's
 close and used to predict the NEXT trading day. The label `did_2pct_next` is
-the next trading day's +2% outcome (explicitly a LEAD; everything else must
-never look forward). Predictions for "tomorrow" are the rows at the latest
-signal_date, which have no label yet.
+the next trading day's TOUCH outcome — reached +2% intraday (open-to-high) and
+not a high-spike glitch (scan.touch_event_predicate), explicitly a LEAD;
+everything else must never look forward. oc_return / cnt_2pct_20d remain as
+FEATURES (momentum), not the event. Predictions for "tomorrow" are the rows at
+the latest signal_date, which have no label yet.
 
 Caveat to the claim above: price-derived features honor it strictly, but
 sector labels, sector-aggregate membership, and log_mcap come from the LATEST
@@ -23,7 +25,7 @@ import logging
 import duckdb
 import pandas as pd
 
-from twopercent.scan import _THRESHOLD_EPSILON, DEFAULT_THRESHOLD
+from twopercent.scan import _THRESHOLD_EPSILON, DEFAULT_THRESHOLD, touch_event_predicate
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +56,7 @@ METADATA_COLUMNS = ["median_vol_20"]
 # canary deliberately excludes label columns, which legitimately change when
 # the future changes).
 
-_SQL = """
+_SQL = f"""
 WITH per_symbol AS (
     SELECT
         symbol, date, oc_return, volume,
@@ -64,9 +66,14 @@ WITH per_symbol AS (
         volume / nullif(avg(volume) OVER w20, 0) AS volume_ratio,
         median(volume) OVER w20 AS median_vol_20,
         CASE WHEN high > low THEN (close - low) / (high - low) END AS close_pos,
-        sum(CASE WHEN oc_return >= ? THEN 1 ELSE 0 END) OVER w20 AS cnt_2pct_20d,
+        -- cnt_2pct_20d is now a count of TOUCH days (open-to-high reached +2%
+        -- and not a high-spike glitch), the same event as the label.
+        sum(CASE WHEN {touch_event_predicate()} THEN 1 ELSE 0 END) OVER w20 AS cnt_2pct_20d,
         LEAD(date) OVER w AS target_date,
-        LEAD(oc_return) OVER w AS next_oc_return
+        LEAD(oc_return) OVER w AS next_oc_return,
+        -- LEAD of the touch event's inputs → the NEXT day's reached-2% label.
+        LEAD(high_return) OVER w AS next_high_return,
+        LEAD(high_glitch_suspect) OVER w AS next_high_glitch_suspect
     FROM daily_returns
     WINDOW
         w AS (PARTITION BY symbol ORDER BY date),
@@ -76,6 +83,8 @@ market AS (
     SELECT
         date,
         avg(CASE WHEN oc_return > 0 THEN 1.0 ELSE 0.0 END) AS breadth,
+        -- market_heat stays an open-to-CLOSE breadth FEATURE (a market-state
+        -- predictor, deliberately NOT an event site — it never defines a label).
         avg(CASE WHEN oc_return >= ? THEN 1.0 ELSE 0.0 END) AS market_heat
     FROM daily_returns
     GROUP BY date
@@ -95,9 +104,13 @@ SELECT
     s.symbol,
     s.date AS signal_date,
     s.target_date,
+    -- The label is the NEXT day's TOUCH event (reached +2% intraday, not a
+    -- glitch). next_high_return IS NULL means there is no next bar yet (newest
+    -- signal row) → NULL label, exactly as the close-era label keyed on the next
+    -- bar's absence. next_oc_return is kept only as the scoring/sim magnitude.
     CASE
-        WHEN s.next_oc_return IS NULL THEN NULL
-        WHEN s.next_oc_return >= ? THEN 1
+        WHEN s.next_high_return IS NULL THEN NULL
+        WHEN {touch_event_predicate("s.next_high_return", "s.next_high_glitch_suspect")} THEN 1
         ELSE 0
     END AS did_2pct_next,
     s.next_oc_return,

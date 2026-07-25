@@ -260,7 +260,7 @@ def test_degraded_files_issue_and_exits_2(degraded, monkeypatch):
         (args, kw) for args, kw in calls if args[:3] == ["gh", "issue", "create"]
     )
     assert create[create.index("--title") + 1] == (
-        "Auto: champion underperforming baseline (trailing-5 live lift 0.50)"
+        "Auto: champion underperforming baseline (trailing-5 live excess precision -0.050)"
     )
     assert create[create.index("--body-file") + 1] == "-"  # body via stdin, not the shell
     assert create[create.index("--label") + 1] == "auto-degradation"
@@ -270,7 +270,7 @@ def test_degraded_files_issue_and_exits_2(degraded, monkeypatch):
     assert champion.get_champion() in body
     assert "2026-07-10" in body  # last of the 5 degraded target dates in the table
     assert "| * |" in body  # trailing-window rows are marked in the table
-    assert "5 of 5 window day(s) individually below 1.0" in body
+    assert "5 of 5 window day(s) individually below the base rate" in body
     # Label ensured idempotently before create.
     label = next(args for args, kw in calls if args[:3] == ["gh", "label", "create"])
     assert "--force" in label and "auto-degradation" in label

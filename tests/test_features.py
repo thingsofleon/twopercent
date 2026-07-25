@@ -43,6 +43,10 @@ def test_lookahead_canary(con):
     assert vec_before["sector_breadth"].notna().all()
     assert vec_before["sector_excess"].notna().all()
 
+    # Mutating `high` on FUTURE bars is load-bearing now that the label and
+    # cnt_2pct_20d are TOUCH events (open-to-high): a refactor that dropped `high`
+    # from this UPDATE would stop exercising the touch path and the canary would
+    # pass blind. Keep `high` here, and assert the touch feature is future-invariant.
     con.execute(
         "UPDATE prices SET close = close * 3, high = high * 3, volume = volume * 7 WHERE date > ?",
         [cutoff],
@@ -51,6 +55,9 @@ def test_lookahead_canary(con):
     vec_after = after[after["signal_date"] == cutoff].set_index("symbol")[watched]
 
     assert vec_before.equals(vec_after)  # features untouched by the future
+    # Explicit: the touch-count feature at the cutoff row uses only bars through
+    # the cutoff, so tripling every future high must not move it (no lookahead).
+    assert vec_before["cnt_2pct_20d"].equals(vec_after["cnt_2pct_20d"])
     # ...while the label DID change (it is the future, explicitly):
     lbl_b = before[before["signal_date"] == cutoff].set_index("symbol")["did_2pct_next"]
     lbl_a = after[after["signal_date"] == cutoff].set_index("symbol")["did_2pct_next"]

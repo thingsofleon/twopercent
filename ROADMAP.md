@@ -275,20 +275,27 @@ trading-P&L presentation). Two principles from the user:
 
 Design (staged, each a reviewed PR; quant-skeptic mandatory on Stage A):
 
-- **Stage A — target redefinition.** The "+2% event" becomes `high ≥ open ×
-  (1 + threshold)` (open-to-high / intraday touch), replacing close-based
-  everywhere it defines the EVENT: the training label (`did_2pct_next` →
-  reached-2%), the scanner (`scan.daily_movers`), the base rate and hit/
-  precision (`track.py`, `backtest.py`), and the rolling-count feature
-  (`cnt_2pct_20d` → count of touch-days). Open-to-close return REMAINS as a
-  predictive FEATURE (momentum), just not the label. No lookahead: the label
-  uses only the target day's own `high`/`open`. **New data-quality surface:**
-  the label now depends on `high` — the field the OHLC-ordering gate (#64) and
-  completeness gate (#66) hardened, but a spurious high SPIKE (bad print, high
-  implausibly above open/close/prior-close with no corroboration) would FAKE a
-  touch. Stage A must add a high-spike guard (bound `(high−open)/open` sanity
-  vs the day's own range / prior close) — quant-skeptic sizes it so real
-  spikes are kept and glitches rejected.
+- **Stage A — target redefinition. SHIPPED (#69, PR — pending review/merge).**
+  The "+2% event" becomes `high ≥ open × (1 + threshold)` (open-to-high /
+  intraday touch), replacing close-based everywhere it defines the EVENT: the
+  training label (`did_2pct_next` → reached-2%), the scanner
+  (`scan.daily_movers`), the base rate and hit/precision (`track.py`,
+  `backtest.py`), and the rolling-count feature (`cnt_2pct_20d` → count of
+  touch-days). Open-to-close return REMAINS a predictive FEATURE (momentum),
+  just not the label. No lookahead: the label uses only the target day's own
+  `high`/`open`. ONE predicate (`scan.touch_event_predicate`, backed by
+  `high_return`/`high_glitch_suspect` columns on the `daily_returns` view) is
+  embedded by all five event sites so they can never disagree. The high-spike
+  guard (M2, below) is an intersection (isolated high AND close-unconfirmed AND
+  below-average volume, same-bar + prior data only) surfaced in `doctor`. On the
+  live store: touch base rate 30.8% vs close 14.7% (2.09×, matching the
+  measurement); the guard flags 95 bars in 5y (0.009% of touch bars) and zero of
+  the 1,002 isolated-high ≥2×-volume real squeezes. **Required post-merge op:**
+  `twopercent benchmark` to record a touch-era champion (reads degrade gracefully
+  to "no touch-era benchmark yet" until then; close-era rows stay as archive, no
+  migration). Metric definitions versioned via an `event` column on
+  experiments/predictions/shadow (M1); degradation detector re-derived to pooled
+  excess precision (M3). Stages B and C remain open.
 - **Stage B — remove the trading-P&L layer.** Delete `PickPerformance.growth`,
   `sim_windows` growth, `backtest` sim_top1/top5 growth, the $-money tiles, and
   the SIM/LIVE $-growth explorer. Lead with prediction quality: reach-rate
@@ -434,5 +441,18 @@ truth for *decisions and plan shape*; GitHub is the source of truth for
   so a stale mid-session bar can count toward coverage (refetch/finality tracking
   is #34/#31); (2) a mass-halt / mass-delist day (>10% of the universe halted at
   once) will false-HOLD as incomplete — rare, and arguably desirable to flag.
+  Shipped (#69, reach-predictor Stage A): the "+2% event" is now INTRADAY REACH
+  (open-to-high) instead of open-to-close, via one shared predicate
+  (`scan.touch_event_predicate` / the `high_return` + `high_glitch_suspect`
+  columns on `daily_returns`) that the label, `cnt_2pct_20d`, the scanner, the
+  base rate/precision/lift, and the backtest all embed identically. The M2
+  high-spike guard (isolated high AND close-unconfirmed AND below-average volume,
+  same-bar + prior data only) is surfaced in `doctor`; on the live store it flags
+  95 bars in 5y and zero real ≥2×-volume squeezes. Metric definitions are
+  versioned (`event` column on experiments/predictions/shadow, stamped
+  `open_to_high`; close-era rows walled off, live record clean-reset), and the
+  degradation detector was re-derived to base-rate-invariant pooled excess
+  precision (M3). **Required post-merge op:** `twopercent benchmark` to record a
+  touch-era champion. Stages B ($-P&L removal) and C (calibration) remain open.
   Exit criterion: a real degradation → investigation cycle observed, or at
   minimum both timers proven live — NOT complete yet.

@@ -453,7 +453,7 @@ def _explorer_state(
     notes: list[str] = []
     sim_s = None
     if not sim_days:
-        notes.append("No walk-forward simulation recorded yet — run twopercent benchmark.")
+        notes.append("No touch-era benchmark yet — run twopercent benchmark.")
     elif len(sim_days) < w:
         notes.append(f"SIM: needs {w} trading days — {len(sim_days)} available")
     else:
@@ -639,7 +639,7 @@ _JS = """
     var notes = [];
     if (!data.sim.length) {
       setRow("sim", null);
-      notes.push("No walk-forward simulation recorded yet " + DASH +
+      notes.push("No touch-era benchmark yet " + DASH +
                  " run twopercent benchmark.");
     } else if (data.sim.length < w) {
       setRow("sim", null);
@@ -779,6 +779,19 @@ def build_html(
         dates = ", ".join(f'<span class="mono">{d}</span>' for d in record.pending)
         pending = f'<p class="sub" style="margin-top:8px">Awaiting outcomes for: {dates}</p>'
 
+    # Clean-reset disclosure (M1): the live touch record counts only touch-era
+    # (event='open_to_high') predictions; pre-cutover days are archived, never
+    # silently re-scored under the new definition. Shown only when a real cutover
+    # left archived close-era days behind (a fresh touch-only store shows nothing).
+    first_touch, archived_days = store.touch_record_bounds(con, result.strategy)
+    reset_note = ""
+    if first_touch is not None and archived_days:
+        reset_note = (
+            f'<p class="sub" style="margin-top:8px">Live reach-record began '
+            f'<b class="mono">{first_touch}</b> (reached +2% intraday, open-to-high); '
+            f"{archived_days} earlier day(s) targeted open-to-close and are archived.</p>"
+        )
+
     sim = store.latest_experiment_daily(con, result.strategy)
     outcomes = track.daily_rank_outcomes(con, result.strategy)
     base_dates = [
@@ -797,6 +810,7 @@ def build_html(
         head
         + candidates
         + "<h2>Track record</h2>"
+        + reset_note
         + body
         + pending
         + explorer

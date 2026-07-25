@@ -127,6 +127,20 @@ def test_dashboard_clean_reset_note(modeled, tmp_path):
     assert "archived" in content
 
 
+def test_dashboard_reset_note_at_cutover_without_touch_prediction(modeled):
+    # The exact cutover: archived close-era predictions exist but NO touch
+    # prediction has been logged yet (first_touch is None). The archive must
+    # still be disclosed — not silently suppressed (F3).
+    dates = sorted(pd.bdate_range("2026-01-05", periods=60).date)
+    picks = pd.DataFrame({"symbol": ["RUN0"], "prob": [0.9], "rank": [1]})
+    store.save_predictions(modeled, "baseline_gbm_v1", dates[-6], picks, event=None)  # archived
+    result = predict_for(modeled, "baseline_gbm_v1", save=False)  # nothing logged
+    content = dashboard.build_html(modeled, result, top=5)
+    assert "targeted open-to-close and are archived" in content
+    assert "the reach-record starts with the first touch prediction" in content
+    assert "Live reach-record began" not in content  # no touch prediction yet
+
+
 def _record_sim(con, n_days, ranks_per_day=6, strategy="baseline_gbm_v1"):
     """Per-rank sim rows: mostly-up rank-1 returns, adversarial values."""
     seq = store.record_experiment(

@@ -781,16 +781,26 @@ def build_html(
 
     # Clean-reset disclosure (M1): the live touch record counts only touch-era
     # (event='open_to_high') predictions; pre-cutover days are archived, never
-    # silently re-scored under the new definition. Shown only when a real cutover
-    # left archived close-era days behind (a fresh touch-only store shows nothing).
+    # silently re-scored under the new definition. Rendered whenever a real cutover
+    # left archived close-era days behind — INCLUDING the exact cutover moment when
+    # archived days exist but no touch prediction has been made yet (first_touch is
+    # None); suppressing it then would silently hide the archive while the record
+    # shows "No scored days yet". A fresh touch-only store (no archive) shows nothing.
     first_touch, archived_days = store.touch_record_bounds(con, result.strategy)
     reset_note = ""
-    if first_touch is not None and archived_days:
-        reset_note = (
-            f'<p class="sub" style="margin-top:8px">Live reach-record began '
-            f'<b class="mono">{first_touch}</b> (reached +2% intraday, open-to-high); '
-            f"{archived_days} earlier day(s) targeted open-to-close and are archived.</p>"
-        )
+    if archived_days:
+        if first_touch is not None:
+            reset_note = (
+                f'<p class="sub" style="margin-top:8px">Live reach-record began '
+                f'<b class="mono">{first_touch}</b> (reached +2% intraday, open-to-high); '
+                f"{archived_days} earlier day(s) targeted open-to-close and are archived.</p>"
+            )
+        else:
+            reset_note = (
+                f'<p class="sub" style="margin-top:8px">{archived_days} earlier day(s) '
+                "targeted open-to-close and are archived — the reach-record starts with "
+                "the first touch prediction.</p>"
+            )
 
     sim = store.latest_experiment_daily(con, result.strategy)
     outcomes = track.daily_rank_outcomes(con, result.strategy)

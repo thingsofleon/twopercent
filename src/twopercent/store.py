@@ -451,9 +451,13 @@ def touch_record_bounds(
 
 
 def predicted_signal_dates(con: duckdb.DuckDBPyConnection, strategy: str) -> list[dt.date]:
+    """Touch-era signal dates only (M1): the pending list is derived from this, so
+    a pre-cutover (NULL-event) close-era day must NOT appear — it can never resolve
+    to a touch score and would otherwise render "Awaiting outcomes" forever."""
     rows = con.execute(
-        "SELECT DISTINCT signal_date FROM predictions WHERE strategy = ? ORDER BY signal_date",
-        [strategy],
+        "SELECT DISTINCT signal_date FROM predictions WHERE strategy = ? AND event = ? "
+        "ORDER BY signal_date",
+        [strategy, scan.TOUCH_EVENT],
     ).fetchall()
     return [r[0] for r in rows]
 
@@ -502,10 +506,13 @@ def save_shadow_predictions(
 
 
 def shadow_signal_dates(con: duckdb.DuckDBPyConnection, challenger: str) -> list[dt.date]:
+    """Touch-era signal dates only (M1) — same clean-reset reason as
+    predicted_signal_dates: a pre-cutover close-era shadow day can never resolve
+    to a touch score and must not linger in the challenger's pending list."""
     rows = con.execute(
-        "SELECT DISTINCT signal_date FROM shadow_predictions WHERE challenger = ? "
+        "SELECT DISTINCT signal_date FROM shadow_predictions WHERE challenger = ? AND event = ? "
         "ORDER BY signal_date",
-        [challenger],
+        [challenger, scan.TOUCH_EVENT],
     ).fetchall()
     return [r[0] for r in rows]
 

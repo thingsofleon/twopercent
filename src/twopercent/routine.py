@@ -51,6 +51,7 @@ from twopercent import (
     ingest,
     issues,
     notify,
+    scan,
     shadow,
     store,
     track,
@@ -737,10 +738,15 @@ def _issue_body(
     # "no experiments" once other strategies crowd the table. Rows with
     # non-empty strategy_params are research variants recorded under the
     # champion's name — they must never be quoted as the champion's benchmark.
+    # event = TOUCH_EVENT (M1): a close-era archive row must NEVER be quoted here
+    # either — otherwise a degradation that fires before the post-merge
+    # `twopercent benchmark` would hand the investigator open-to-close lift/base/
+    # precision to compare against a touch-based degradation (the cross-definition
+    # comparison M1 walls off everywhere else).
     bench = con.execute(
         "SELECT run_ts, test_start, test_end, params, metrics FROM experiments "
-        "WHERE strategy = ? ORDER BY run_ts DESC, id DESC",
-        [strategy],
+        "WHERE strategy = ? AND event = ? ORDER BY run_ts DESC, id DESC",
+        [strategy, scan.TOUCH_EVENT],
     ).df()
     row = None
     for cand in bench.itertuples():
@@ -752,7 +758,10 @@ def _issue_body(
             row = cand
             break
     if row is None:
-        lines.append(f"No experiments recorded for `{strategy}` — run `twopercent benchmark`.")
+        lines.append(
+            f"No touch-era champion benchmark recorded for `{strategy}` yet — "
+            "run `twopercent benchmark` (close-era archive rows are walled off)."
+        )
     else:
         lines.append(
             f"Run {pd.Timestamp(row.run_ts)}, test window {row.test_start} → {row.test_end}:"

@@ -266,6 +266,33 @@ def test_live_record_clean_reset_excludes_pre_cutover(con):
     assert archived == 1  # the NULL-event signal day is counted as archived
 
 
+def test_pending_excludes_close_era_signal_dates(con):
+    # A store with ONLY close-era (NULL-event) predictions must yield empty
+    # predicted_signal_dates and empty pending — never perpetual "Awaiting
+    # outcomes" for days that can never resolve to a touch score (F1).
+    seed_history(con, {"HIT1": [0.001] * 23 + [0.03, 0.05], "MISS": [0.001] * 25})
+    dates = sorted(pd.bdate_range("2026-01-05", periods=25).date)
+    picks = pd.DataFrame({"symbol": ["HIT1", "MISS"], "prob": [0.9, 0.1], "rank": [1, 2]})
+    store.save_predictions(con, "s", dates[-3], picks, event=None)  # close era only
+
+    assert store.predicted_signal_dates(con, "s") == []
+    assert track.score_predictions(con, "s", top_n=2).pending == []
+
+    # A touch-era prediction with no next trading day yet pends correctly.
+    store.save_predictions(con, "s", dates[-1], picks)  # touch era
+    assert store.predicted_signal_dates(con, "s") == [dates[-1]]
+    assert dates[-1] in track.score_predictions(con, "s", top_n=2).pending
+
+
+def test_shadow_pending_excludes_close_era_signal_dates(con):
+    seed_history(con, {"AAA": [0.001] * 25})
+    dates = sorted(pd.bdate_range("2026-01-05", periods=25).date)
+    picks = pd.DataFrame({"symbol": ["AAA"], "prob": [0.9], "rank": [1]})
+    store.save_shadow_predictions(con, "ch", "s", "{}", dates[-3], picks, event=None)
+    assert store.shadow_signal_dates(con, "ch") == []
+    assert track.score_shadow_predictions(con, "ch", top_n=1).pending == []
+
+
 def test_benchmark_stamps_touch_event(con, monkeypatch):
     from tests.conftest import seed_planted
 

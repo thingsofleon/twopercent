@@ -20,7 +20,7 @@ Every trading day, many tickers move 2%+. The system:
 |---|---|---|
 | Universe | Top 3000 US stocks by market cap (Russell 3000 proxy), via NASDAQ screener API | Changed in Session 1: iShares IWV holdings CSV no longer plainly downloadable; screener is free, keyless, self-updating. **Known limitations:** survivorship bias — today's constituents applied to history omit delisted/faded names (accepted for v1; quant-skeptic's first target at level 2); unlike the real Russell 3000, foreign-domiciled US-listed ordinaries (e.g. Shopify) are included — deliberate widening, they trade here and can do 2% days. Ingest uses the union of all universe snapshots so rank-3000 boundary churn doesn't truncate histories. This pattern now also feeds the sector features and log_mcap (latest snapshot applied to all of history), making historical feature values refresh-dependent — reproduce a logged experiment only against the same universe snapshot |
 | Data source | yfinance (free) | Daily OHLCV, batched + cached locally; no true real-time/pre-market. Revisit paid API (e.g. Polygon) if used daily |
-| "Did 2%" definition | Open-to-close: `(close − open) / open ≥ 2%` | Regular-hours move only; gaps excluded; +2% direction only |
+| "Did 2%" definition | **Intraday reach (open-to-high): `(high − open) / open ≥ 2%`** — CHANGED 2026-07-25 | Was open-to-close through 2026-07-24. The event is "did the stock REACH +2% intraday" (a pre-placed +2% limit would have filled — deterministic on the day's high, not lookahead), NOT "did it close +2%". Regular-hours only; +2% direction only. See "Reach-predictor pivot" below. Open-to-close return stays available as a FEATURE, not the label. |
 | Signals/prediction | ML model from the start | Gradient boosting on engineered features; **walk-forward validation only** — no lookahead. **Known limitation (#25, 2026-07-17):** selection-time liquidity floor (trailing median 20-bar volume ≥ 100k shares) excludes thin names from prediction rankings AND from the benchmark's top-N selection, so reported precision matches the shipped product — but labels, training, and the AUC/brier/base-rate populations deliberately remain all-names, so trained base rates include moves the ranking will never surface |
 | Storage | DuckDB / parquet | Columnar, local, zero server; fits 3,000 tickers × years of daily bars |
 | Language/tooling | Python, `uv`, `pytest`, `ruff` | |
@@ -260,6 +260,97 @@ Import cycle broken by extracting `canonical.py` (research/generate keep
 promotes nothing — that is #59 (forward shadow-gate), separately quant-skeptic-
 gated, and #60 (MC accounting) scales the band/window off `MAX_SHADOW`.
 
+## Reach-predictor pivot (decided 2026-07-25) — separate PREDICTION from TRADING
+
+Locked-in reframing (supersedes the original open-to-close target and the
+trading-P&L presentation). Two principles from the user:
+
+1. **This app is a PURE PREDICTOR.** Its only job: rank tickers by the
+   probability of REACHING ≥2% intraday, so the user can decide how to trade
+   them. It reports prediction QUALITY, never trading P&L.
+2. **Trading strategy is a SEPARATE application.** Limit-sell-at-2%, stop-loss,
+   trailing-stop, etc. are the user's decision and belong in a downstream app
+   that CONSUMES these rankings. The existing backtest/$-growth machinery is the
+   seed of that app; it is REMOVED from this one.
+
+Design (staged, each a reviewed PR; quant-skeptic mandatory on Stage A):
+
+- **Stage A — target redefinition. SHIPPED (#69, PR — pending review/merge).**
+  The "+2% event" becomes `high ≥ open × (1 + threshold)` (open-to-high /
+  intraday touch), replacing close-based everywhere it defines the EVENT: the
+  training label (`did_2pct_next` → reached-2%), the scanner
+  (`scan.daily_movers`), the base rate and hit/precision (`track.py`,
+  `backtest.py`), and the rolling-count feature (`cnt_2pct_20d` → count of
+  touch-days). Open-to-close return REMAINS a predictive FEATURE (momentum),
+  just not the label. No lookahead: the label uses only the target day's own
+  `high`/`open`. ONE predicate (`scan.touch_event_predicate`, backed by
+  `high_return`/`high_glitch_suspect` columns on the `daily_returns` view) is
+  embedded by all five event sites so they can never disagree. The high-spike
+  guard (M2, below) is an intersection (isolated high AND close-unconfirmed AND
+  below-average volume, same-bar + prior data only) surfaced in `doctor`. On the
+  live store: touch base rate 30.8% vs close 14.7% (2.09×, matching the
+  measurement); the guard flags 95 bars in 5y (0.009% of touch bars) and zero of
+  the 1,002 isolated-high ≥2×-volume real squeezes. **Required post-merge op:**
+  `twopercent benchmark` to record a touch-era champion (reads degrade gracefully
+  to "no touch-era benchmark yet" until then; close-era rows stay as archive, no
+  migration). Metric definitions versioned via an `event` column on
+  experiments/predictions/shadow (M1); degradation detector re-derived to pooled
+  excess precision (M3). Stages B and C remain open.
+- **Stage B — remove the trading-P&L layer.** Delete `PickPerformance.growth`,
+  `sim_windows` growth, `backtest` sim_top1/top5 growth, the $-money tiles, and
+  the SIM/LIVE $-growth explorer. Lead with prediction quality: reach-rate
+  (precision), base rate, lift, per-day chart; the explorer becomes Top-N ×
+  window on reach-rate + lift, not dollars. (This subsumes the fee-removal
+  PR #68 — no growth number left to be gross or net.)
+- **Stage C — calibration as first-class.** The output is P(reach 2%) and the
+  user acts on the number, so it must be honest: add walk-forward calibration
+  (bucket predicted probs vs realized reach-frequency; reliability table +
+  a metric alongside the existing Brier). "40% must mean ~40%."
+
+Reinterpretation to expect: touching +2% is far more common than closing +2%,
+so the BASE RATE rises sharply and raw hit rate looks high — **lift and
+calibration become the honesty metrics**, not headline reach-rate. Threshold
+stays 2% (parameterizable later). Walk-forward preserved throughout.
+
+**quant-skeptic design review (2026-07-25) — must resolve IN Stage A:**
+- **Core claim PASS** — open-to-high label is lookahead-free (target day's own
+  bar only). Measured on the real store: touch base rate **14.7% → 30.8%** mean
+  (~2×). Keep `high` in the leakage-canary UPDATE and add a `cnt_2pct_20d`
+  future-invariance assertion (the canary now leans on the high mutation).
+- **M1 — metric-definition cutover silently re-scores everything ~2×.** Every
+  metric keys on `oc_return >= threshold` re-derived at read time, and stored
+  artifacts don't carry the definition. Flipping it retroactively re-scores the
+  whole experiments ledger AND the live track record under touch (hit rates
+  ~double with zero model change → false step-change), and compares close-based
+  champions vs touch-based challengers (nonsense promotion/degradation). FIX:
+  stamp `event = open_to_high | open_to_close` on every experiments row and
+  scoring path; wall off pre-pivot rows; force a champion re-benchmark under
+  touch; record the cutover date. **Live track record: clean cutover** (the
+  touch record starts fresh from the touch-trained model; close-era days are
+  archived/labeled, not silently re-scored).
+- **M2 — high-spike guard is an INTERSECTION, not an absolute cap.** 1,126 bars
+  (0.10% of touch bars) have an isolated high ≥1.15× surroundings, but **73%
+  carry ≥2× volume — real small-cap squeezes a +2% limit WOULD have filled**;
+  an absolute cap would false-reject the exact violent moves the model exists
+  to predict. Only ~150 bars in 5yr (~0.014%) are glitch-suspect: isolated high
+  AND below-average volume AND the touch is decided by the high alone
+  (`close < open×1.02`). Guard = that intersection, in the shared
+  `daily_returns` path (so all consumers agree), loud-counted, surfaced in
+  `doctor` like the OHLC gate.
+- **M3 — degradation detector false-fires under touch base rates.** Its
+  trailing-5 `lift < 1.0` trip was calibrated for close base rates; under touch
+  the lift ceiling is `1/base_rate` and 133/1260 days have base rate ≥0.5
+  (ceiling <2). A hot high-base-rate streak drags mean lift toward 1.0 with no
+  decay → false auto-degradation issue + investigator cycle. Re-derive the
+  detector baseline for the touch regime before touch metrics feed it.
+- **N-notes:** single source for the touch predicate (define once, ideally a
+  `daily_returns` column — 5 call sites must agree); lift dynamic range
+  compresses (max ~3.25 vs ~6.8) so lead ranking on **AUC (base-rate-invariant)**
+  + `precision − base_rate` excess; Stage-C calibration must use a **Brier skill
+  score vs the daily base rate** and check reliability CONDITIONED on regime
+  (base rate swings 7%→98% daily; raw Brier drops "for free" at cutover);
+  reaffirm touch labels are never resolved onto incomplete days (#66).
+
 ## Status
 
 Live tracking is on GitHub: **milestones** (one per level) and **issues**
@@ -350,5 +441,18 @@ truth for *decisions and plan shape*; GitHub is the source of truth for
   so a stale mid-session bar can count toward coverage (refetch/finality tracking
   is #34/#31); (2) a mass-halt / mass-delist day (>10% of the universe halted at
   once) will false-HOLD as incomplete — rare, and arguably desirable to flag.
+  Shipped (#69, reach-predictor Stage A): the "+2% event" is now INTRADAY REACH
+  (open-to-high) instead of open-to-close, via one shared predicate
+  (`scan.touch_event_predicate` / the `high_return` + `high_glitch_suspect`
+  columns on `daily_returns`) that the label, `cnt_2pct_20d`, the scanner, the
+  base rate/precision/lift, and the backtest all embed identically. The M2
+  high-spike guard (isolated high AND close-unconfirmed AND below-average volume,
+  same-bar + prior data only) is surfaced in `doctor`; on the live store it flags
+  95 bars in 5y and zero real ≥2×-volume squeezes. Metric definitions are
+  versioned (`event` column on experiments/predictions/shadow, stamped
+  `open_to_high`; close-era rows walled off, live record clean-reset), and the
+  degradation detector was re-derived to base-rate-invariant pooled excess
+  precision (M3). **Required post-merge op:** `twopercent benchmark` to record a
+  touch-era champion. Stages B ($-P&L removal) and C (calibration) remain open.
   Exit criterion: a real degradation → investigation cycle observed, or at
   minimum both timers proven live — NOT complete yet.

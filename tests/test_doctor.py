@@ -320,11 +320,12 @@ def test_clean_store_passes_every_check(clean):
     assert doctor.extreme_bars(clean).empty
     assert doctor.zero_volume_runs(clean).empty
     assert doctor.invalid_bars(clean).empty
+    assert doctor.glitch_bars(clean).empty
     assert doctor.universe_symbols_without_prices(clean) == []
     assert doctor.price_symbols_without_meta(clean) == []
     text = "\n".join(doctor.format_report(report))
     assert "[FAIL]" not in text
-    assert text.count("[ OK ]") == 6
+    assert text.count("[ OK ]") == 7
 
 
 def test_missing_universe_warns_but_does_not_fail(con):

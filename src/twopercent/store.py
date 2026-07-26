@@ -11,11 +11,21 @@ import duckdb
 import numpy as np
 import pandas as pd
 
+from twopercent import scan
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = Path("data/twopercent.duckdb")
 
-_SCHEMA = """
+# High-spike glitch guard (M2), used inside the daily_returns view. A touch
+# decided by the day's HIGH alone is a GLITCH-SUSPECT (excluded from the touch
+# event) ONLY at the narrow intersection quant-skeptic sized at ~150 bars / 5yr
+# (~0.014% of touch bars): an isolated high AND a close that did not confirm the
+# move AND volume that did not corroborate. Real high-volume squeezes are KEPT.
+_HIGH_GLITCH_MULTIPLE = 1.15  # high >= 1.15 × max(open, close, prev_close)
+_HIGH_GLITCH_VOL_WINDOW = 20  # trailing bars (STRICTLY prior) for the volume norm
+
+_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS universe (
     symbol TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -40,16 +50,58 @@ CREATE TABLE IF NOT EXISTS ingest_meta (
     symbol TEXT NOT NULL PRIMARY KEY,
     from_date DATE NOT NULL
 );
+-- daily_returns carries BOTH return definitions plus the touch-event guard:
+--   oc_return   = (close - open) / open  — the open-to-close move, now a FEATURE
+--                 (momentum) and the guard's close-confirmation input, no longer
+--                 the event.
+--   high_return = (high  - open) / open  — the open-to-high (intraday reach) move.
+--                 The touch EVENT (scan.touch_event_predicate) is
+--                 high_return >= threshold-eps AND NOT high_glitch_suspect.
+--   high_glitch_suspect (M2) = TRUE only at the isolated-high / close-unconfirmed
+--                 / volume-uncorroborated intersection (see below). ONE definition
+--                 here so every consumer agrees.
 CREATE OR REPLACE VIEW daily_returns AS
-    SELECT symbol, date, open, high, low, close, volume,
-           (close - open) / open AS oc_return
-    FROM prices
-    WHERE open > 0 AND isfinite(open) AND isfinite(close)
-      -- isfinite(high)/isfinite(low) MUST precede the >=/<= comparisons: in
-      -- DuckDB total ordering NaN >= x is TRUE, so a NaN high would otherwise
-      -- pass high >= open and leak an OHLC-impossible bar into oc_return.
-      AND isfinite(high) AND isfinite(low)
-      AND high >= open AND high >= close AND low <= open AND low <= close;
+    SELECT symbol, date, open, high, low, close, volume, oc_return, high_return,
+           -- high_glitch_suspect: the touch was decided by the HIGH alone (close
+           -- did NOT confirm: oc_return < threshold), the high is an isolated
+           -- outlier vs the same bar + PRIOR close only, AND volume did not
+           -- corroborate (below its trailing-{_HIGH_GLITCH_VOL_WINDOW} PRIOR
+           -- average). prev_close is LAG(close) over VALID bars — same-bar +
+           -- prior data ONLY; NEVER next_open or any future bar, because this
+           -- column feeds the training LABEL and future data would be lookahead
+           -- (quant-skeptic flagged next_open as diagnostic-only). coalesce(...,
+           -- FALSE) keeps the flag a definite boolean: a NULL prev_close (first
+           -- valid bar) or NULL/absent volume norm means "no prior reference to
+           -- call it a glitch" → NOT suspect. The {scan.DEFAULT_THRESHOLD} /
+           -- {_HIGH_GLITCH_MULTIPLE} literals are the SQL copy of
+           -- scan.DEFAULT_THRESHOLD and store._HIGH_GLITCH_MULTIPLE (raw
+           -- threshold, no epsilon — this is a heuristic guard, not the event).
+           coalesce(
+               high_return >= {scan.DEFAULT_THRESHOLD}
+               AND oc_return < {scan.DEFAULT_THRESHOLD}
+               AND high >= {_HIGH_GLITCH_MULTIPLE} * greatest(open, close, coalesce(prev_close, 0))
+               AND trailing_avg_vol IS NOT NULL AND isfinite(trailing_avg_vol)
+               AND volume < trailing_avg_vol,
+               FALSE
+           ) AS high_glitch_suspect
+    FROM (
+        SELECT symbol, date, open, high, low, close, volume,
+               (close - open) / open AS oc_return,
+               (high - open) / open AS high_return,
+               LAG(close) OVER w AS prev_close,
+               avg(volume) OVER wv AS trailing_avg_vol
+        FROM prices
+        WHERE open > 0 AND isfinite(open) AND isfinite(close)
+          -- isfinite(high)/isfinite(low) MUST precede the >=/<= comparisons: in
+          -- DuckDB total ordering NaN >= x is TRUE, so a NaN high would otherwise
+          -- pass high >= open and leak an OHLC-impossible bar into the returns.
+          AND isfinite(high) AND isfinite(low)
+          AND high >= open AND high >= close AND low <= open AND low <= close
+        WINDOW
+            w AS (PARTITION BY symbol ORDER BY date),
+            wv AS (PARTITION BY symbol ORDER BY date
+                   ROWS BETWEEN {_HIGH_GLITCH_VOL_WINDOW} PRECEDING AND 1 PRECEDING)
+    );
 -- Which trading days are COMPLETE (trustworthy to score/predict from) vs
 -- PROVISIONAL (an in-progress day whose pre-market/partial bar covers only a
 -- fraction of the universe). The ONE definition, reused by track.py scoring,
@@ -113,8 +165,13 @@ CREATE TABLE IF NOT EXISTS experiments (
     train_start DATE,
     test_start DATE,
     test_end DATE,
-    metrics TEXT NOT NULL
+    metrics TEXT NOT NULL,
+    -- Metric-definition tag (M1): 'open_to_high' for touch-era rows; NULL for
+    -- pre-pivot (close-era) rows. Champion-benchmark reads filter to the touch
+    -- era so a close-based row is never quoted or compared against a touch row.
+    event TEXT
 );
+ALTER TABLE experiments ADD COLUMN IF NOT EXISTS event TEXT;
 CREATE TABLE IF NOT EXISTS experiment_daily (
     seq BIGINT NOT NULL,
     target_date DATE NOT NULL,
@@ -131,9 +188,14 @@ CREATE TABLE IF NOT EXISTS predictions (
     rank INTEGER NOT NULL,
     created_ts TIMESTAMP NOT NULL,
     universe_as_of DATE,
+    -- Metric-definition tag (M1): 'open_to_high' for touch-era predictions; NULL
+    -- for pre-cutover predictions. The live touch record counts ONLY touch-era
+    -- rows (clean reset); NULL-event days are archived, never re-scored as touch.
+    event TEXT,
     PRIMARY KEY (strategy, signal_date, symbol)
 );
 ALTER TABLE predictions ADD COLUMN IF NOT EXISTS universe_as_of DATE;
+ALTER TABLE predictions ADD COLUMN IF NOT EXISTS event TEXT;
 CREATE TABLE IF NOT EXISTS shadow_predictions (
     challenger TEXT NOT NULL,
     strategy TEXT NOT NULL,
@@ -144,8 +206,10 @@ CREATE TABLE IF NOT EXISTS shadow_predictions (
     rank INTEGER NOT NULL,
     created_ts TIMESTAMP NOT NULL,
     universe_as_of DATE,
+    event TEXT,  -- metric-definition tag (M1); see predictions.event
     PRIMARY KEY (challenger, signal_date, symbol)
 );
+ALTER TABLE shadow_predictions ADD COLUMN IF NOT EXISTS event TEXT;
 CREATE OR REPLACE VIEW latest_universe AS
     SELECT symbol, name, market_cap, as_of, sector
     FROM universe
@@ -327,7 +391,11 @@ def trading_day_coverage(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
 
 
 def save_predictions(
-    con: duckdb.DuckDBPyConnection, strategy: str, signal_date: dt.date, df: pd.DataFrame
+    con: duckdb.DuckDBPyConnection,
+    strategy: str,
+    signal_date: dt.date,
+    df: pd.DataFrame,
+    event: str = scan.TOUCH_EVENT,
 ) -> int:
     """Replace the (strategy, signal_date) slice with `df` (columns: symbol, prob, rank).
 
@@ -352,18 +420,44 @@ def save_predictions(
     con.execute(
         """
         INSERT INTO predictions
-        SELECT strategy, signal_date, symbol, prob, rank, now(), ? FROM predictions_in
+        SELECT strategy, signal_date, symbol, prob, rank, now(), ?, ? FROM predictions_in
         """,
-        [as_of],
+        [as_of, event],
     )
     con.unregister("predictions_in")
     return len(rows)
 
 
+def touch_record_bounds(
+    con: duckdb.DuckDBPyConnection, strategy: str
+) -> tuple[dt.date | None, int]:
+    """(first touch-era signal_date, count of pre-cutover NULL-event signal_dates)
+    for a strategy's predictions — the clean-reset note inputs (M1).
+
+    The live touch record begins at the first `event = 'open_to_high'` prediction;
+    earlier days targeted open-to-close and are archived (excluded from the touch
+    tiles), never silently re-scored. The dashboard discloses both so the reset is
+    visible. Both are None/0 on a store with no cutover (fresh touch-only store)."""
+    first_touch = con.execute(
+        "SELECT min(signal_date) FROM predictions WHERE strategy = ? AND event = ?",
+        [strategy, scan.TOUCH_EVENT],
+    ).fetchone()[0]
+    archived = con.execute(
+        "SELECT count(DISTINCT signal_date) FROM predictions "
+        "WHERE strategy = ? AND event IS DISTINCT FROM ?",
+        [strategy, scan.TOUCH_EVENT],
+    ).fetchone()[0]
+    return first_touch, int(archived)
+
+
 def predicted_signal_dates(con: duckdb.DuckDBPyConnection, strategy: str) -> list[dt.date]:
+    """Touch-era signal dates only (M1): the pending list is derived from this, so
+    a pre-cutover (NULL-event) close-era day must NOT appear — it can never resolve
+    to a touch score and would otherwise render "Awaiting outcomes" forever."""
     rows = con.execute(
-        "SELECT DISTINCT signal_date FROM predictions WHERE strategy = ? ORDER BY signal_date",
-        [strategy],
+        "SELECT DISTINCT signal_date FROM predictions WHERE strategy = ? AND event = ? "
+        "ORDER BY signal_date",
+        [strategy, scan.TOUCH_EVENT],
     ).fetchall()
     return [r[0] for r in rows]
 
@@ -375,6 +469,7 @@ def save_shadow_predictions(
     params_json: str,
     signal_date: dt.date,
     df: pd.DataFrame,
+    event: str = scan.TOUCH_EVENT,
 ) -> int:
     """Replace the (challenger, signal_date) slice of shadow_predictions with `df`.
 
@@ -401,20 +496,23 @@ def save_shadow_predictions(
     con.execute(
         """
         INSERT INTO shadow_predictions
-        SELECT challenger, strategy, params, signal_date, symbol, prob, rank, now(), ?
+        SELECT challenger, strategy, params, signal_date, symbol, prob, rank, now(), ?, ?
         FROM shadow_predictions_in
         """,
-        [as_of],
+        [as_of, event],
     )
     con.unregister("shadow_predictions_in")
     return len(rows)
 
 
 def shadow_signal_dates(con: duckdb.DuckDBPyConnection, challenger: str) -> list[dt.date]:
+    """Touch-era signal dates only (M1) — same clean-reset reason as
+    predicted_signal_dates: a pre-cutover close-era shadow day can never resolve
+    to a touch score and must not linger in the challenger's pending list."""
     rows = con.execute(
-        "SELECT DISTINCT signal_date FROM shadow_predictions WHERE challenger = ? "
+        "SELECT DISTINCT signal_date FROM shadow_predictions WHERE challenger = ? AND event = ? "
         "ORDER BY signal_date",
-        [challenger],
+        [challenger, scan.TOUCH_EVENT],
     ).fetchall()
     return [r[0] for r in rows]
 
@@ -435,16 +533,30 @@ def record_experiment(
     test_start: dt.date,
     test_end: dt.date,
     metrics: dict,
+    event: str = scan.TOUCH_EVENT,
 ) -> int:
-    """Insert an experiments row and return its id (the seq daily rows key on)."""
+    """Insert an experiments row and return its id (the seq daily rows key on).
+
+    `event` stamps the metric definition (M1): touch-era rows carry
+    scan.TOUCH_EVENT so champion-benchmark reads never compare a close-era row
+    to a touch row. Pre-pivot rows in the store keep NULL.
+    """
     return con.execute(
         """
         INSERT INTO experiments (run_ts, strategy, params, train_start, test_start,
-                                 test_end, metrics)
-        VALUES (now(), ?, ?, ?, ?, ?, ?)
+                                 test_end, metrics, event)
+        VALUES (now(), ?, ?, ?, ?, ?, ?, ?)
         RETURNING id
         """,
-        [strategy, json.dumps(params), train_start, test_start, test_end, json.dumps(metrics)],
+        [
+            strategy,
+            json.dumps(params),
+            train_start,
+            test_start,
+            test_end,
+            json.dumps(metrics),
+            event,
+        ],
     ).fetchone()[0]
 
 
@@ -495,6 +607,11 @@ def latest_experiment_daily(
     frame ordered by target_date, rank), or None when no qualifying experiment
     recorded daily rows — experiments predating the experiment_daily table
     have aggregates only.
+
+    Touch era ONLY (M1): rows with event <> scan.TOUCH_EVENT (a close-era
+    NULL-event archive row) are excluded, so the dashboard SIM panel reads a
+    touch benchmark or none — it never re-scores a close-era sim under the touch
+    definition. Returns None until a touch benchmark is recorded.
     """
     rows = con.execute(
         """
@@ -504,10 +621,10 @@ def latest_experiment_daily(
             SELECT seq, count(DISTINCT target_date) AS n_days
             FROM experiment_daily GROUP BY seq
         ) d ON d.seq = e.id
-        WHERE e.strategy = ?
+        WHERE e.strategy = ? AND e.event = ?
         ORDER BY d.n_days DESC, e.run_ts DESC, e.id DESC
         """,
-        [strategy],
+        [strategy, scan.TOUCH_EVENT],
     ).fetchall()
     row = None
     for candidate in rows:

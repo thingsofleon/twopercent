@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 
 from tests.conftest import seed_history, seed_planted
-from twopercent import champion, ingest, routine, store, track
+from twopercent import champion, doctor, ingest, routine, scan, store, track
 
 POST_CLOSE = dt.datetime(2026, 7, 17, 17, 0, tzinfo=routine._EASTERN)  # Friday 17:00 ET
 
@@ -197,6 +197,47 @@ def _degraded_record(n_live: int = 5, lift: float = 0.5) -> track.TrackRecord:
     return track.TrackRecord(scored=scored, pending=[])
 
 
+def test_issue_body_benchmark_section_is_touch_only(con):
+    # If the model degrades BEFORE the post-merge `twopercent benchmark`, the only
+    # experiments rows are close-era (NULL-event). The issue body's benchmark
+    # section must NOT quote those open-to-close numbers against a touch-based
+    # degradation — it says no-touch-benchmark instead (F2).
+    store.record_experiment(
+        con,
+        "gbm",
+        {"months": 12, "top_n": 20},
+        dt.date(2026, 1, 1),
+        dt.date(2026, 2, 1),
+        dt.date(2026, 3, 1),
+        {"lift": 9.876, "base_rate": 0.111, "precision_at_5": 0.5},
+        event=None,  # close-era archive row
+    )
+    record = _degraded_record()
+    verdict = track.degradation_verdict(record.scored)
+    body = routine._issue_body(
+        con, "gbm", verdict, record.scored, doctor.run(con), dt.date(2026, 7, 17)
+    )
+    assert "No touch-era champion benchmark recorded for `gbm`" in body
+    assert "9.876" not in body  # the close-era lift must not leak into the report
+
+    # A touch-era benchmark IS quoted once recorded.
+    store.record_experiment(
+        con,
+        "gbm",
+        {"months": 12, "top_n": 20},
+        dt.date(2026, 1, 1),
+        dt.date(2026, 2, 1),
+        dt.date(2026, 3, 1),
+        {"lift": 2.345, "base_rate": 0.30, "precision_at_5": 0.6},
+        event=scan.TOUCH_EVENT,
+    )
+    body2 = routine._issue_body(
+        con, "gbm", verdict, record.scored, doctor.run(con), dt.date(2026, 7, 17)
+    )
+    assert "2.345" in body2
+    assert "No touch-era champion benchmark recorded" not in body2
+
+
 @pytest.fixture
 def degraded(ready, monkeypatch):
     """Score run whose track record shows 5 live days at lift 0.5."""
@@ -260,7 +301,7 @@ def test_degraded_files_issue_and_exits_2(degraded, monkeypatch):
         (args, kw) for args, kw in calls if args[:3] == ["gh", "issue", "create"]
     )
     assert create[create.index("--title") + 1] == (
-        "Auto: champion underperforming baseline (trailing-5 live lift 0.50)"
+        "Auto: champion underperforming baseline (trailing-5 live excess precision -0.050)"
     )
     assert create[create.index("--body-file") + 1] == "-"  # body via stdin, not the shell
     assert create[create.index("--label") + 1] == "auto-degradation"
@@ -270,7 +311,7 @@ def test_degraded_files_issue_and_exits_2(degraded, monkeypatch):
     assert champion.get_champion() in body
     assert "2026-07-10" in body  # last of the 5 degraded target dates in the table
     assert "| * |" in body  # trailing-window rows are marked in the table
-    assert "5 of 5 window day(s) individually below 1.0" in body
+    assert "5 of 5 window day(s) individually below the base rate" in body
     # Label ensured idempotently before create.
     label = next(args for args, kw in calls if args[:3] == ["gh", "label", "create"])
     assert "--force" in label and "auto-degradation" in label

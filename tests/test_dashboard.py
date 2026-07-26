@@ -105,9 +105,40 @@ def test_dashboard_empty_track_record_state(modeled, tmp_path):
     assert "No scored days yet" in content
     assert "<svg" not in content
     # No benchmark recorded daily rows yet — the SIM row must say so loudly.
-    assert "No walk-forward simulation recorded yet" in content
+    assert "No touch-era benchmark yet" in content
     assert "twopercent benchmark" in content
     assert "LIVE: no live days yet" in content
+
+
+def test_dashboard_clean_reset_note(modeled, tmp_path):
+    # When a real cutover left archived close-era predictions behind, the M1
+    # clean-reset note discloses when the touch record began; a fresh touch-only
+    # store shows nothing.
+    dates = sorted(pd.bdate_range("2026-01-05", periods=60).date)
+    predict_for(modeled, "baseline_gbm_v1", signal_date=dates[-3], save=True)  # touch era
+    picks = pd.DataFrame({"symbol": ["RUN0"], "prob": [0.9], "rank": [1]})
+    store.save_predictions(modeled, "baseline_gbm_v1", dates[-6], picks, event=None)  # archived
+
+    out = tmp_path / "dash.html"
+    dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5, result=None)
+    content = out.read_text()
+    assert "Live reach-record began" in content
+    assert str(dates[-3]) in content  # first touch-era signal date
+    assert "archived" in content
+
+
+def test_dashboard_reset_note_at_cutover_without_touch_prediction(modeled):
+    # The exact cutover: archived close-era predictions exist but NO touch
+    # prediction has been logged yet (first_touch is None). The archive must
+    # still be disclosed — not silently suppressed (F3).
+    dates = sorted(pd.bdate_range("2026-01-05", periods=60).date)
+    picks = pd.DataFrame({"symbol": ["RUN0"], "prob": [0.9], "rank": [1]})
+    store.save_predictions(modeled, "baseline_gbm_v1", dates[-6], picks, event=None)  # archived
+    result = predict_for(modeled, "baseline_gbm_v1", save=False)  # nothing logged
+    content = dashboard.build_html(modeled, result, top=5)
+    assert "targeted open-to-close and are archived" in content
+    assert "the reach-record starts with the first touch prediction" in content
+    assert "Live reach-record began" not in content  # no touch prediction yet
 
 
 def _record_sim(con, n_days, ranks_per_day=6, strategy="baseline_gbm_v1"):
@@ -328,7 +359,7 @@ def test_explorer_state_live_short_window_disclosures():
     live = [{"d": str(i), "late": False, "base": None, "picks": [[1, 0.011, 0]]} for i in range(3)]
     sim_s, live_s, notes = dashboard._explorer_state([], live, 5, 126)
     assert sim_s is None
-    assert any("No walk-forward simulation recorded yet" in n for n in notes)
+    assert any("No touch-era benchmark yet" in n for n in notes)
     assert live_s is not None and live_s["days"] == 3
     assert any("all 3 live day(s)" in n for n in notes)  # window shortfall disclosed
     assert any("3 day(s) had fewer than 5 picks" in n for n in notes)

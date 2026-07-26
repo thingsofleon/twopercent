@@ -51,6 +51,7 @@ from twopercent import (
     ingest,
     issues,
     notify,
+    scan,
     shadow,
     store,
     track,
@@ -684,9 +685,11 @@ def _issue_body(
         "underperforming the all-names base rate on live-scored days.",
         "",
         f"- Champion: `{strategy}`",
-        f"- Trailing-{verdict.window} live mean lift: **{verdict.trailing_mean_lift:.4f}** "
-        f"(DEGRADED when < 1.0; {verdict.days_below_1} of {verdict.window} window "
-        "day(s) individually below 1.0)",
+        f"- Trailing-{verdict.window} live pooled excess precision: "
+        f"**{verdict.pooled_excess_precision:+.4f}** (pooled precision "
+        f"{verdict.pooled_precision:.1%} − pooled base rate {verdict.pooled_base_rate:.1%}; "
+        f"DEGRADED when < 0; {verdict.days_below_1} of {verdict.window} window day(s) "
+        "individually below the base rate)",
         f"- Live days scored: {verdict.live_days}"
         + (
             f" ({verdict.excluded_null_lift} zero-base-rate day(s) excluded)"
@@ -704,11 +707,12 @@ def _issue_body(
         f"- Doctor baseline this run: {pre.problem_count} problems "
         f"({len(pre.gaps)} gap symbols, {len(pre.stale)} stale, {len(pre.extreme)} extreme "
         f"bars, {len(pre.zero_runs)} zero-volume, {len(pre.invalid)} invalid, "
+        f"{len(pre.glitch)} high-spike glitch, "
         f"{len(pre.universe_missing_prices)} universe symbols without prices, "
         f"{len(pre.prices_missing_meta)} price symbols without meta)"
     )
-    # `*` marks the rows forming the trailing-window the detector averaged,
-    # so the headline mean is recomputable from the table by eye.
+    # `*` marks the rows forming the trailing-window the detector pooled,
+    # so the headline pooled precision/base rate is recomputable from the table.
     ordered = scored.sort_values("target_date")
     live = ordered[~ordered["late"].astype(bool) & ordered["lift"].notna()]
     window_days = set(pd.to_datetime(live["target_date"]).dt.date.tail(verdict.window))
@@ -734,10 +738,15 @@ def _issue_body(
     # "no experiments" once other strategies crowd the table. Rows with
     # non-empty strategy_params are research variants recorded under the
     # champion's name — they must never be quoted as the champion's benchmark.
+    # event = TOUCH_EVENT (M1): a close-era archive row must NEVER be quoted here
+    # either — otherwise a degradation that fires before the post-merge
+    # `twopercent benchmark` would hand the investigator open-to-close lift/base/
+    # precision to compare against a touch-based degradation (the cross-definition
+    # comparison M1 walls off everywhere else).
     bench = con.execute(
         "SELECT run_ts, test_start, test_end, params, metrics FROM experiments "
-        "WHERE strategy = ? ORDER BY run_ts DESC, id DESC",
-        [strategy],
+        "WHERE strategy = ? AND event = ? ORDER BY run_ts DESC, id DESC",
+        [strategy, scan.TOUCH_EVENT],
     ).df()
     row = None
     for cand in bench.itertuples():
@@ -749,7 +758,10 @@ def _issue_body(
             row = cand
             break
     if row is None:
-        lines.append(f"No experiments recorded for `{strategy}` — run `twopercent benchmark`.")
+        lines.append(
+            f"No touch-era champion benchmark recorded for `{strategy}` yet — "
+            "run `twopercent benchmark` (close-era archive rows are walled off)."
+        )
     else:
         lines.append(
             f"Run {pd.Timestamp(row.run_ts)}, test window {row.test_start} → {row.test_end}:"
@@ -780,7 +792,8 @@ def _file_issue_step(
     and the scoring stands."""
     title = (
         f"Auto: champion underperforming baseline "
-        f"(trailing-{verdict.window} live lift {verdict.trailing_mean_lift:.2f})"
+        f"(trailing-{verdict.window} live excess precision "
+        f"{verdict.pooled_excess_precision:+.3f})"
     )
     body = _issue_body(con, strategy, verdict, scored, pre, today)
     result = issues.file_issue(

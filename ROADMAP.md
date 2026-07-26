@@ -319,10 +319,44 @@ Design (staged, each a reviewed PR; quant-skeptic mandatory on Stage A):
   prediction not trade advice). Metric math (reach-rate/base-rate/lift/AUC)
   untouched — Stage B is removal + presentation only. **Supersedes/closes #68**
   (fee removal): no growth number left to be gross or net.
-- **Stage C — calibration as first-class.** The output is P(reach 2%) and the
-  user acts on the number, so it must be honest: add walk-forward calibration
-  (bucket predicted probs vs realized reach-frequency; reliability table +
-  a metric alongside the existing Brier). "40% must mean ~40%."
+- **Stage C — calibration as first-class. SHIPPED (#74, PR #75 — pending
+  review/merge).** MEASURES + DISPLAYS calibration (does NOT recalibrate — that
+  is a scoped follow-up if warranted). New `calibration.py` computes two
+  populations, out-of-sample per fold: (1) **all names** (same rows as the
+  recorded AUC/Brier) — a 10-bucket reliability table, a **Brier Skill Score**
+  vs each test day's OWN base rate (`BSS = 1 − Brier_model/Brier_ref`; the daily
+  reference is the honesty choice per quant-skeptic N2 — raw Brier drops "for
+  free" at a higher base rate), and **per-regime** BSS + slope within
+  low/medium/high base-rate-day tertiles; and (2) **the top-N liquid PICKS** —
+  the population the user acts on — reliability + slope only, NO BSS (a
+  post-selection BSS vs the ~0.74 survivor base rate reads negative as a pure
+  selection artifact and would mislead). Recorded into the experiment `metrics`
+  JSON in `run_benchmark` (event `open_to_high`). The dashboard "Calibration
+  (walk-forward)" panel LEADS with the **pick** reliability curve + a
+  plain-language read (the honest "a pick called X% reaches ~X%?"), carries the
+  all-names BSS as an explicitly-labelled SECONDARY "ranking skill (all names)"
+  tile, and shows a regime note that flags when calibration differs by regime.
+  The read names any material OVERCONFIDENT confident-tail bucket regardless of
+  its count (so the small tail where the user acts is never averaged away),
+  hedged as direction-not-magnitude (the tail is regime-clustered, quant-skeptic
+  Note C). Self-contained theme-aware inline SVG; degrades gracefully (no
+  touch-era benchmark, or an older row with no pick block → all-names fallback,
+  loudly labelled); walk-forward/backtest-labelled and dollar-free.
+  **Measured champion calibration (baseline_gbm_v1, 12mo / 246 test days):**
+  all-names **BSS +0.066** (modest ranking skill over the daily base rate). On
+  the population that matters — the **top-20 liquid picks** (4,920 pick-
+  predictions) — the **modal pick is essentially perfectly calibrated**: ~83% of
+  picks land in the 0.7–0.8 bucket, which predicts **74.5%** and reaches
+  **74.4%**. The only real miss is a small OVERCONFIDENT tail: the 0.8–0.9
+  bucket predicts ~82% but reaches ~71% (n=323, ~11pp). Calibration also
+  **differs by regime** (all-names BSS 0.13 medium vs 0.01 high; slope 0.78 on
+  low-base days). Net: the number a user acts on is trustworthy in the bulk and
+  mildly overconfident only in the thin high-confidence tail — a recalibration
+  follow-up (isotonic/Platt on the tail, possibly regime-aware) is optional, not
+  urgent. Reported in the PR; deliberately NOT done here (measure + display
+  only). **Post-merge op:** re-run `twopercent benchmark` so the recorded
+  champion carries the pick-calibration block (older rows degrade to the
+  all-names fallback view).
 
 Reinterpretation to expect: touching +2% is far more common than closing +2%,
 so the BASE RATE rises sharply and raw hit rate looks high — **lift and

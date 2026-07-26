@@ -174,6 +174,20 @@ _INFO_TEXT = {
     "t_excess": "Live reach-rate minus the base rate (in percentage points), pooled "
     "across live days. Positive means the ranking beat the market — the honesty "
     "metric when lift compresses at a high base rate.",
+    # Calibration panel — does the probability mean what it says.
+    "t_bss": "Brier skill score, walk-forward, ACROSS ALL NAMES (not the picks): "
+    "1 − Brier_model / Brier_reference, reference = each day's own base rate (which "
+    "swings ~7%→74% in the touch-era test window). Positive means the ranking's "
+    "probabilities add skill BEYOND simply knowing the daily base rate — a measure "
+    "of ranking DISCRIMINATION over all names, NOT a statement about the top-N picks "
+    "you act on (the reliability curve answers that). Raw Brier drops for free at a "
+    "higher base rate, so this skill form is the one comparable across the "
+    "close→touch cutover.",
+    "cal_curve": "Reliability, walk-forward, on the population named in the legend: "
+    "each point is a predicted-probability bucket — its mean predicted chance (x) "
+    "against how often those actually reached +2% (y), sized by how many fell in it. "
+    "On the dashed diagonal means the probability is honest (a 74% call → ~74% "
+    "realized); below the line means overconfident, above means underconfident.",
     # Candidates table columns
     "c_rank": "Rank by model probability — 1 is the most likely to reach +2%.",
     "c_sym": "Ticker symbol.",
@@ -327,6 +341,261 @@ def _benchmark_tiles(benchmark: tuple[int, dict, object, object] | None, top: in
         f'<div class="tile"><span class="label">Walk-forward reach-rate (top {bn})'
         f"{_info('t_reach')}</span>"
         f'<b>{reach_val}</b><span class="cmp">{base_cmp}</span></div>'
+    )
+
+
+def _reliability_svg(reliability: list[dict], pop_label: str) -> str:
+    """Reliability curve: predicted-bucket mean (x) vs realized reach (y), with
+    the perfect-calibration diagonal. Self-contained inline SVG, theme-aware —
+    same var(--*) palette as _chart_svg. Points sized by bucket count; empty
+    buckets are simply absent (never plotted as a silent 0). pop_label names the
+    population the curve is computed on (picks vs all names) in the legend."""
+    width, height, pad_l, pad_b, pad_t, pad_r = 460, 300, 42, 30, 12, 14
+    plot_w, plot_h = width - pad_l - pad_r, height - pad_t - pad_b
+
+    def x(v: float) -> float:
+        return pad_l + plot_w * v
+
+    def y(v: float) -> float:
+        return pad_t + plot_h * (1 - v)
+
+    parts = [
+        '<defs><filter id="cglow" x="-40%" y="-40%" width="180%" height="180%">'
+        '<feGaussianBlur stdDeviation="2" result="b"/>'
+        '<feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>'
+        "</filter></defs>"
+    ]
+    for frac in (0.25, 0.5, 0.75, 1.0):
+        gy, gx = y(frac), x(frac)
+        parts.append(
+            f'<line x1="{pad_l}" y1="{gy:.1f}" x2="{width - pad_r}" y2="{gy:.1f}" '
+            f'stroke="var(--grid)" stroke-width="1"/>'
+            f'<text x="{pad_l - 6}" y="{gy + 3:.1f}" text-anchor="end" font-size="10" '
+            f'font-family="ui-monospace, Consolas, monospace" '
+            f'fill="var(--ink-muted)">{frac:.0%}</text>'
+            f'<text x="{gx:.1f}" y="{height - 10}" text-anchor="middle" font-size="10" '
+            f'fill="var(--ink-muted)">{frac:.0%}</text>'
+        )
+    # Perfect-calibration diagonal (predicted == realized).
+    parts.append(
+        f'<line x1="{x(0):.1f}" y1="{y(0):.1f}" x2="{x(1):.1f}" y2="{y(1):.1f}" '
+        f'stroke="var(--baseline)" stroke-width="1.5" stroke-dasharray="5 4"/>'
+    )
+    populated = [r for r in reliability if r["count"] and _finite(r["mean_pred"])]
+    max_count = max((r["count"] for r in populated), default=1)
+    pts = [(x(r["mean_pred"]), y(r["reach_rate"])) for r in populated]
+    if len(pts) >= 2:
+        path = "M" + " L".join(f"{px:.1f} {py:.1f}" for px, py in pts)
+        parts.append(
+            f'<path d="{path}" fill="none" stroke="var(--info)" stroke-width="2" '
+            f'stroke-opacity="0.75"/>'
+        )
+    for r, (px, py) in zip(populated, pts, strict=True):
+        radius = 3 + 6 * math.sqrt(r["count"] / max_count)
+        parts.append(
+            f"<g><title>predicted {r['mean_pred']:.0%}, realized {r['reach_rate']:.0%} "
+            f"(n={r['count']})</title>"
+            f'<circle cx="{px:.1f}" cy="{py:.1f}" r="{radius:.1f}" fill="var(--info)" '
+            f'fill-opacity="0.85" filter="url(#cglow)"/></g>'
+        )
+    parts.append(
+        f'<line x1="{x(0):.1f}" y1="{y(0):.1f}" x2="{x(0):.1f}" y2="{y(1):.1f}" '
+        f'stroke="var(--baseline)" stroke-width="1"/>'
+        f'<line x1="{x(0):.1f}" y1="{y(0):.1f}" x2="{x(1):.1f}" y2="{y(0):.1f}" '
+        f'stroke="var(--baseline)" stroke-width="1"/>'
+    )
+    # Axis names live in the legend, not as inline SVG labels — an inline label
+    # at the 100% corner collides with the 100% tick text ("predict100%").
+    return (
+        '<div class="legend">'
+        '<span><span class="chip" style="background:var(--info)"></span>'
+        f"realized reach (y) vs predicted prob (x) · {html.escape(pop_label)}"
+        f"{_info('cal_curve')}</span>"
+        "<span>· · · perfect calibration</span>"
+        "</div>"
+        f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" '
+        f'aria-label="Reliability curve: predicted probability (x) vs realized reach rate (y)">'
+        f"{''.join(parts)}</svg>"
+    )
+
+
+# A confident bucket (predicted >= this) whose realized reach misses its
+# prediction by more than the tolerance must be NAMED in the read regardless of
+# its count — the count-weighted verdict alone drowns the small confident tail
+# where the user actually acts (FIX A / both reviewers).
+_CONFIDENT_FLOOR = 0.70
+_TAIL_TOLERANCE = 0.075
+
+
+def _calibration_read(reliability: list[dict], slope, noun_cap: str, noun_low: str) -> str:
+    """One honest plain-language sentence computed FROM the buckets — never a
+    canned claim. Reports a representative bucket (predicted vs realized), a
+    count-weighted verdict, AND — separately — any confident-tail miss, which the
+    weighted verdict would otherwise average away. noun_cap/noun_low name the
+    population (Picks / predictions) so the language matches what was measured."""
+    populated = [
+        r
+        for r in reliability
+        if r["count"] and _finite(r["mean_pred"]) and _finite(r["reach_rate"])
+    ]
+    if not populated:
+        return f"Not enough test {noun_low} to read calibration."
+    total = sum(r["count"] for r in populated)
+    # Weighted mean |predicted − realized| across occupied buckets (expected
+    # calibration error): the honest average gap between promise and reality.
+    ece = sum(r["count"] * abs(r["mean_pred"] - r["reach_rate"]) for r in populated) / total
+    # Representative bucket: the most-populated confident (>=50%) bucket, else the
+    # highest-predicted occupied bucket — the number the user most acts on.
+    confident = [r for r in populated if r["mean_pred"] >= 0.5]
+    rep = max(confident or populated, key=lambda r: (r["count"], r["mean_pred"]))
+    # The confident-tail miss: an occupied confident bucket (predicted >= floor)
+    # that OVERPROMISES — realized reach falls short by more than tolerance. This
+    # is the trust hazard (the user over-trusts the number); an underconfident
+    # bucket, or the tiny top noise bucket that happens to reach 100%, is not.
+    # Detected regardless of count (it must NOT be averaged away), but among
+    # candidates the most material (highest count) is named, not the noisiest.
+    overpromise = [
+        r
+        for r in populated
+        if r["mean_pred"] >= _CONFIDENT_FLOOR
+        and (r["mean_pred"] - r["reach_rate"]) >= _TAIL_TOLERANCE
+    ]
+    tail = max(overpromise, key=lambda r: (r["count"], r["mean_pred"])) if overpromise else None
+    verdict = (
+        "well calibrated"
+        if ece < 0.05
+        else "roughly calibrated"
+        if ece < 0.10
+        else "materially miscalibrated"
+    )
+    if tail is not None and verdict in ("well calibrated", "roughly calibrated"):
+        verdict += " in the bulk"
+    # Global slope tilt only when NO specific tail is named. Over the compressed
+    # pick range the slope is dragged by the tail bucket, so a blanket
+    # "overconfident" would contradict "well calibrated in the bulk" — the tail
+    # sentence carries the overconfidence signal more honestly there.
+    tilt = ""
+    if tail is None and _finite(slope):
+        if slope < 0.85:
+            tilt = f" — the {noun_low} are overconfident (too extreme)"
+        elif slope > 1.15:
+            tilt = f" — the {noun_low} are underconfident (too timid)"
+    tail_txt = ""
+    if tail is not None:
+        # Direction (overconfident) is robust; the tail is concentrated in a few
+        # regime-days, so hedge the magnitude (quant-skeptic Note C).
+        tail_txt = (
+            f" But {noun_low} it calls ~{tail['mean_pred']:.0%} reach only "
+            f"~{tail['reach_rate']:.0%} — overconfident in the tail (direction robust; the "
+            f"tail is regime-clustered, so read it as a direction, not a hard magnitude)."
+        )
+    return (
+        f"{noun_cap} the model calls ~{rep['mean_pred']:.0%} reached +2% about "
+        f"{rep['reach_rate']:.0%} of the time. Averaged over all buckets the "
+        f"probability is off by {ece:.0%} — {verdict}{tilt}.{tail_txt}"
+    )
+
+
+def _regime_note(cal: dict) -> str:
+    """Surface calibration that differs across base-rate regimes — a pooled curve
+    can look honest while every regime is off. Renders each stratum's base-rate
+    span, BSS, and slope; flags when the BSS spread across regimes is wide."""
+    regimes = cal.get("regimes") or []
+    if not regimes:
+        return ""
+    cells = []
+    for r in regimes:
+        bss = f"{r['bss']:+.2f}" if _finite(r["bss"]) else "—"
+        slope = f"{r['slope']:.2f}" if _finite(r["slope"]) else "—"
+        cells.append(
+            f"<b>{html.escape(r['name'])}</b> base {r['base_lo']:.0%}–{r['base_hi']:.0%} "
+            f"({r['n_days']}d): BSS {bss}, slope {slope}"
+        )
+    bsss = [r["bss"] for r in regimes if _finite(r["bss"])]
+    flag = ""
+    if len(bsss) >= 2 and (max(bsss) - min(bsss)) >= 0.10:
+        flag = (
+            " Calibration DIFFERS by regime — read per-regime, the pooled curve "
+            "can average away a regime-specific miss."
+        )
+    return (
+        '<p class="sub" style="margin-top:8px">By base-rate regime (walk-forward, '
+        "all names, ranking skill): " + " · ".join(cells) + f".{flag}</p>"
+    )
+
+
+def _calibration_panel(benchmark: tuple[int, dict, object, object] | None) -> str:
+    """ "Calibration (walk-forward)" section. The PRIMARY reliability curve + read
+    are on the TOP-N LIQUID PICKS — the population the user acts on ("a pick
+    called X% reaches ~X%?"). The all-names Brier skill score rides as an
+    explicitly-labelled SECONDARY tile (ranking discrimination over the daily
+    base rate — never implying it describes the picks). Degrades gracefully: no
+    touch-era benchmark, or a pre-Stage-C row with no calibration block, or an
+    older touch row that carries all-names calibration but no pick block (the
+    curve then falls back to all names, loudly labelled). Backtest; no dollars."""
+    header = "<h2>Calibration (walk-forward)</h2>"
+    empty = (
+        header + '<div class="card"><p class="empty">No touch-era benchmark yet — run '
+        "twopercent benchmark to measure whether a pick the model calls ~70% "
+        "reaches +2% about 70% of the time.</p></div>"
+    )
+    if benchmark is None:
+        return empty
+    cal = benchmark[1].get("calibration")
+    if not cal or not cal.get("reliability"):
+        return empty
+
+    # Secondary: all-names Brier skill score (ranking discrimination). Labelled so
+    # it is never read as "the picks add no skill" — it is a different question.
+    bss = cal.get("bss")
+    bss_val = f"{bss:+.2f}" if _finite(bss) else "—"
+    bss_up = "up" if _finite(bss) and bss > 0 else ""
+    tile = (
+        '<div class="tiles">'
+        f'<div class="tile"><span class="label">Ranking skill · BSS (all names)'
+        f'{_info("t_bss")}</span><b class="{bss_up}">{bss_val}</b>'
+        f'<span class="cmp">vs the daily base rate · {cal["n"]:,} all-names test '
+        "predictions</span></div></div>"
+    )
+
+    # Primary: the pick population the user acts on, falling back to all names
+    # (loudly) only when an older row carries no pick block.
+    picks = cal.get("picks")
+    if picks and any(r["count"] for r in picks.get("reliability", [])):
+        reliability = picks["reliability"]
+        slope = picks.get("slope")
+        pop_label = f"top-{picks['top_n']} picks"
+        read = _calibration_read(reliability, slope, "Picks", "picks")
+        floor_note = (
+            f'<p class="sub" style="margin-top:10px">Reliability of the top-'
+            f"{picks['top_n']} liquidity-floored PICKS — the population you act on — "
+            f"over {picks['n']:,} pick-predictions on {picks['n_days']} test days, "
+            "out-of-sample per fold.</p>"
+        )
+    else:
+        reliability = cal["reliability"]
+        slope = cal.get("slope")
+        pop_label = "all names"
+        read = _calibration_read(reliability, slope, "Predictions", "predictions")
+        floor_note = (
+            '<p class="sub" style="margin-top:10px"><b>No pick-population block '
+            "recorded yet</b> — showing all-names reliability (a different question "
+            "from the picks you act on). Re-run twopercent benchmark to record it.</p>"
+        )
+
+    return (
+        header
+        + tile
+        + "<div class='card'>"
+        + _reliability_svg(reliability, pop_label)
+        + floor_note
+        + f'<p class="sub" style="margin-top:6px">{html.escape(read)}</p>'
+        + _regime_note(cal)
+        + '<p class="sub" style="margin-top:8px">Reliability curve: the top-N '
+        "liquidity-floored picks, out-of-sample per fold — the population you act "
+        "on. BSS tile + regime line: all names (ranking skill), same population as "
+        "the benchmark AUC/Brier. Walk-forward — the model never trains on the days "
+        "it scores. Backtest, not the live record; measured, not recalibrated.</p>" + "</div>"
     )
 
 
@@ -878,6 +1147,7 @@ def build_html(
     return (
         head
         + candidates
+        + _calibration_panel(benchmark)
         + "<h2>Track record</h2>"
         + reset_note
         + body

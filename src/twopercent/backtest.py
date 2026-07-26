@@ -16,7 +16,7 @@ import duckdb
 import pandas as pd
 from sklearn.metrics import brier_score_loss, roc_auc_score
 
-from twopercent import scan, store, strategies
+from twopercent import calibration, scan, store, strategies
 from twopercent.features import feature_frame
 from twopercent.predict import LIQUIDITY_MIN_MEDIAN_VOLUME
 
@@ -96,6 +96,7 @@ def run_benchmark(
     folds = month_folds(labeled["target_date"], months)
     all_probs: list[pd.Series] = []
     all_labels: list[pd.Series] = []
+    all_dates: list[pd.Series] = []
     daily_hits: list[float] = []
     fold_drops: dict[dt.date, frozenset[str]] = {}
     folds_run = 0
@@ -103,6 +104,8 @@ def run_benchmark(
     unscoreable_days = 0
     daily_picks: list[tuple[dt.date, int, float]] = []
     rank_rows: list[tuple[dt.date, int, float, int]] = []
+    pick_probs: list[pd.Series] = []
+    pick_labels: list[pd.Series] = []
     first_run_start: dt.date | None = None
 
     for month_start, month_end in folds:
@@ -126,6 +129,10 @@ def run_benchmark(
         probs = strategy.predict_proba(test)
         all_probs.append(probs)
         all_labels.append(test["did_2pct_next"])
+        # Per-row target_date rides alongside the (prob, label) pair the AUC/Brier
+        # already pool, so calibration keys the daily-base-rate BSS reference and
+        # the regime strata to the SAME out-of-sample population — no lookahead.
+        all_dates.append(test["target_date"])
         for target_date, day_rows in test.assign(prob=probs).groupby("target_date"):
             # Same liquidity floor the shipped predictions apply (predict.py):
             # only the top-N SELECTION filters — training and the AUC/brier
@@ -137,6 +144,12 @@ def run_benchmark(
                 continue
             top = eligible.nlargest(top_n, "prob")
             daily_hits.append(top["did_2pct_next"].mean())
+            # Calibration on the population the user ACTS on: the same top-N
+            # liquid picks that drive precision_at_n, out-of-sample per fold.
+            # A pick called X% should reach ~X% — the all-names view answers a
+            # different question (ranking discrimination) and buries this one.
+            pick_probs.append(top["prob"])
+            pick_labels.append(top["did_2pct_next"])
             # One frame drives both the recorded per-rank rows (experiment_daily,
             # for the dashboard trailing-window reach explorer) and the top-1/
             # top-5 reach aggregates (rank 1 row, mean of ranks 1-5). The per-rank
@@ -186,6 +199,7 @@ def run_benchmark(
 
     probs = pd.concat(all_probs)
     labels = pd.concat(all_labels).astype(int)
+    dates = pd.concat(all_dates)
     base_rate = labels.mean()
     precision_at_n = float(pd.Series(daily_hits).mean())
     picks = pd.DataFrame(daily_picks, columns=["target_date", "top1_hit", "top5_hits"])
@@ -204,6 +218,22 @@ def run_benchmark(
         "test_rows": int(len(labels)),
         "test_days": len(daily_hits),
         "folds": folds_run,
+        # Walk-forward calibration. Two populations, two questions:
+        #   - all-names (same rows as brier/auc): reliability + Brier SKILL score
+        #     vs the daily base rate + per-regime — ranking discrimination.
+        #   - picks (top-N liquid, nested under "picks"): reliability of the
+        #     numbers the user acts on — a pick called X% should reach ~X%.
+        #     No BSS on picks (post-selection BSS is a misleading artifact).
+        # MEASURED only — Stage C does not recalibrate the model.
+        "calibration": {
+            **calibration.calibration_report(probs.to_numpy(), labels.to_numpy(), dates),
+            "picks": calibration.pick_calibration_report(
+                pd.concat(pick_probs).to_numpy(),
+                pd.concat(pick_labels).to_numpy(),
+                top_n=top_n,
+                n_days=len(daily_hits),
+            ),
+        },
     }
     if record:
         params = {

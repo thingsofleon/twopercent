@@ -96,6 +96,19 @@ def test_calibration_report_shape_and_population_label():
     assert all(r["mean_pred"] is None and r["reach_rate"] is None for r in empties)
 
 
+def test_pick_calibration_report_has_reliability_and_slope_but_no_bss():
+    # The pick population carries reliability + slope only — a post-selection BSS
+    # vs the survivor base rate is a misleading artifact and must be absent.
+    y = np.array([1] * 60 + [0] * 40)
+    p = np.clip(y * 0.2 + 0.6, 0, 1)  # compressed survivor range ~0.6-0.8
+    report = calibration.pick_calibration_report(p, y, top_n=20, n_days=5)
+    assert report["population"] == "top_n_liquid_picks"
+    assert report["top_n"] == 20 and report["n_days"] == 5 and report["n"] == 100
+    assert "bss" not in report
+    assert len(report["reliability"]) == 10
+    assert report["slope"] is not None
+
+
 def test_slope_none_without_spread():
     # A single occupied bucket has no predicted-prob spread — slope is undefined
     # and must be None, never a fabricated number.

@@ -8,7 +8,8 @@ predictions (out-of-sample), never in-sample. It does not recalibrate the model.
 Two honesty choices, both from the quant-skeptic Stage-C notes:
 
 - **Brier SKILL score, not raw Brier.** Touching +2% is far more common than
-  closing +2%, and the daily base rate swings ~7%→98%. Raw Brier drops "for
+  closing +2%, and the daily base rate swings ~7%→74% (touch-era test window).
+  Raw Brier drops "for
   free" at a higher base rate, so it is misleading across the close→touch
   cutover. `BSS = 1 − Brier_model / Brier_ref` measures skill over the
   no-skill forecast — and the reference is each test day's OWN base rate (a
@@ -122,7 +123,8 @@ def brier_skill_score(probs, labels, dates) -> dict:
     }
 
 
-# Base-rate-day strata: the daily base rate swings ~7%→98%, so calibration is
+# Base-rate-day strata: the daily base rate swings ~7%→74% (touch-era test
+# window), so calibration is
 # also measured within tertiles of the per-day base rate. Tertile cuts adapt to
 # the data (fixed cuts would misclassify a whole regime); ordered low→high.
 _REGIME_NAMES = ("low", "medium", "high")
@@ -201,4 +203,37 @@ def calibration_report(probs, labels, dates, n_bins: int = DEFAULT_BINS) -> dict
         "slope": calibration_slope(table),
         "reliability": table,
         "regimes": regime_reports(p, y, dates, n_bins),
+    }
+
+
+def pick_calibration_report(
+    probs, labels, top_n: int, n_days: int, n_bins: int = DEFAULT_BINS
+) -> dict:
+    """Reliability of the top-N liquidity-floored PICKS — the population the user
+    actually acts on, and the honest answer to "when I act on a pick the model
+    calls X%, does it reach X%?".
+
+    Reliability + slope only, NO Brier skill score. Post-selection BSS vs the
+    survivor base rate is negative largely as a SELECTION ARTIFACT — the ranking
+    already spent its edge delivering the base-rate→pick-rate lift, and the
+    predicted-prob range is compressed among the survivors — so a pick BSS would
+    read as "no skill" and mislead. The all-names BSS (ranking discrimination
+    over the daily base rate) carries the skill story; this carries the "is the
+    number on a pick honest" story. Population differs materially from all-names:
+    picks concentrate in the well-calibrated mid-range, so the all-names view
+    both overstates the confident-tail miss and buries the modal-pick fact.
+    """
+    p = np.asarray(probs, dtype=float)
+    y = np.asarray(labels, dtype=float)
+    if p.shape != y.shape:
+        raise ValueError(f"probs/labels length mismatch: {p.shape} vs {y.shape}")
+    table = reliability_table(p, y, n_bins)
+    return {
+        "population": "top_n_liquid_picks",
+        "top_n": int(top_n),
+        "n": int(len(p)),
+        "n_days": int(n_days),
+        "n_bins": n_bins,
+        "reliability": table,
+        "slope": calibration_slope(table),
     }

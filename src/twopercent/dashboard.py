@@ -175,17 +175,19 @@ _INFO_TEXT = {
     "across live days. Positive means the ranking beat the market — the honesty "
     "metric when lift compresses at a high base rate.",
     # Calibration panel — does the probability mean what it says.
-    "t_bss": "Brier skill score, walk-forward: 1 − Brier_model / Brier_reference, "
-    "where the reference each day is that day's own base rate. Positive means the "
-    "probabilities add skill BEYOND simply knowing the daily base rate (which swings "
-    "~7%→98%); 0 means no better than the base rate; negative means worse. This is "
-    "the honest calibration headline — raw Brier drops for free at a higher base "
-    "rate, so it is not comparable across the close→touch cutover.",
-    "cal_curve": "Reliability, walk-forward: each point is a predicted-probability "
-    "bucket — its mean predicted chance (x) against how often those picks actually "
-    "reached +2% (y), sized by how many predictions fell in it. On the dashed "
-    "diagonal means the probability is honest (70% predicted → ~70% realized); "
-    "below the line means overconfident, above means underconfident.",
+    "t_bss": "Brier skill score, walk-forward, ACROSS ALL NAMES (not the picks): "
+    "1 − Brier_model / Brier_reference, reference = each day's own base rate (which "
+    "swings ~7%→74% in the touch-era test window). Positive means the ranking's "
+    "probabilities add skill BEYOND simply knowing the daily base rate — a measure "
+    "of ranking DISCRIMINATION over all names, NOT a statement about the top-N picks "
+    "you act on (the reliability curve answers that). Raw Brier drops for free at a "
+    "higher base rate, so this skill form is the one comparable across the "
+    "close→touch cutover.",
+    "cal_curve": "Reliability, walk-forward, on the population named in the legend: "
+    "each point is a predicted-probability bucket — its mean predicted chance (x) "
+    "against how often those actually reached +2% (y), sized by how many fell in it. "
+    "On the dashed diagonal means the probability is honest (a 74% call → ~74% "
+    "realized); below the line means overconfident, above means underconfident.",
     # Candidates table columns
     "c_rank": "Rank by model probability — 1 is the most likely to reach +2%.",
     "c_sym": "Ticker symbol.",
@@ -342,11 +344,12 @@ def _benchmark_tiles(benchmark: tuple[int, dict, object, object] | None, top: in
     )
 
 
-def _reliability_svg(reliability: list[dict]) -> str:
+def _reliability_svg(reliability: list[dict], pop_label: str) -> str:
     """Reliability curve: predicted-bucket mean (x) vs realized reach (y), with
     the perfect-calibration diagonal. Self-contained inline SVG, theme-aware —
     same var(--*) palette as _chart_svg. Points sized by bucket count; empty
-    buckets are simply absent (never plotted as a silent 0)."""
+    buckets are simply absent (never plotted as a silent 0). pop_label names the
+    population the curve is computed on (picks vs all names) in the legend."""
     width, height, pad_l, pad_b, pad_t, pad_r = 460, 300, 42, 30, 12, 14
     plot_w, plot_h = width - pad_l - pad_r, height - pad_t - pad_b
 
@@ -406,7 +409,7 @@ def _reliability_svg(reliability: list[dict]) -> str:
     return (
         '<div class="legend">'
         '<span><span class="chip" style="background:var(--info)"></span>'
-        "realized reach (y) vs predicted prob (x)"
+        f"realized reach (y) vs predicted prob (x) · {html.escape(pop_label)}"
         f"{_info('cal_curve')}</span>"
         "<span>· · · perfect calibration</span>"
         "</div>"
@@ -416,17 +419,27 @@ def _reliability_svg(reliability: list[dict]) -> str:
     )
 
 
-def _calibration_read(cal: dict) -> str:
+# A confident bucket (predicted >= this) whose realized reach misses its
+# prediction by more than the tolerance must be NAMED in the read regardless of
+# its count — the count-weighted verdict alone drowns the small confident tail
+# where the user actually acts (FIX A / both reviewers).
+_CONFIDENT_FLOOR = 0.70
+_TAIL_TOLERANCE = 0.075
+
+
+def _calibration_read(reliability: list[dict], slope, noun_cap: str, noun_low: str) -> str:
     """One honest plain-language sentence computed FROM the buckets — never a
-    canned claim. Reports a representative high-confidence bucket (predicted vs
-    realized) and a verdict from the weighted calibration error and BSS."""
+    canned claim. Reports a representative bucket (predicted vs realized), a
+    count-weighted verdict, AND — separately — any confident-tail miss, which the
+    weighted verdict would otherwise average away. noun_cap/noun_low name the
+    population (Picks / predictions) so the language matches what was measured."""
     populated = [
         r
-        for r in cal["reliability"]
+        for r in reliability
         if r["count"] and _finite(r["mean_pred"]) and _finite(r["reach_rate"])
     ]
     if not populated:
-        return "Not enough test predictions to read calibration."
+        return f"Not enough test {noun_low} to read calibration."
     total = sum(r["count"] for r in populated)
     # Weighted mean |predicted − realized| across occupied buckets (expected
     # calibration error): the honest average gap between promise and reality.
@@ -435,6 +448,19 @@ def _calibration_read(cal: dict) -> str:
     # highest-predicted occupied bucket — the number the user most acts on.
     confident = [r for r in populated if r["mean_pred"] >= 0.5]
     rep = max(confident or populated, key=lambda r: (r["count"], r["mean_pred"]))
+    # The confident-tail miss: an occupied confident bucket (predicted >= floor)
+    # that OVERPROMISES — realized reach falls short by more than tolerance. This
+    # is the trust hazard (the user over-trusts the number); an underconfident
+    # bucket, or the tiny top noise bucket that happens to reach 100%, is not.
+    # Detected regardless of count (it must NOT be averaged away), but among
+    # candidates the most material (highest count) is named, not the noisiest.
+    overpromise = [
+        r
+        for r in populated
+        if r["mean_pred"] >= _CONFIDENT_FLOOR
+        and (r["mean_pred"] - r["reach_rate"]) >= _TAIL_TOLERANCE
+    ]
+    tail = max(overpromise, key=lambda r: (r["count"], r["mean_pred"])) if overpromise else None
     verdict = (
         "well calibrated"
         if ece < 0.05
@@ -442,23 +468,31 @@ def _calibration_read(cal: dict) -> str:
         if ece < 0.10
         else "materially miscalibrated"
     )
-    slope = cal.get("slope")
+    if tail is not None and verdict in ("well calibrated", "roughly calibrated"):
+        verdict += " in the bulk"
+    # Global slope tilt only when NO specific tail is named. Over the compressed
+    # pick range the slope is dragged by the tail bucket, so a blanket
+    # "overconfident" would contradict "well calibrated in the bulk" — the tail
+    # sentence carries the overconfidence signal more honestly there.
     tilt = ""
-    if _finite(slope):
+    if tail is None and _finite(slope):
         if slope < 0.85:
-            tilt = " — the probabilities are overconfident (too extreme)"
+            tilt = f" — the {noun_low} are overconfident (too extreme)"
         elif slope > 1.15:
-            tilt = " — the probabilities are underconfident (too timid)"
-    bss = cal.get("bss")
-    skill = ""
-    if _finite(bss) and bss <= 0:
-        skill = (
-            " The probabilities add no skill over just predicting each day's base rate (BSS ≤ 0)."
+            tilt = f" — the {noun_low} are underconfident (too timid)"
+    tail_txt = ""
+    if tail is not None:
+        # Direction (overconfident) is robust; the tail is concentrated in a few
+        # regime-days, so hedge the magnitude (quant-skeptic Note C).
+        tail_txt = (
+            f" But {noun_low} it calls ~{tail['mean_pred']:.0%} reach only "
+            f"~{tail['reach_rate']:.0%} — overconfident in the tail (direction robust; the "
+            f"tail is regime-clustered, so read it as a direction, not a hard magnitude)."
         )
     return (
-        f"Picks the model calls ~{rep['mean_pred']:.0%} reached +2% about "
+        f"{noun_cap} the model calls ~{rep['mean_pred']:.0%} reached +2% about "
         f"{rep['reach_rate']:.0%} of the time. Averaged over all buckets the "
-        f"probability is off by {ece:.0%} — {verdict}{tilt}.{skill}"
+        f"probability is off by {ece:.0%} — {verdict}{tilt}.{tail_txt}"
     )
 
 
@@ -485,50 +519,83 @@ def _regime_note(cal: dict) -> str:
             "can average away a regime-specific miss."
         )
     return (
-        '<p class="sub" style="margin-top:8px">By base-rate regime (walk-forward): '
-        + " · ".join(cells)
-        + f".{flag}</p>"
+        '<p class="sub" style="margin-top:8px">By base-rate regime (walk-forward, '
+        "all names, ranking skill): " + " · ".join(cells) + f".{flag}</p>"
     )
 
 
 def _calibration_panel(benchmark: tuple[int, dict, object, object] | None) -> str:
-    """ "Calibration (walk-forward)" section: a BSS tile, the reliability curve,
-    a plain-language read, and the per-regime note. Answers "can I trust the
-    probability". Degrades gracefully — like the other benchmark tiles — when no
-    touch-era benchmark is recorded, or a pre-Stage-C benchmark carries no
-    calibration block. Clearly backtest-labelled; no dollars."""
+    """ "Calibration (walk-forward)" section. The PRIMARY reliability curve + read
+    are on the TOP-N LIQUID PICKS — the population the user acts on ("a pick
+    called X% reaches ~X%?"). The all-names Brier skill score rides as an
+    explicitly-labelled SECONDARY tile (ranking discrimination over the daily
+    base rate — never implying it describes the picks). Degrades gracefully: no
+    touch-era benchmark, or a pre-Stage-C row with no calibration block, or an
+    older touch row that carries all-names calibration but no pick block (the
+    curve then falls back to all names, loudly labelled). Backtest; no dollars."""
     header = "<h2>Calibration (walk-forward)</h2>"
     empty = (
         header + '<div class="card"><p class="empty">No touch-era benchmark yet — run '
-        "twopercent benchmark to measure whether the predicted probabilities are "
-        "honest (a 70% pick reaching +2% ~70% of the time).</p></div>"
+        "twopercent benchmark to measure whether a pick the model calls ~70% "
+        "reaches +2% about 70% of the time.</p></div>"
     )
     if benchmark is None:
         return empty
     cal = benchmark[1].get("calibration")
     if not cal or not cal.get("reliability"):
         return empty
+
+    # Secondary: all-names Brier skill score (ranking discrimination). Labelled so
+    # it is never read as "the picks add no skill" — it is a different question.
     bss = cal.get("bss")
     bss_val = f"{bss:+.2f}" if _finite(bss) else "—"
     bss_up = "up" if _finite(bss) and bss > 0 else ""
     tile = (
         '<div class="tiles">'
-        f'<div class="tile"><span class="label">Brier skill score{_info("t_bss")}</span>'
-        f'<b class="{bss_up}">{bss_val}</b>'
-        f'<span class="cmp">vs predicting the daily base rate · {cal["n"]:,} test '
+        f'<div class="tile"><span class="label">Ranking skill · BSS (all names)'
+        f'{_info("t_bss")}</span><b class="{bss_up}">{bss_val}</b>'
+        f'<span class="cmp">vs the daily base rate · {cal["n"]:,} all-names test '
         "predictions</span></div></div>"
     )
+
+    # Primary: the pick population the user acts on, falling back to all names
+    # (loudly) only when an older row carries no pick block.
+    picks = cal.get("picks")
+    if picks and any(r["count"] for r in picks.get("reliability", [])):
+        reliability = picks["reliability"]
+        slope = picks.get("slope")
+        pop_label = f"top-{picks['top_n']} picks"
+        read = _calibration_read(reliability, slope, "Picks", "picks")
+        floor_note = (
+            f'<p class="sub" style="margin-top:10px">Reliability of the top-'
+            f"{picks['top_n']} liquidity-floored PICKS — the population you act on — "
+            f"over {picks['n']:,} pick-predictions on {picks['n_days']} test days, "
+            "out-of-sample per fold.</p>"
+        )
+    else:
+        reliability = cal["reliability"]
+        slope = cal.get("slope")
+        pop_label = "all names"
+        read = _calibration_read(reliability, slope, "Predictions", "predictions")
+        floor_note = (
+            '<p class="sub" style="margin-top:10px"><b>No pick-population block '
+            "recorded yet</b> — showing all-names reliability (a different question "
+            "from the picks you act on). Re-run twopercent benchmark to record it.</p>"
+        )
+
     return (
         header
         + tile
         + "<div class='card'>"
-        + _reliability_svg(cal["reliability"])
-        + f'<p class="sub" style="margin-top:10px">{html.escape(_calibration_read(cal))}</p>'
+        + _reliability_svg(reliability, pop_label)
+        + floor_note
+        + f'<p class="sub" style="margin-top:6px">{html.escape(read)}</p>'
         + _regime_note(cal)
-        + '<p class="sub" style="margin-top:8px">Walk-forward on the all-names '
-        "test-fold predictions (same population as the benchmark AUC/Brier) — the "
-        "model never trains on the days it scores. Backtest, not the live record; "
-        "measured, not recalibrated.</p>" + "</div>"
+        + '<p class="sub" style="margin-top:8px">Reliability curve: the top-N '
+        "liquidity-floored picks, out-of-sample per fold — the population you act "
+        "on. BSS tile + regime line: all names (ranking skill), same population as "
+        "the benchmark AUC/Brier. Walk-forward — the model never trains on the days "
+        "it scores. Backtest, not the live record; measured, not recalibrated.</p>" + "</div>"
     )
 
 

@@ -212,7 +212,7 @@ def test_dashboard_reset_note_at_cutover_without_touch_prediction(modeled):
     assert "Live reach-record began" not in content  # no touch prediction yet
 
 
-def _calibration_metrics(bss=0.18, reliability=None, regimes=None) -> dict:
+def _calibration_metrics(bss=0.18, reliability=None, regimes=None, picks=True) -> dict:
     """A recorded touch-era benchmark metrics dict carrying a calibration block."""
     if reliability is None:
         reliability = [
@@ -255,6 +255,34 @@ def _calibration_metrics(bss=0.18, reliability=None, regimes=None) -> dict:
                 "slope": 0.70,
             },
         ]
+    calibration = {
+        "population": "all_names_test",
+        "n": 12000,
+        "n_days": 120,
+        "n_bins": 10,
+        "brier": 0.19,
+        "brier_ref": 0.22,
+        "bss": bss,
+        "slope": 0.9,
+        "reliability": reliability,
+        "regimes": regimes,
+    }
+    if picks:
+        # Picks concentrate at the modal ~0.74 (well calibrated) with a small
+        # overconfident 0.8-0.9 tail — the real champion shape.
+        calibration["picks"] = {
+            "population": "top_n_liquid_picks",
+            "top_n": 20,
+            "n": 9000,
+            "n_days": 120,
+            "n_bins": 10,
+            "slope": 0.88,
+            "reliability": [
+                {"lo": 0.6, "hi": 0.7, "mean_pred": 0.65, "reach_rate": 0.64, "count": 1200},
+                {"lo": 0.7, "hi": 0.8, "mean_pred": 0.74, "reach_rate": 0.744, "count": 7000},
+                {"lo": 0.8, "hi": 0.9, "mean_pred": 0.83, "reach_rate": 0.72, "count": 800},
+            ],
+        }
     return {
         "auc": 0.72,
         "lift": 2.15,
@@ -262,32 +290,43 @@ def _calibration_metrics(bss=0.18, reliability=None, regimes=None) -> dict:
         "base_rate": 0.34,
         "top_n": 20,
         "brier": 0.19,
-        "calibration": {
-            "population": "all_names_test",
-            "n": 12000,
-            "n_days": 120,
-            "n_bins": 10,
-            "brier": 0.19,
-            "brier_ref": 0.22,
-            "bss": bss,
-            "slope": 0.9,
-            "reliability": reliability,
-            "regimes": regimes,
-        },
+        "calibration": calibration,
     }
 
 
-def test_calibration_panel_renders_from_recorded_metrics():
-    benchmark = (7, _calibration_metrics(bss=0.18), None, None)
-    panel = dashboard._calibration_panel(benchmark)
+def test_calibration_panel_leads_with_picks_and_labels_bss_all_names():
+    # FIX B: the PRIMARY curve + read are the top-N picks (what the user acts on);
+    # the all-names BSS is a SECONDARY, explicitly-labelled tile — never implying
+    # it describes the picks.
+    panel = dashboard._calibration_panel((7, _calibration_metrics(bss=0.18), None, None))
     assert "Calibration (walk-forward)" in panel
-    assert "Brier skill score" in panel and ">+0.18<" in panel  # signed BSS tile
-    assert "<svg" in panel  # reliability curve rendered
-    assert "perfect calibration" in panel  # the diagonal legend
-    assert "reached +2% about" in panel  # plain-language read, computed from buckets
-    assert "By base-rate regime" in panel  # regimes surfaced, not only pooled
-    assert "12,000 test predictions" in panel
-    assert "$" not in panel  # no dollars anywhere in the predictor's calibration
+    assert "Ranking skill · BSS (all names)" in panel and ">+0.18<" in panel  # labelled BSS
+    assert "all-names test predictions" in panel  # the tile names its population
+    assert "top-20 picks" in panel  # the curve legend names the pick population
+    assert "top-20 liquidity-floored PICKS" in panel  # the read caption
+    assert "Picks the model calls" in panel  # read uses pick language, not "70% pick"
+    assert "<svg" in panel and "perfect calibration" in panel
+    assert "By base-rate regime" in panel and "all names, ranking skill" in panel
+    assert "$" not in panel
+
+
+def test_calibration_panel_curve_is_picks_reliability_with_tail_named():
+    # The picks curve concentrates at the modal ~74% (calibrated) but carries a
+    # small 0.8-0.9 overconfident tail — the read must show BOTH, honestly.
+    panel = dashboard._calibration_panel((7, _calibration_metrics(), None, None))
+    assert "~74% reached +2% about 74%" in panel  # modal pick is calibrated
+    assert "in the bulk" in panel  # not an unqualified "well calibrated"
+    assert "~83% reach only ~72%" in panel  # the overconfident tail is named
+
+
+def test_calibration_panel_falls_back_to_all_names_when_no_pick_block():
+    # An older touch row recorded before pick-calibration existed: the curve falls
+    # back to all-names, LOUDLY labelled (not silently mislabelled as picks).
+    panel = dashboard._calibration_panel((7, _calibration_metrics(picks=False), None, None))
+    assert "No pick-population block recorded yet" in panel
+    assert "all names" in panel
+    assert "Re-run twopercent benchmark" in panel
+    assert "Predictions the model calls" in panel  # all-names noun, not "Picks"
 
 
 def test_calibration_panel_flags_regime_disagreement():
@@ -304,12 +343,36 @@ def test_calibration_read_is_honest_about_miscalibration():
         {"lo": 0.0, "hi": 0.1, "mean_pred": 0.05, "reach_rate": 0.05, "count": 100},
         {"lo": 0.9, "hi": 1.0, "mean_pred": 0.9, "reach_rate": 0.4, "count": 100},
     ]
-    cal = _calibration_metrics(reliability=reliability)["calibration"]
-    cal["slope"] = 0.6  # steep overconfidence
-    read = dashboard._calibration_read(cal)
+    read = dashboard._calibration_read(reliability, 0.6, "Picks", "picks")
     assert "materially miscalibrated" in read
     assert "overconfident" in read
-    assert "~90% reached +2% about 40%" in read  # honest to the actual bucket
+    assert "~90%" in read and "~40%" in read  # honest to the actual bucket
+
+
+def test_calibration_read_names_a_small_overconfident_tail_not_averaged_away():
+    # THE adversarial case both reviewers asked for: a large well-calibrated bulk
+    # plus a SMALL overconfident high-prob bucket. The count-weighted ECE is tiny
+    # (the bulk dominates), so a weighted verdict alone would print "well
+    # calibrated" — but the read must NAME the tail miss regardless of its count.
+    reliability = [
+        {"lo": 0.1, "hi": 0.2, "mean_pred": 0.15, "reach_rate": 0.15, "count": 5000},
+        {"lo": 0.2, "hi": 0.3, "mean_pred": 0.25, "reach_rate": 0.25, "count": 5000},
+        {"lo": 0.3, "hi": 0.4, "mean_pred": 0.35, "reach_rate": 0.35, "count": 5000},
+        {"lo": 0.8, "hi": 0.9, "mean_pred": 0.85, "reach_rate": 0.60, "count": 50},  # tail
+    ]
+    read = dashboard._calibration_read(reliability, 0.95, "Picks", "picks")
+    assert "well calibrated" not in read or "in the bulk" in read  # never unqualified
+    assert "in the bulk" in read
+    assert "~85%" in read and "reach only ~60%" in read  # the tail is named
+    assert "regime-clustered" in read  # magnitude hedged (quant-skeptic Note C)
+
+
+def test_calibration_read_uses_population_noun():
+    reliability = [{"lo": 0.7, "hi": 0.8, "mean_pred": 0.74, "reach_rate": 0.74, "count": 900}]
+    picks_read = dashboard._calibration_read(reliability, 1.0, "Picks", "picks")
+    names_read = dashboard._calibration_read(reliability, 1.0, "Predictions", "predictions")
+    assert picks_read.startswith("Picks the model calls")
+    assert names_read.startswith("Predictions the model calls")
 
 
 def test_calibration_panel_degrades_without_benchmark_or_block():
@@ -338,8 +401,9 @@ def test_dashboard_render_includes_calibration_panel(modeled, tmp_path):
     dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5)
     content = out.read_text()
     section = content.split("Calibration (walk-forward)", 1)[1].split("Track record", 1)[0]
-    assert "Brier skill score" in section and ">+0.12<" in section
+    assert "Ranking skill · BSS (all names)" in section and ">+0.12<" in section
     assert "<svg" in section
+    assert "top-20 liquidity-floored PICKS" in section  # picks-primary curve
     assert "same population as the benchmark AUC/Brier" in section  # WF labelling
     assert "$" not in section
 

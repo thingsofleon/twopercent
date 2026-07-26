@@ -170,6 +170,16 @@ def test_benchmark_records_walk_forward_calibration(con, monkeypatch):
     assert cal["regimes"]
     assert {r["name"] for r in cal["regimes"]} <= {"low", "medium", "high"}
 
+    # The pick population the user ACTS on is recorded separately: reliability of
+    # the top-N liquid picks, no BSS (a post-selection BSS would mislead).
+    picks = cal["picks"]
+    assert picks["population"] == "top_n_liquid_picks"
+    assert picks["top_n"] == 5
+    assert "bss" not in picks  # never a misleading post-selection skill score
+    assert len(picks["reliability"]) == 10
+    # Every recorded pick is a top-N pick on some scored day: n <= test_days * top_n.
+    assert 0 < picks["n"] <= metrics["test_days"] * 5
+
 
 def test_benchmark_calibration_persists_in_metrics_json(con, monkeypatch):
     monkeypatch.setattr(backtest, "MIN_TRAIN_ROWS", 500)

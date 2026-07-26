@@ -104,6 +104,8 @@ def run_benchmark(
     unscoreable_days = 0
     daily_picks: list[tuple[dt.date, int, float]] = []
     rank_rows: list[tuple[dt.date, int, float, int]] = []
+    pick_probs: list[pd.Series] = []
+    pick_labels: list[pd.Series] = []
     first_run_start: dt.date | None = None
 
     for month_start, month_end in folds:
@@ -142,6 +144,12 @@ def run_benchmark(
                 continue
             top = eligible.nlargest(top_n, "prob")
             daily_hits.append(top["did_2pct_next"].mean())
+            # Calibration on the population the user ACTS on: the same top-N
+            # liquid picks that drive precision_at_n, out-of-sample per fold.
+            # A pick called X% should reach ~X% — the all-names view answers a
+            # different question (ranking discrimination) and buries this one.
+            pick_probs.append(top["prob"])
+            pick_labels.append(top["did_2pct_next"])
             # One frame drives both the recorded per-rank rows (experiment_daily,
             # for the dashboard trailing-window reach explorer) and the top-1/
             # top-5 reach aggregates (rank 1 row, mean of ranks 1-5). The per-rank
@@ -210,11 +218,22 @@ def run_benchmark(
         "test_rows": int(len(labels)),
         "test_days": len(daily_hits),
         "folds": folds_run,
-        # Walk-forward calibration on the all-names test predictions (same
-        # population as brier/auc above): reliability buckets, Brier skill score
-        # vs the daily base rate, and per-regime reports. MEASURED only — Stage C
-        # does not recalibrate the model.
-        "calibration": calibration.calibration_report(probs.to_numpy(), labels.to_numpy(), dates),
+        # Walk-forward calibration. Two populations, two questions:
+        #   - all-names (same rows as brier/auc): reliability + Brier SKILL score
+        #     vs the daily base rate + per-regime — ranking discrimination.
+        #   - picks (top-N liquid, nested under "picks"): reliability of the
+        #     numbers the user acts on — a pick called X% should reach ~X%.
+        #     No BSS on picks (post-selection BSS is a misleading artifact).
+        # MEASURED only — Stage C does not recalibrate the model.
+        "calibration": {
+            **calibration.calibration_report(probs.to_numpy(), labels.to_numpy(), dates),
+            "picks": calibration.pick_calibration_report(
+                pd.concat(pick_probs).to_numpy(),
+                pd.concat(pick_labels).to_numpy(),
+                top_n=top_n,
+                n_days=len(daily_hits),
+            ),
+        },
     }
     if record:
         params = {

@@ -2,7 +2,7 @@ import pandas as pd
 import pytest
 
 from tests.conftest import seed_history
-from twopercent import dashboard, store
+from twopercent import dashboard, store, track
 from twopercent.predict import predict_for
 
 RUNNER_OC = [0.03 + 0.001 * (i % 5) for i in range(60)]
@@ -108,6 +108,77 @@ def test_dashboard_empty_track_record_state(modeled, tmp_path):
     assert "No touch-era benchmark yet" in content
     assert "twopercent benchmark" in content
     assert "LIVE: no live days yet" in content
+    # The empty live record must not VANISH (that reads the backtest tiles as
+    # system performance) — an explicit placeholder tile provides the contrast.
+    assert "no live days yet — the live record starts" in content
+
+
+def _scored(rows: list[dict]) -> track.TrackRecord:
+    """A TrackRecord.scored-shaped frame from per-day dicts (hits, n_scored,
+    base_rate, late) — precision/lift derived so the frame is self-consistent."""
+    frame = pd.DataFrame(rows)
+    frame["precision"] = frame["hits"] / frame["n_scored"]
+    frame["lift"] = frame["precision"] / frame["base_rate"]
+    frame["signal_date"] = pd.bdate_range("2026-06-01", periods=len(frame)).date
+    frame["target_date"] = pd.bdate_range("2026-06-02", periods=len(frame)).date
+    return track.TrackRecord(scored=frame, pending=[])
+
+
+def test_live_tiles_pool_live_days_only_never_the_backfilled_mix():
+    # THE backfill-path guard (CLAUDE.md signature failure mode): a live day and
+    # a backfilled/late day. Wrong-pooling both gives reach 9/20 = 45%; the live
+    # tiles must count the LIVE day ONLY → reach 80%, excess +60.0%, lift 4.00×.
+    record = _scored(
+        [
+            {"hits": 8, "n_scored": 10, "base_rate": 0.20, "late": False},  # live
+            {"hits": 1, "n_scored": 10, "base_rate": 0.20, "late": True},  # backfilled
+        ]
+    )
+    tiles = dashboard._live_tiles(record, top=10)
+    assert "Live reach-rate" in tiles
+    assert ">80%<" in tiles  # 8/10, the live day alone
+    assert "45%" not in tiles  # never the (8+1)/(10+10) wrong-pooled mix
+    assert "+60.0%" in tiles  # excess = 0.80 − 0.20 (base from the live day only)
+    assert "4.00×" in tiles  # lift = 0.80 / 0.20
+    # Deleting the `~late` filter (the ship-green regression) flips all three.
+
+
+def test_live_tiles_empty_when_all_days_backfilled():
+    # Only backfilled days scored: no live number may be shown — the placeholder
+    # tile appears instead of a wrongly-populated "live" reach-rate.
+    record = _scored([{"hits": 9, "n_scored": 10, "base_rate": 0.20, "late": True}])
+    tiles = dashboard._live_tiles(record, top=10)
+    assert "no live days yet" in tiles
+    assert "90%" not in tiles  # the backfilled day's reach never surfaces as "live"
+
+
+def test_benchmark_tiles_populated_render_walk_forward_values():
+    # FIX 4: the populated benchmark path renders the three Walk-forward tiles
+    # with the ledger values, all carrying the "Walk-forward" qualifier so none
+    # reads as the live/default number once the live record fills.
+    benchmark = (
+        7,
+        {"auc": 0.72, "lift": 2.15, "precision_at_n": 0.74, "base_rate": 0.34, "top_n": 20},
+        None,
+        None,
+    )
+    tiles = dashboard._benchmark_tiles(benchmark, top=20)
+    assert "Walk-forward AUC" in tiles and ">0.720<" in tiles
+    assert "Walk-forward lift" in tiles and ">2.15×<" in tiles
+    assert "Walk-forward reach-rate (top 20)" in tiles and ">74%<" in tiles
+    assert "base rate 34%" in tiles
+    # Every benchmark tile is qualified "Walk-forward" — no bare "Reach-rate".
+    assert "Reach-rate (top 20)" not in tiles.replace("Walk-forward reach-rate", "")
+
+
+def test_title_and_h1_say_reach_not_open_to_close(modeled, tmp_path):
+    # FIX 4: guard a title/h1 regression back to the misleading close wording.
+    out = tmp_path / "dash.html"
+    dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5)
+    content = out.read_text()
+    assert "<title>twopercent — reach +2% intraday</title>" in content
+    assert "tickers likely to REACH +2% intraday" in content  # h1
+    assert "open-to-close candidates" not in content  # the stale, wrong label
 
 
 def test_dashboard_clean_reset_note(modeled, tmp_path):

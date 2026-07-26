@@ -154,12 +154,18 @@ _INFO_TEXT = {
     # base-rate-invariant evidence) then the accumulating live reach record.
     "t_auc": "Walk-forward AUC of the ranking: the chance a random reacher is "
     "ranked above a random non-reacher. Base-rate-invariant — it does not move "
-    "when the +2% base rate does, so it is the honest headline.",
+    "when the +2% base rate does, so it is the honest headline. Backtest number: "
+    "the model never trains on the days it scores, but the system was designed "
+    "with this history visible, so it is not yet live performance.",
     "t_bench_lift": "Walk-forward lift: how much more often the top-N picks reach "
     "+2% than a random symbol would. Above 1× beats chance. Lift compresses at "
-    "high base rates (it is capped at 1/base-rate), so read AUC and excess too.",
+    "high base rates (it is capped at 1/base-rate), so read AUC and excess too. "
+    "Backtest number, designed with this history visible — not yet live "
+    "performance; see the live tiles for the clean forward record.",
     "t_reach": "Walk-forward reach-rate: the share of the top-N picks that reached "
-    "+2% intraday, over the benchmark test window, versus the all-names base rate.",
+    "+2% intraday, over the benchmark test window, versus the all-names base rate. "
+    "Backtest number, designed with this history visible — not yet live "
+    "performance; the live tiles carry the clean forward record.",
     "t_cands": "How many symbols the model ranked for the next trading day.",
     "t_live_reach": "Live reach-rate: of the top-N picks logged before the market "
     "opened, the share that then reached +2% intraday. Backfilled days excluded.",
@@ -318,9 +324,17 @@ def _benchmark_tiles(benchmark: tuple[int, dict, object, object] | None, top: in
         f'<div class="tile"><span class="label">Walk-forward lift{_info("t_bench_lift")}</span>'
         f'<b class="{lift_up}">{lift_val}</b>'
         f'<span class="cmp">top-{bn} reach vs base</span></div>'
-        f'<div class="tile"><span class="label">Reach-rate (top {bn}){_info("t_reach")}</span>'
+        f'<div class="tile"><span class="label">Walk-forward reach-rate (top {bn})'
+        f"{_info('t_reach')}</span>"
         f'<b>{reach_val}</b><span class="cmp">{base_cmp}</span></div>'
     )
+
+
+_LIVE_EMPTY_TILE = (
+    '<div class="tile"><span class="label">Live reach-rate{info}</span>'
+    '<b>—</b><span class="cmp">no live days yet — the live record starts with '
+    "the first touch prediction, kept separate from the backtest tiles</span></div>"
+)
 
 
 def _live_tiles(record: track.TrackRecord, top: int) -> str:
@@ -328,13 +342,19 @@ def _live_tiles(record: track.TrackRecord, top: int) -> str:
     base). LIVE days ONLY (late == False): a backfilled day's outcome was known
     when the pick was saved, so pooling it in would inflate a "live" number —
     exactly the silent success this project guards against. Pooled (base rate
-    pick-weighted like precision). Never dollars. Empty until the first live day
-    — the reset/backfill notes explain why the tiles are absent."""
-    if record.scored.empty:
-        return ""
-    live = record.scored[~record.scored["late"].astype(bool)]
+    pick-weighted like precision). Never dollars.
+
+    Until the first live day the tile does NOT vanish (that would leave a skimmer
+    reading the walk-forward benchmark tiles as system performance): it renders an
+    explicit "no live days yet" placeholder so there is visible tile-level
+    contrast between the backtest and the empty forward record."""
+    live = (
+        record.scored[~record.scored["late"].astype(bool)]
+        if not record.scored.empty
+        else record.scored
+    )
     if live.empty:
-        return ""
+        return _LIVE_EMPTY_TILE.format(info=_info("t_live_reach"))
     total_n = live["n_scored"].sum()
     reach = live["hits"].sum() / total_n
     # Weight base rates like precision is pooled, or the headline lift is

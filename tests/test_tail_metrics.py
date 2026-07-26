@@ -31,7 +31,7 @@ def _save(con, ranked, strategy="s", live=False):
         )
 
 
-def test_pick_performance_math_and_costed_growth(con):
+def test_pick_performance_math_and_reach(con):
     seed_history(con, OC)
     _save(con, ["WIN", "LOSE", "ALSO"], live=True)
 
@@ -40,15 +40,15 @@ def test_pick_performance_math_and_costed_growth(con):
     assert picks.late_days == 0
     row = picks.daily.iloc[0]
     assert row["top1_symbol"] == "WIN"
+    # top1_return keeps the open-to-close magnitude as an archival column, but
+    # the reach flag (top1_hit) is what the dashboard shows — no $-growth.
     assert abs(row["top1_return"] - 0.04) < 1e-12
     assert row["top1_hit"] == 1
-    assert abs(row["topn_return"] - (0.04 - 0.03 + 0.025) / 3) < 1e-12
-    assert row["topn_hits"] == 2  # WIN and ALSO
+    assert row["topn_hits"] == 2  # WIN and ALSO reached +2% intraday
     assert row["n_avail"] == 3
 
     assert picks.precision_at_1() == 1.0
-    # Growth is net of the assumed round-trip cost.
-    assert abs(picks.growth("top1_return") - (1 + 0.04 - track.COST_ROUND_TRIP)) < 1e-12
+    assert not hasattr(picks, "growth")  # Stage B removed the trading-P&L layer
 
 
 def test_pick_performance_top1_is_best_available(con):
@@ -67,24 +67,21 @@ def test_pick_performance_empty(con):
     picks = track.daily_pick_performance(con, "nope")
     assert picks.days == 0
     assert picks.precision_at_1() is None
-    assert picks.growth() is None
 
 
-def test_benchmark_reports_tail_metrics_and_sim(con, monkeypatch):
+def test_benchmark_reports_reach_metrics_no_growth(con, monkeypatch):
     monkeypatch.setattr(backtest, "MIN_TRAIN_ROWS", 500)
     seed_planted(con, n_each=30)
     metrics = backtest.run_benchmark(con, "baseline_gbm_v1", months=2, top_n=5)
 
     # Runners do +3.0–3.4% every day and are perfectly identifiable: the top
-    # pick hits every day and $1 compounds at roughly (1 + 3.2% − cost)^days.
+    # pick reaches +2% every day.
     assert metrics["precision_at_1"] == 1.0
     assert metrics["precision_at_5"] == 1.0
-    days = metrics["test_days"]
-    low = (1 + 0.030 - track.COST_ROUND_TRIP) ** days
-    high = (1 + 0.034 - track.COST_ROUND_TRIP) ** days
-    assert low * 0.99 <= metrics["sim_top1_growth"] <= high * 1.01
-    assert metrics["sim_top5_growth"] > 1.0
-    assert len(metrics["sim_top1_growth_by_fold"]) == metrics["folds"]
+    assert metrics["lift"] > 1.0
+    # Stage B removed the trading-P&L layer — no $-growth metrics recorded.
+    assert not any(k.startswith("sim_") for k in metrics)
+    assert "sim_top1_growth" not in metrics and "sim_top5_growth" not in metrics
 
 
 def test_next_oc_return_is_label_side(con):
@@ -129,7 +126,7 @@ def con_with_universe(con):
     return con
 
 
-def test_dashboard_shows_pick_tiles_and_column(con_with_universe, tmp_path):
+def test_dashboard_shows_reach_tiles_and_column(con_with_universe, tmp_path):
     from twopercent import dashboard
     from twopercent.predict import predict_for
 
@@ -139,7 +136,10 @@ def test_dashboard_shows_pick_tiles_and_column(con_with_universe, tmp_path):
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(dashboard.build_html(con_with_universe, result, top=3))
     content = out.read_text()
-    assert "Top pick hit rate (live)" in content
-    assert "$1 → top pick daily (live)" in content
+    # Live reach-record tiles lead with prediction quality, never dollars.
+    assert "Live reach-rate" in content
+    assert "Live lift" in content
+    assert "Live excess" in content
+    assert "$" not in content  # no money anywhere
     assert "<th>Top pick" in content  # column header (now carries an info icon)
     assert "WIN" in content

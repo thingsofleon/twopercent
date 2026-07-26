@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
 import duckdb
-import numpy as np
 import pandas as pd
 
 from twopercent import scan, store
@@ -40,21 +39,17 @@ COMPLETENESS_MIN_FRACTION = 0.9
 COMPLETENESS_MEDIAN_WINDOW = 20
 COMPLETENESS_MIN_PRIOR_DATES = 5
 
-# Assumed round-trip trading cost (entry + exit) per daily position, applied
-# to every simulated day. 30 bps is a deliberate, documented GUESS pitched for
-# liquid-ish small caps at open/close; real spreads on thin names can be far
-# worse. The simulation is an upper bound on execution quality, not a promise.
-COST_ROUND_TRIP = 0.003
-
 
 @dataclass
 class PickPerformance:
     """Per-day realized outcomes of the top-ranked picks, plus summaries.
 
-    `late` marks days whose predictions were NOT created before the target
-    day's market open (backfills, and evening-of-target saves) — those days
-    are excluded from the headline money metrics by default: a compounded
-    dollar figure that includes known outcomes is not forecasting skill.
+    Reach-predictor (Stage B): this app reports prediction QUALITY, never
+    trading P&L, so the summaries are reach-rates — no dollar growth. `late`
+    marks days whose predictions were NOT created before the target day's
+    market open (backfills, and evening-of-target saves); the live reach-rate
+    excludes them by default, since an outcome that was already known when the
+    prediction was saved is not forecasting skill.
     """
 
     daily: pd.DataFrame  # target_date, top1_symbol, top1_rank, top1_return,
@@ -76,17 +71,9 @@ class PickPerformance:
         frame = self.daily if include_late else self.live
         return float(frame["top1_hit"].mean()) if len(frame) else None
 
-    def growth(self, column: str = "top1_return", include_late: bool = False) -> float | None:
-        """Growth of $1 compounding `column` daily, net of COST_ROUND_TRIP.
 
-        Live days only by default — see class docstring."""
-        frame = self.daily if include_late else self.live
-        if not len(frame):
-            return None
-        return float((1 + frame[column] - COST_ROUND_TRIP).prod())
-
-
-# Trailing windows for the simulated walk-forward record, in TRADING days.
+# Trailing windows for the walk-forward reach record, in TRADING days. Shared
+# by the dashboard's trailing-window explorer (reach-rate / base rate / lift).
 SIM_WINDOW_SPECS = [
     ("1 week", 5),
     ("1 month", 21),
@@ -94,71 +81,6 @@ SIM_WINDOW_SPECS = [
     ("6 months", 126),
     ("1 year", 252),
 ]
-
-
-@dataclass
-class SimWindows:
-    """Trailing-window summary of a benchmark's per-rank sim record for one basket.
-
-    `days_available` is always reported, even when every window is omitted,
-    so callers can say "N sim days available" instead of silently showing
-    nothing (a window is NEVER computed on a shorter span than requested).
-    """
-
-    days_available: int
-    basket: int
-    windows: list[dict]  # label, days, growth, hit_rate, short_days
-
-
-def sim_windows(daily: pd.DataFrame, n: int) -> SimWindows:
-    """Growth of $1 and hit rates of the top-`n` basket over trailing windows.
-
-    CONTIGUOUS RANKS ONLY: baskets by `rank <= n`, which equals the
-    dashboard's first-n-available rule only when each day's ranks are
-    1..k with no gaps — true for experiment_daily rows by construction.
-    Never feed live-style frames (missing ranks) here; use the dashboard
-    summarizer, whose first-n rule IS the substitution semantics.
-
-    `daily` is a per-rank experiment_daily frame (ordered by target_date,
-    rank) with columns target_date, rank, ret, hit. Each day's basket return
-    is the mean ret of ranks <= n present that day; days with fewer than n
-    ranks use what exists and are counted in the window's `short_days` (the
-    caller must disclose them — partial coverage is never silent). Growth
-    compounds daily net of COST_ROUND_TRIP, same formula as
-    PickPerformance.growth. Hits were computed at benchmark time with the
-    epsilon-guarded threshold — no re-derivation here. Windows longer than
-    the available history are omitted. A non-finite ret/hit raises: skipna
-    aggregation would silently compound a shorter window than claimed.
-    """
-    if len(daily):
-        corrupt = int(
-            (~np.isfinite(daily["ret"].astype(float))).sum()
-            + (~np.isfinite(daily["hit"].astype(float))).sum()
-        )
-        if corrupt:
-            raise ValueError(
-                f"sim daily frame has {corrupt} non-finite ret/hit value(s) — "
-                "refusing to summarize around corrupt rows"
-            )
-    basket = daily[daily["rank"] <= n]
-    per_day = basket.groupby("target_date").agg(
-        ret=("ret", "mean"), hit=("hit", "mean"), picks=("rank", "count")
-    )
-    windows: list[dict] = []
-    for label, w in SIM_WINDOW_SPECS:
-        if len(per_day) < w:
-            continue
-        tail = per_day.iloc[-w:]
-        windows.append(
-            {
-                "label": label,
-                "days": w,
-                "growth": float((1 + tail["ret"] - COST_ROUND_TRIP).prod()),
-                "hit_rate": float(tail["hit"].mean()),
-                "short_days": int((tail["picks"] < n).sum()),
-            }
-        )
-    return SimWindows(days_available=len(per_day), basket=n, windows=windows)
 
 
 def daily_base_rates(con: duckdb.DuckDBPyConnection, dates: list[dt.date]) -> dict[dt.date, float]:
@@ -256,7 +178,7 @@ def _late_lookup(con: duckdb.DuckDBPyConnection, strategy: str):
 def _shadow_late_lookup(con: duckdb.DuckDBPyConnection, challenger: str):
     """Callable target_date -> late flag for a shadow challenger's picks — the
     SAME 09:30-ET rule as the champion, so backfilled shadow picks are excluded
-    from the forward record exactly like the champion's money tiles."""
+    from the forward record exactly like the champion's live reach-rate."""
     return _late_from_created(
         _created_by_target(con, "shadow_predictions", "challenger", challenger)
     )
@@ -338,7 +260,8 @@ def daily_pick_performance(
         ),
         picks AS (
             -- hit is the TOUCH event, computed per row; top1_return / topn_return
-            -- keep the open-to-close magnitude (Stage B owns the $-growth tiles).
+            -- top1_return / topn_return keep the open-to-close magnitude as an
+            -- archival return; the dashboard shows reach ✓/✗, not a $ figure.
             SELECT r.target_date, pr.rank, pr.symbol, dr.oc_return,
                    CASE WHEN {touch_event_predicate("dr.high_return", "dr.high_glitch_suspect")}
                         THEN 1 ELSE 0 END AS hit
@@ -542,7 +465,7 @@ def _score_table(
     identically. `table`/`id_col` are internal constants, never user input.
 
     ONE definition of live in the codebase: `late_lookup` is the 09:30-ET
-    any-late rule (_late_from_created), the same flag the money metrics use.
+    any-late rule (_late_from_created), the same flag the live reach-rate uses.
     A plain date-granularity comparison here would count an evening-of-target
     save (outcome fully known) as live and feed the degradation detector weaker
     evidence than the dashboard shows."""

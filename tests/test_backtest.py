@@ -90,25 +90,30 @@ def test_benchmark_persists_per_rank_daily_rows(con, monkeypatch):
     assert dates[0] >= pd.Timestamp(experiments["test_start"].iloc[0]).date()
     assert dates[-1] <= pd.Timestamp(experiments["test_end"].iloc[0]).date()
 
-    # The persisted rank rows recompound to exactly the recorded aggregates:
-    # rank 1 → sim_top1_growth, mean of ranks 1-5 → sim_top5_growth.
-    from twopercent import track
-
+    # The persisted rank rows recompute to exactly the recorded reach aggregates:
+    # rank 1 hits → precision_at_1, mean of ranks 1-5 hits → precision_at_5.
     top1 = daily[daily["rank"] == 1]
-    growth1 = float((1 + top1["ret"] - track.COST_ROUND_TRIP).prod())
-    assert abs(round(growth1, 4) - metrics["sim_top1_growth"]) < 1e-9
-    day5 = daily[daily["rank"] <= 5].groupby("target_date")["ret"].mean()
-    growth5 = float((1 + day5 - track.COST_ROUND_TRIP).prod())
-    assert abs(round(growth5, 4) - metrics["sim_top5_growth"]) < 1e-9
+    reach1 = float(top1["hit"].mean())
+    assert abs(round(reach1, 4) - metrics["precision_at_1"]) < 1e-9
+    day5 = daily[daily["rank"] <= 5].groupby("target_date")["hit"].mean()
+    reach5 = float(day5.mean())
+    assert abs(round(reach5, 4) - metrics["precision_at_5"]) < 1e-9
+
+    # Stage B removed the $-growth metrics; the per-rank rows still carry the
+    # archival open-to-close return column and the reach flag the dashboard
+    # explorer summarizes.
+    assert set(daily.columns) >= {"target_date", "rank", "ret", "hit"}
 
     result = store.latest_experiment_daily(con, "baseline_gbm_v1")
     assert result is not None
     meta, latest_daily = result
     assert meta["seq"] == seq
     assert len(latest_daily) == len(daily)
-    # Metrics JSON stays aggregate-only — per-day rows live in their own table.
+    # Metrics JSON stays aggregate-only — per-day rows live in their own table —
+    # and carries no trading-P&L growth numbers (Stage B).
     recorded = json.loads(experiments["metrics"].iloc[0])
     assert "daily" not in recorded and "daily_picks" not in recorded
+    assert not any(k.startswith("sim_") for k in recorded)
 
 
 def test_benchmark_records_fewer_ranks_when_fewer_eligible(con, monkeypatch):

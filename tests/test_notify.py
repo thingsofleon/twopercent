@@ -132,6 +132,23 @@ def test_stats_come_from_the_ledger_never_hardcoded(con):
         assert "2025-07-01 to 2026-06-30" in body  # test window from the row
 
 
+def test_signal_email_uses_prediction_framing_not_trade_language():
+    # Stage B reframe: the email is a ranked PREDICTION of intraday reach, not a
+    # trade suggestion. Guard against the old trade/$ language sneaking back
+    # (reintroducing it would otherwise pass CI, since this file was unchanged).
+    _, text, html = notify.compose_signal_email(_prediction(), _perf(), None, FRIDAY_0800_ET)
+    for body in (text, html):
+        assert "not trade advice" in body  # _PREDICTION_NOTE
+        assert "REACH +2% intraday" in body
+        # The old trading-P&L framing must be gone from both alternatives.
+        assert "TRADE SUGGESTION" not in body and "Trade Suggestion" not in body
+        assert "$" not in body
+        assert "compounded" not in body.lower()
+        assert "bought at the open" not in body and "exited at the close" not in body
+    assert "TODAY'S CANDIDATES" in text  # reframed text section header
+    assert "Today's Candidates" in html  # reframed HTML heading
+
+
 def test_no_recorded_benchmark_says_so_instead_of_inventing_numbers():
     _, text, html = notify.compose_signal_email(_prediction(), _perf(), None, FRIDAY_0800_ET)
     for body in (text, html):

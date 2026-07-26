@@ -17,7 +17,7 @@ from decimal import ROUND_HALF_UP, Decimal
 import duckdb
 import pandas as pd
 
-from twopercent import store, track
+from twopercent import backtest, store, track
 from twopercent.predict import PredictResult, predict_for
 
 _CSS = """
@@ -150,48 +150,60 @@ html, body { background: var(--bg); margin: 0; }
 
 
 _INFO_TEXT = {
-    # Header tiles
-    "t_lift": "How much more often the top picks hit +2% than a random symbol "
-    "would, pooled across every scored day. Above 1× beats chance.",
-    "t_hit": "Share of the top-ranked picks that actually moved +2% open-to-close, "
-    "across all scored days.",
-    "t_live1": "Of live days (picks logged before the market opened), the share "
-    "where the #1 ranked pick moved +2%. Backfilled days excluded.",
-    "t_growth": "Value today of $1 placed each live day on the #1 pick — and, "
-    "alongside, on the top-5 equal-weight basket — net of assumed round-trip "
-    "costs. Live days only.",
+    # Header tiles — walk-forward benchmark (leads with base-rate-adjusted,
+    # base-rate-invariant evidence) then the accumulating live reach record.
+    "t_auc": "Walk-forward AUC of the ranking: the chance a random reacher is "
+    "ranked above a random non-reacher. Base-rate-invariant — it does not move "
+    "when the +2% base rate does, so it is the honest headline. Backtest number: "
+    "the model never trains on the days it scores, but the system was designed "
+    "with this history visible, so it is not yet live performance.",
+    "t_bench_lift": "Walk-forward lift: how much more often the top-N picks reach "
+    "+2% than a random symbol would. Above 1× beats chance. Lift compresses at "
+    "high base rates (it is capped at 1/base-rate), so read AUC and excess too. "
+    "Backtest number, designed with this history visible — not yet live "
+    "performance; see the live tiles for the clean forward record.",
+    "t_reach": "Walk-forward reach-rate: the share of the top-N picks that reached "
+    "+2% intraday, over the benchmark test window, versus the all-names base rate. "
+    "Backtest number, designed with this history visible — not yet live "
+    "performance; the live tiles carry the clean forward record.",
     "t_cands": "How many symbols the model ranked for the next trading day.",
+    "t_live_reach": "Live reach-rate: of the top-N picks logged before the market "
+    "opened, the share that then reached +2% intraday. Backfilled days excluded.",
+    "t_live_lift": "Live reach-rate ÷ base rate, pooled across live scored days. "
+    "Above 1× beats picking at random. Read alongside AUC and excess.",
+    "t_excess": "Live reach-rate minus the base rate (in percentage points), pooled "
+    "across live days. Positive means the ranking beat the market — the honesty "
+    "metric when lift compresses at a high base rate.",
     # Candidates table columns
-    "c_rank": "Rank by model probability — 1 is the most likely to move +2%.",
+    "c_rank": "Rank by model probability — 1 is the most likely to reach +2%.",
     "c_sym": "Ticker symbol.",
-    "c_prob": "Model's estimated chance the symbol moves +2% open-to-close. The "
+    "c_prob": "Model's estimated chance the symbol reaches +2% intraday. The "
     "bar is relative to today's top candidate — a ranking, not calibrated odds.",
     "c_prev": "The symbol's open-to-close return on the most recent completed day.",
     "c_vol": "Latest volume ÷ its trailing-20-day average volume (today included). "
     "Above 1× means unusually active.",
-    "c_cnt": "How many of the last 20 trading days this symbol moved +2% open-to-close.",
+    "c_cnt": "How many of the last 20 trading days this symbol reached +2% intraday.",
     "c_co": "Company name.",
     # Track-record chart + table
-    "chart": "One bar per scored day: the top-N hit rate. Green beat the market "
+    "chart": "One bar per scored day: the top-N reach-rate. Green beat the market "
     "base rate, red missed it. The amber dash marks that day's base rate — the "
-    "share of all symbols that moved +2%.",
+    "share of all symbols that reached +2% intraday.",
     "r_day": "The trading day these picks were made for.",
-    "r_pick": "The #1 ranked pick and its actual open-to-close return. A † means "
-    "the day was backfilled, not a live forecast.",
-    "r_hits": "How many of that day's scored top-N picks moved +2%.",
-    "r_hit": "Hits ÷ picks scored that day. Green beat the market base rate.",
-    "r_base": "Share of all symbols that moved +2% that day — the bar to beat.",
-    "r_lift": "Hit rate ÷ base rate. Above 1× is better than picking at random.",
+    "r_pick": "The #1 ranked pick and whether it reached +2% intraday (✓/✗). A † "
+    "means the day was backfilled, not a live forecast.",
+    "r_hits": "How many of that day's scored top-N picks reached +2%.",
+    "r_hit": "Reachers ÷ picks scored that day. Green beat the market base rate.",
+    "r_base": "Share of all symbols that reached +2% that day — the bar to beat.",
+    "r_lift": "Reach-rate ÷ base rate. Above 1× is better than picking at random.",
     # Explorer controls + table
     "e_basket": "Basket size — the top-N ranked picks each day drive the numbers below.",
     "e_window": "How many trailing trading days to summarize.",
     "e_record": "SIM is walk-forward simulation: the model never trains on the days "
     "it predicts, but the system was built with this history visible. LIVE is the "
     "picks actually logged before each open — the clean test.",
-    "e_growth": "Compounded value of $1 over the selected window, net of assumed round-trip costs.",
-    "e_hit": "Share of the basket that moved +2%, averaged over the window.",
-    "e_base": "Average share of all symbols that moved +2% over the window.",
-    "e_lift": "Hit rate ÷ base rate over the window. Above 1× beats random.",
+    "e_hit": "Share of the basket that reached +2% intraday, averaged over the window.",
+    "e_base": "Average share of all symbols that reached +2% over the window.",
+    "e_lift": "Reach-rate ÷ base rate over the window. Above 1× beats random.",
     "e_days": "Trading days included in this window.",
 }
 
@@ -276,73 +288,123 @@ def _chart_svg(scored: pd.DataFrame) -> str:
     )
 
 
-def _tiles(
-    record: track.TrackRecord, picks: track.PickPerformance, n_candidates: int, top: int
-) -> str:
-    if record.scored.empty:
-        return ""
-    total_n = record.scored["n_scored"].sum()
-    overall_p = record.scored["hits"].sum() / total_n
+def _finite(value) -> bool:
+    """A real, plottable number — not None and not a NaN (NaN survives a JSON
+    round-trip out of the ledger and passes every `>= 0` comparison silently)."""
+    return isinstance(value, int | float) and math.isfinite(value)
+
+
+def _benchmark_tiles(benchmark: tuple[int, dict, object, object] | None, top: int) -> str:
+    """Lead tiles: the walk-forward touch-era benchmark (AUC, lift, reach-rate).
+
+    AUC leads because it is base-rate-invariant; lift compresses at the high
+    touch base rate, so its tooltip and the caveats say to read AUC/excess too.
+    Degrades gracefully to one honest tile when no touch benchmark is recorded
+    (the required post-Stage-A `twopercent benchmark` op has not run yet)."""
+    if benchmark is None:
+        return (
+            '<div class="tile"><span class="label">Walk-forward benchmark</span>'
+            '<b>—</b><span class="cmp">no touch-era benchmark yet — '
+            "run twopercent benchmark</span></div>"
+        )
+    _exp_id, metrics, _ts, _te = benchmark
+    auc = metrics.get("auc")
+    lift = metrics.get("lift")
+    reach = metrics.get("precision_at_n")
+    base = metrics.get("base_rate")
+    bn = metrics.get("top_n", top)
+    auc_val = f"{auc:.3f}" if _finite(auc) else "—"
+    lift_val = f"{lift:.2f}×" if _finite(lift) else "—"
+    lift_up = "up" if _finite(lift) and lift >= 1 else ""
+    reach_val = f"{reach:.0%}" if _finite(reach) else "—"
+    base_cmp = f"base rate {base:.0%}" if _finite(base) else "base rate —"
+    return (
+        f'<div class="tile"><span class="label">Walk-forward AUC{_info("t_auc")}</span>'
+        f'<b>{auc_val}</b><span class="cmp">base-rate-invariant ranking</span></div>'
+        f'<div class="tile"><span class="label">Walk-forward lift{_info("t_bench_lift")}</span>'
+        f'<b class="{lift_up}">{lift_val}</b>'
+        f'<span class="cmp">top-{bn} reach vs base</span></div>'
+        f'<div class="tile"><span class="label">Walk-forward reach-rate (top {bn})'
+        f"{_info('t_reach')}</span>"
+        f'<b>{reach_val}</b><span class="cmp">{base_cmp}</span></div>'
+    )
+
+
+_LIVE_EMPTY_TILE = (
+    '<div class="tile"><span class="label">Live reach-rate{info}</span>'
+    '<b>—</b><span class="cmp">no live days yet — the live record starts with '
+    "the first touch prediction, kept separate from the backtest tiles</span></div>"
+)
+
+
+def _live_tiles(record: track.TrackRecord, top: int) -> str:
+    """Accumulating LIVE reach record: reach-rate, lift, and excess (reach −
+    base). LIVE days ONLY (late == False): a backfilled day's outcome was known
+    when the pick was saved, so pooling it in would inflate a "live" number —
+    exactly the silent success this project guards against. Pooled (base rate
+    pick-weighted like precision). Never dollars.
+
+    Until the first live day the tile does NOT vanish (that would leave a skimmer
+    reading the walk-forward benchmark tiles as system performance): it renders an
+    explicit "no live days yet" placeholder so there is visible tile-level
+    contrast between the backtest and the empty forward record."""
+    live = (
+        record.scored[~record.scored["late"].astype(bool)]
+        if not record.scored.empty
+        else record.scored
+    )
+    if live.empty:
+        return _LIVE_EMPTY_TILE.format(info=_info("t_live_reach"))
+    total_n = live["n_scored"].sum()
+    reach = live["hits"].sum() / total_n
     # Weight base rates like precision is pooled, or the headline lift is
     # inconsistent when day sizes / base rates differ.
-    overall_b = (record.scored["base_rate"] * record.scored["n_scored"]).sum() / total_n
-    lift = overall_p / overall_b if overall_b > 0 else float("nan")
-    tiles = (
-        '<div class="tiles">'
-        f'<div class="tile"><span class="label">Cumulative lift{_info("t_lift")}</span>'
-        f'<b class="{"up" if lift >= 1 else ""}">{lift:.2f}×</b>'
+    base = (live["base_rate"] * live["n_scored"]).sum() / total_n
+    lift = reach / base if base > 0 else float("nan")
+    excess = reach - base
+    lift_txt = f"{lift:.2f}×" if math.isfinite(lift) else "—"
+    return (
+        f'<div class="tile"><span class="label">Live reach-rate (top {top})'
+        f"{_info('t_live_reach')}</span><b>{reach:.0%}</b>"
+        f'<span class="cmp">market base {base:.0%}</span></div>'
+        f'<div class="tile"><span class="label">Live lift{_info("t_live_lift")}</span>'
+        f'<b class="{"up" if math.isfinite(lift) and lift >= 1 else ""}">{lift_txt}</b>'
         f'<span class="cmp">vs picking at random</span></div>'
-        f'<div class="tile"><span class="label">Hit rate (top {top}){_info("t_hit")}</span>'
-        f"<b>{overall_p:.0%}</b>"
-        f'<span class="cmp">market base {overall_b:.0%}</span></div>'
+        f'<div class="tile"><span class="label">Live excess{_info("t_excess")}</span>'
+        f'<b class="{"up" if excess >= 0 else ""}">{excess:+.1%}</b>'
+        f'<span class="cmp">reach-rate − base rate</span></div>'
     )
-    if picks.days:
-        # Live days only: backfilled days must never inflate the money tiles.
-        p1 = picks.precision_at_1()
-        g1 = picks.growth("top1_return")
-        g5 = picks.growth("topn_return")
-        late_note = f" · excludes {picks.late_days} backfilled" if picks.late_days else ""
-        if g1 is not None:
-            live = picks.live
-            tiles += (
-                f'<div class="tile"><span class="label">Top pick hit rate (live)'
-                f"{_info('t_live1')}</span>"
-                f"<b>{p1:.0%}</b>"
-                f'<span class="cmp">{int(live["top1_hit"].sum())}/{len(live)} days'
-                f" did +2%{late_note}</span></div>"
-                f'<div class="tile"><span class="label">$1 → top pick daily (live)'
-                f"{_info('t_growth')}</span>"
-                f'<b class="{"up" if g1 >= 1 else ""}">${g1:.3f}</b>'
-                f'<span class="cmp">top-5: ${g5:.3f} · net of '
-                f"{track.COST_ROUND_TRIP:.1%}/day assumed costs{late_note}</span></div>"
-            )
-        else:
-            tiles += (
-                f'<div class="tile"><span class="label">$1 → top pick daily (live)'
-                f"{_info('t_growth')}</span>"
-                f"<b>—</b>"
-                f'<span class="cmp">all {picks.late_days} scored days were backfilled — '
-                f"live record starts with the next scheduled run</span></div>"
-            )
-    tiles += (
-        f'<div class="tile"><span class="label">Candidates today{_info("t_cands")}</span>'
+
+
+def _tiles(
+    record: track.TrackRecord,
+    benchmark: tuple[int, dict, object, object] | None,
+    n_candidates: int,
+    top: int,
+) -> str:
+    """Summary tiles: lead with the walk-forward benchmark, then candidates
+    today, then the accumulating live reach record. No dollars anywhere."""
+    return (
+        '<div class="tiles">'
+        + _benchmark_tiles(benchmark, top)
+        + f'<div class="tile"><span class="label">Candidates today{_info("t_cands")}</span>'
         f"<b>{n_candidates}</b>"
         f'<span class="cmp">ranked by probability</span></div>'
-        "</div>"
+        + _live_tiles(record, top)
+        + "</div>"
     )
-    return tiles
 
 
 _SIM_CAVEAT = (
     "Walk-forward simulation: the model never trains on the days it predicts, "
-    "but the system was designed with this history visible. Assumes 30 bps "
-    "round-trip cost and perfect open/close fills; picks require a next-day "
-    "bar and today's universe is applied to history, so delisted names can "
-    "never contribute their final catastrophic day — the dollar figures are "
-    "biased up. Browsing basket and window combinations is itself a form of "
-    "selection — a good-looking cell found by flipping views is partly luck, "
-    "and compounded growth over short windows is dominated by a handful of "
-    "days. The live record above is the clean test."
+    "but the system was designed with this history visible. Picks require a "
+    "next-day bar and today's universe is applied to history, so delisted names "
+    "can never contribute their final catastrophic day — the reach-rate is "
+    "biased up (survivorship). Browsing basket and window combinations is itself "
+    "a form of selection — a good-looking cell found by flipping views is partly "
+    "luck — and short windows are small samples. Lift compresses at a high base "
+    "rate (it is capped at 1 / base-rate), so read AUC and excess (reach − base) "
+    "too. The live record above is the clean test."
 )
 
 BASKET_CHOICES = [1, 5, 10, 15, 20]
@@ -362,8 +424,11 @@ def _embed_json(payload: dict) -> str:
     return f'<script type="application/json" id="tp-data">{text}</script>'
 
 
-def _payload_days(frame: pd.DataFrame, bases: dict, ret_col: str, late: bool = False) -> list[dict]:
-    """Per-rank frame -> ordered payload day dicts {d, base, [late,] picks}."""
+def _payload_days(frame: pd.DataFrame, bases: dict, late: bool = False) -> list[dict]:
+    """Per-rank frame -> ordered payload day dicts {d, base, [late,] picks}.
+
+    Each pick is [rank, hit]: Stage B reports reach only, so no per-pick $-return
+    rides in the payload — the explorer summarizes reach-rate, not growth."""
     days: list[dict] = []
     for d, grp in frame.groupby("target_date"):
         day = pd.Timestamp(d).date()
@@ -372,8 +437,7 @@ def _payload_days(frame: pd.DataFrame, bases: dict, ret_col: str, late: bool = F
             "d": str(day),
             "base": round(float(base), 6) if base is not None else None,
             "picks": [
-                [int(rank), round(float(ret), 6), int(hit)]
-                for rank, ret, hit in zip(grp["rank"], grp[ret_col], grp["hit"], strict=True)
+                [int(rank), int(hit)] for rank, hit in zip(grp["rank"], grp["hit"], strict=True)
             ],
         }
         if late:
@@ -383,12 +447,12 @@ def _payload_days(frame: pd.DataFrame, bases: dict, ret_col: str, late: bool = F
 
 
 def _summarize_days(days: list[dict], n: int) -> dict:
-    """Basket stats over payload days — EXACT server-side mirror of the inline
-    JS summarize(): basket = first n picks of each day (rank order; taking the
-    next available name IS the substitution rule), day return/hit = basket
-    means, growth compounds net of COST_ROUND_TRIP. Non-finite days are
-    counted as corrupt, never silently averaged around."""
-    growth, hit_sum, base_sum = 1.0, 0.0, 0.0
+    """Basket reach stats over payload days — EXACT server-side mirror of the
+    inline JS summarize(): basket = first n picks of each day (rank order;
+    taking the next available name IS the substitution rule), day reach = mean
+    of the basket's hit flags. A non-finite basket reach is counted as corrupt,
+    never silently averaged around."""
+    hit_sum, base_sum = 0.0, 0.0
     base_known = short = subst = corrupt = 0
     for day in days:
         picks = day["picks"][:n]
@@ -399,12 +463,10 @@ def _summarize_days(days: list[dict], n: int) -> dict:
             # the same event daily_pick_performance warns about (a missing
             # rank may hide exactly the catastrophic day). Count and disclose.
             subst += 1
-        ret = sum(p[1] for p in picks) / len(picks)
-        hit = sum(p[2] for p in picks) / len(picks)
-        if not (math.isfinite(ret) and math.isfinite(hit)):
+        hit = sum(p[1] for p in picks) / len(picks)
+        if not math.isfinite(hit):
             corrupt += 1
             continue
-        growth *= 1 + ret - track.COST_ROUND_TRIP
         hit_sum += hit
         base = day.get("base")
         if base is not None and math.isfinite(base):
@@ -412,7 +474,6 @@ def _summarize_days(days: list[dict], n: int) -> dict:
             base_known += 1
     clean = len(days) - corrupt
     return {
-        "growth": growth,
         "hit": hit_sum / clean if clean else float("nan"),
         "base": base_sum / base_known if base_known else None,
         "days": len(days),
@@ -497,17 +558,14 @@ def _fixed_half_up(x: float, digits: int) -> str:
 
 
 def _explorer_cells(prefix: str, s: dict | None) -> str:
-    if s is None or not (math.isfinite(s["growth"]) and math.isfinite(s["hit"])):
+    if s is None or not math.isfinite(s["hit"]):
         return "".join(
-            f'<td id="tp-{prefix}-{col}">—</td>'
-            for col in ("growth", "hit", "base", "lift", "days")
+            f'<td id="tp-{prefix}-{col}">—</td>' for col in ("hit", "base", "lift", "days")
         )
     base = s["base"]
     base_txt = _pct_half_up(base) if base is not None else "—"
     lift_txt = f"{_fixed_half_up(s['hit'] / base, 2)}×" if base else "—"
-    cls = "pos" if s["growth"] >= 1 else "neg"
     return (
-        f'<td id="tp-{prefix}-growth" class="{cls}">${_fixed_half_up(s["growth"], 3)}</td>'
         f'<td id="tp-{prefix}-hit">{_pct_half_up(s["hit"])}</td>'
         f'<td id="tp-{prefix}-base">{base_txt}</td>'
         f'<td id="tp-{prefix}-lift">{lift_txt}</td>'
@@ -549,8 +607,8 @@ def _record_explorer(meta: dict | None, sim_days: list[dict], live_days: list[di
         )
     table = (
         "<div class='card'><table><tr>"
-        f"<th>Record{_info('e_record', 'start')}</th><th>$1 →{_info('e_growth')}</th>"
-        f"<th>Hit rate{_info('e_hit')}</th><th>Base rate{_info('e_base')}</th>"
+        f"<th>Record{_info('e_record', 'start')}</th>"
+        f"<th>Reach rate{_info('e_hit')}</th><th>Base rate{_info('e_base')}</th>"
         f"<th>Lift{_info('e_lift')}</th><th>Days{_info('e_days', 'end')}</th></tr>"
         '<tr><td><span class="badge-sim">SIM</span> walk-forward, monthly retrain</td>'
         + _explorer_cells("sim", sim_s)
@@ -579,27 +637,26 @@ _JS = """
   if (!dataEl || !basket || !win) return;
   var data = JSON.parse(dataEl.textContent);
   var DASH = "\\u2014";
-  function summarize(days, n, cost) {
-    var growth = 1, hitSum = 0, baseSum = 0;
+  function summarize(days, n) {
+    var hitSum = 0, baseSum = 0;
     var baseKnown = 0, shortDays = 0, substDays = 0, corrupt = 0;
     for (var i = 0; i < days.length; i++) {
       var picks = days[i].picks.slice(0, n);
       if (picks.length < n) shortDays += 1;
-      var ret = 0, hit = 0, sub = false;
+      var hit = 0, sub = false;
       for (var j = 0; j < picks.length; j++) {
-        ret += picks[j][1]; hit += picks[j][2];
+        hit += picks[j][1];
         if (picks[j][0] !== j + 1) sub = true;
       }
       if (sub) substDays += 1;
-      ret /= picks.length; hit /= picks.length;
-      if (!isFinite(ret) || !isFinite(hit)) { corrupt += 1; continue; }
-      growth *= 1 + ret - cost;
+      hit /= picks.length;
+      if (!isFinite(hit)) { corrupt += 1; continue; }
       hitSum += hit;
       var b = days[i].base;
       if (b != null && isFinite(b)) { baseSum += b; baseKnown += 1; }
     }
     var clean = days.length - corrupt;
-    return { growth: growth, hit: clean ? hitSum / clean : NaN,
+    return { hit: clean ? hitSum / clean : NaN,
              base: baseKnown ? baseSum / baseKnown : null,
              days: days.length, shortDays: shortDays, substDays: substDays,
              baseDays: baseKnown, clean: clean, corrupt: corrupt };
@@ -615,18 +672,15 @@ _JS = """
     return notes;
   }
   function setRow(prefix, s) {
-    var g = el("tp-" + prefix + "-growth");
-    if (s == null || !isFinite(s.growth) || !isFinite(s.hit)) {
-      g.textContent = DASH; g.className = "";
-      el("tp-" + prefix + "-hit").textContent = DASH;
+    var h = el("tp-" + prefix + "-hit");
+    if (s == null || !isFinite(s.hit)) {
+      h.textContent = DASH;
       el("tp-" + prefix + "-base").textContent = DASH;
       el("tp-" + prefix + "-lift").textContent = DASH;
       el("tp-" + prefix + "-days").textContent = DASH;
       return;
     }
-    g.textContent = "$" + s.growth.toFixed(3);
-    g.className = s.growth >= 1 ? "pos" : "neg";
-    el("tp-" + prefix + "-hit").textContent = Math.round(100 * s.hit) + "%";
+    h.textContent = Math.round(100 * s.hit) + "%";
     el("tp-" + prefix + "-base").textContent =
       s.base == null ? DASH : Math.round(100 * s.base) + "%";
     el("tp-" + prefix + "-lift").textContent =
@@ -646,7 +700,7 @@ _JS = """
       notes.push("SIM: needs " + w + " trading days " + DASH + " " +
                  data.sim.length + " available");
     } else {
-      var s = summarize(data.sim.slice(-w), n, data.cost);
+      var s = summarize(data.sim.slice(-w), n);
       if (s.corrupt) {
         setRow("sim", null);
         notes.push("SIM: " + s.corrupt + " corrupt day(s) in window " + DASH + " data error");
@@ -659,7 +713,7 @@ _JS = """
     for (var i = 0; i < data.live.length; i++) if (!data.live[i].late) live.push(data.live[i]);
     if (!live.length) { setRow("live", null); notes.push("LIVE: no live days yet"); }
     else {
-      var s2 = summarize(live.slice(-Math.min(w, live.length)), n, data.cost);
+      var s2 = summarize(live.slice(-Math.min(w, live.length)), n);
       if (s2.corrupt) {
         setRow("live", null);
         notes.push("LIVE: " + s2.corrupt + " corrupt day(s) " + DASH + " data error");
@@ -687,6 +741,7 @@ def build_html(
     """Render the dashboard for an already-computed prediction result."""
     record = track.score_predictions(con, result.strategy, top_n=top)
     picks = track.daily_pick_performance(con, result.strategy)
+    benchmark = backtest.latest_standard_experiment(con, result.strategy)
     pick_by_day = (
         {pd.Timestamp(r.target_date).date(): r for r in picks.daily.itertuples()}
         if picks.days
@@ -698,16 +753,16 @@ def build_html(
 
     head = (
         '<meta charset="utf-8">'
-        "<title>twopercent dashboard</title>"
+        "<title>twopercent — reach +2% intraday</title>"
         + _CSS
         + '<div class="tp-root"><div class="tp-wrap">'
-        + '<h1><span class="tick"></span>twopercent — +2% open-to-close candidates</h1>'
-        + '<p class="sub">Trading day after '
+        + '<h1><span class="tick"></span>twopercent — tickers likely to REACH +2% intraday</h1>'
+        + '<p class="sub">Ranked P(reach +2% intraday, open-to-high) for the trading day after '
         + f'<b class="mono">{result.signal_date}</b> · strategy '
         + f"<b>{html.escape(result.strategy)}</b> · trained on "
         + f'<span class="mono">{result.trained_rows:,}</span> rows · '
         + f'<span class="mono">{n_prices:,}</span> price rows in store</p>'
-        + _tiles(record, picks, len(result.scored), top)
+        + _tiles(record, benchmark, len(result.scored), top)
     )
 
     rows = []
@@ -740,14 +795,18 @@ def build_html(
     else:
 
         def _pick_cell(day) -> str:
+            # Prediction quality, not P&L: show whether the #1 pick REACHED +2%
+            # intraday (✓/✗), never a dollar return.
             p = pick_by_day.get(day)
             if p is None:
                 return "<td>—</td>"
-            cls = "pos" if p.top1_return >= 0 else "neg"
+            reached = bool(p.top1_hit)
+            cls = "pos" if reached else "neg"
+            mark = "✓" if reached else "✗"
             marker = " †" if p.late else ""
             return (
                 f'<td><span class="sym">{html.escape(p.top1_symbol)}</span> '
-                f'<span class="{cls}">{p.top1_return:+.1%}</span>{marker}</td>'
+                f'<span class="{cls}">{mark}</span>{marker}</td>'
             )
 
         trs = "".join(
@@ -764,13 +823,13 @@ def build_html(
             late_note = (
                 f'<p class="sub"><b>{record.late_days} of {len(record.scored)} days '
                 "were backfilled after the fact</b> (marked †) — not live forecasting "
-                "skill, and excluded from the money tiles above.</p>"
+                "skill, and excluded from the live reach tiles above.</p>"
             )
         body = late_note + (
             f"<div class='card'>{_chart_svg(record.scored)}</div>"
             + "<div class='card'><table><tr>"
             + f"<th>Day{_info('r_day', 'start')}</th><th>Top pick{_info('r_pick')}</th>"
-            + f"<th>Hits{_info('r_hits')}</th><th>Hit rate{_info('r_hit')}</th>"
+            + f"<th>Reachers{_info('r_hits')}</th><th>Reach rate{_info('r_hit')}</th>"
             + f"<th>Base rate{_info('r_base')}</th>"
             + f"<th>Lift{_info('r_lift', 'end')}</th></tr>{trs}</table></div>"
         )
@@ -811,10 +870,10 @@ def build_html(
         for d in frame["target_date"]
     ]
     bases = track.daily_base_rates(con, base_dates)
-    sim_days = _payload_days(sim[1], bases, "ret") if sim is not None else []
-    live_days = _payload_days(outcomes, bases, "oc_return", late=True) if len(outcomes) else []
+    sim_days = _payload_days(sim[1], bases) if sim is not None else []
+    live_days = _payload_days(outcomes, bases, late=True) if len(outcomes) else []
     explorer = _record_explorer(sim[0] if sim is not None else None, sim_days, live_days)
-    data_tag = _embed_json({"cost": track.COST_ROUND_TRIP, "sim": sim_days, "live": live_days})
+    data_tag = _embed_json({"sim": sim_days, "live": live_days})
 
     return (
         head

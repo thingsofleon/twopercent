@@ -198,7 +198,7 @@ def test_prediction_targeting_incomplete_day_stays_pending(con):
 
     perf = track.daily_pick_performance(con, "strat", top_n=3)
     assert perf.daily.empty and perf.live.empty
-    assert perf.precision_at_1() is None and perf.growth() is None
+    assert perf.precision_at_1() is None
 
     ranks = track.daily_rank_outcomes(con, "strat", top_n=3)
     assert ranks.empty

@@ -7,7 +7,7 @@ research engine"). This tier is the ISOLATION FOUNDATION only — it LOGS and
 SCORES shadow picks; it promotes nothing (that is #59, separately gated).
 
 **The invariant this module exists to guarantee:** nothing that reads the
-`predictions` table — `track.score_predictions`, the money tiles, the
+`predictions` table — `track.score_predictions`, the live reach tiles, the
 dashboard, the signal email — may ever be affected by shadow picks. Shadow
 storage is a SEPARATE table (`shadow_predictions`); a challenger is scored with
 the same walk-forward machinery (`predict_for(..., save=False)` then

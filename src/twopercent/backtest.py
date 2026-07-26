@@ -16,7 +16,7 @@ import duckdb
 import pandas as pd
 from sklearn.metrics import brier_score_loss, roc_auc_score
 
-from twopercent import scan, store, strategies
+from twopercent import calibration, scan, store, strategies
 from twopercent.features import feature_frame
 from twopercent.predict import LIQUIDITY_MIN_MEDIAN_VOLUME
 
@@ -96,6 +96,7 @@ def run_benchmark(
     folds = month_folds(labeled["target_date"], months)
     all_probs: list[pd.Series] = []
     all_labels: list[pd.Series] = []
+    all_dates: list[pd.Series] = []
     daily_hits: list[float] = []
     fold_drops: dict[dt.date, frozenset[str]] = {}
     folds_run = 0
@@ -126,6 +127,10 @@ def run_benchmark(
         probs = strategy.predict_proba(test)
         all_probs.append(probs)
         all_labels.append(test["did_2pct_next"])
+        # Per-row target_date rides alongside the (prob, label) pair the AUC/Brier
+        # already pool, so calibration keys the daily-base-rate BSS reference and
+        # the regime strata to the SAME out-of-sample population — no lookahead.
+        all_dates.append(test["target_date"])
         for target_date, day_rows in test.assign(prob=probs).groupby("target_date"):
             # Same liquidity floor the shipped predictions apply (predict.py):
             # only the top-N SELECTION filters — training and the AUC/brier
@@ -186,6 +191,7 @@ def run_benchmark(
 
     probs = pd.concat(all_probs)
     labels = pd.concat(all_labels).astype(int)
+    dates = pd.concat(all_dates)
     base_rate = labels.mean()
     precision_at_n = float(pd.Series(daily_hits).mean())
     picks = pd.DataFrame(daily_picks, columns=["target_date", "top1_hit", "top5_hits"])
@@ -204,6 +210,11 @@ def run_benchmark(
         "test_rows": int(len(labels)),
         "test_days": len(daily_hits),
         "folds": folds_run,
+        # Walk-forward calibration on the all-names test predictions (same
+        # population as brier/auc above): reliability buckets, Brier skill score
+        # vs the daily base rate, and per-regime reports. MEASURED only — Stage C
+        # does not recalibrate the model.
+        "calibration": calibration.calibration_report(probs.to_numpy(), labels.to_numpy(), dates),
     }
     if record:
         params = {

@@ -212,6 +212,138 @@ def test_dashboard_reset_note_at_cutover_without_touch_prediction(modeled):
     assert "Live reach-record began" not in content  # no touch prediction yet
 
 
+def _calibration_metrics(bss=0.18, reliability=None, regimes=None) -> dict:
+    """A recorded touch-era benchmark metrics dict carrying a calibration block."""
+    if reliability is None:
+        reliability = [
+            {
+                "lo": round(b / 10, 4),
+                "hi": round((b + 1) / 10, 4),
+                "mean_pred": round(b / 10 + 0.05, 4),
+                "reach_rate": round(b / 10 + 0.05, 4),
+                "count": 100,
+            }
+            for b in range(10)
+        ]
+    if regimes is None:
+        regimes = [
+            {
+                "name": "low",
+                "base_lo": 0.05,
+                "base_hi": 0.20,
+                "n_days": 40,
+                "n": 4000,
+                "bss": 0.22,
+                "slope": 0.98,
+            },
+            {
+                "name": "medium",
+                "base_lo": 0.20,
+                "base_hi": 0.45,
+                "n_days": 40,
+                "n": 4000,
+                "bss": 0.15,
+                "slope": 0.90,
+            },
+            {
+                "name": "high",
+                "base_lo": 0.45,
+                "base_hi": 0.95,
+                "n_days": 40,
+                "n": 4000,
+                "bss": 0.05,
+                "slope": 0.70,
+            },
+        ]
+    return {
+        "auc": 0.72,
+        "lift": 2.15,
+        "precision_at_n": 0.74,
+        "base_rate": 0.34,
+        "top_n": 20,
+        "brier": 0.19,
+        "calibration": {
+            "population": "all_names_test",
+            "n": 12000,
+            "n_days": 120,
+            "n_bins": 10,
+            "brier": 0.19,
+            "brier_ref": 0.22,
+            "bss": bss,
+            "slope": 0.9,
+            "reliability": reliability,
+            "regimes": regimes,
+        },
+    }
+
+
+def test_calibration_panel_renders_from_recorded_metrics():
+    benchmark = (7, _calibration_metrics(bss=0.18), None, None)
+    panel = dashboard._calibration_panel(benchmark)
+    assert "Calibration (walk-forward)" in panel
+    assert "Brier skill score" in panel and ">+0.18<" in panel  # signed BSS tile
+    assert "<svg" in panel  # reliability curve rendered
+    assert "perfect calibration" in panel  # the diagonal legend
+    assert "reached +2% about" in panel  # plain-language read, computed from buckets
+    assert "By base-rate regime" in panel  # regimes surfaced, not only pooled
+    assert "12,000 test predictions" in panel
+    assert "$" not in panel  # no dollars anywhere in the predictor's calibration
+
+
+def test_calibration_panel_flags_regime_disagreement():
+    # BSS spread across regimes is wide (0.22 vs 0.05) — the panel must say so, not
+    # let the pooled curve average a regime-specific miss away.
+    panel = dashboard._calibration_panel((7, _calibration_metrics(), None, None))
+    assert "Calibration DIFFERS by regime" in panel
+
+
+def test_calibration_read_is_honest_about_miscalibration():
+    # Overconfident model: the 0.9 bucket only reaches 0.4. The read must NOT claim
+    # calibration — it reports the gap and calls it materially miscalibrated.
+    reliability = [
+        {"lo": 0.0, "hi": 0.1, "mean_pred": 0.05, "reach_rate": 0.05, "count": 100},
+        {"lo": 0.9, "hi": 1.0, "mean_pred": 0.9, "reach_rate": 0.4, "count": 100},
+    ]
+    cal = _calibration_metrics(reliability=reliability)["calibration"]
+    cal["slope"] = 0.6  # steep overconfidence
+    read = dashboard._calibration_read(cal)
+    assert "materially miscalibrated" in read
+    assert "overconfident" in read
+    assert "~90% reached +2% about 40%" in read  # honest to the actual bucket
+
+
+def test_calibration_panel_degrades_without_benchmark_or_block():
+    # No touch-era benchmark, and a pre-Stage-C benchmark with no calibration block:
+    # both degrade gracefully to the same honest placeholder — never a blank/crash.
+    for benchmark in (None, (7, {"auc": 0.7}, None, None)):
+        panel = dashboard._calibration_panel(benchmark)
+        assert "Calibration (walk-forward)" in panel
+        assert "No touch-era benchmark yet" in panel
+        assert "<svg" not in panel
+
+
+def test_dashboard_render_includes_calibration_panel(modeled, tmp_path):
+    # End-to-end: a recorded touch-era benchmark with a calibration block surfaces
+    # the panel in the rendered page, walk-forward-labelled and dollar-free.
+    store.record_experiment(
+        modeled,
+        strategy="baseline_gbm_v1",
+        params={"months": 12, "top_n": 20},
+        train_start=pd.Timestamp("2025-06-02").date(),
+        test_start=pd.Timestamp("2026-01-05").date(),
+        test_end=pd.Timestamp("2026-06-30").date(),
+        metrics=_calibration_metrics(bss=0.12),
+    )
+    out = tmp_path / "dash.html"
+    dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5)
+    content = out.read_text()
+    section = content.split("Calibration (walk-forward)", 1)[1].split("Track record", 1)[0]
+    assert "Brier skill score" in section and ">+0.12<" in section
+    assert "<svg" in section
+    assert "same population as the benchmark AUC/Brier" in section  # WF labelling
+    assert "$" not in section
+
+
 def _record_sim(con, n_days, ranks_per_day=6, strategy="baseline_gbm_v1"):
     """Per-rank sim rows: mostly-up rank-1 returns, adversarial values."""
     seq = store.record_experiment(

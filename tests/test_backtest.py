@@ -152,6 +152,34 @@ def test_benchmark_records_first_run_fold_as_test_start(con, monkeypatch, caplog
     assert test_start == first_recorded.replace(day=1)
 
 
+def test_benchmark_records_walk_forward_calibration(con, monkeypatch):
+    # Calibration is measured on the SAME out-of-sample test-fold predictions the
+    # AUC/Brier pool — never in-sample. Its row count equalling test_rows and its
+    # brier equalling the recorded brier pins that shared population.
+    monkeypatch.setattr(backtest, "MIN_TRAIN_ROWS", 500)
+    seed_planted(con)
+    metrics = backtest.run_benchmark(con, "baseline_gbm_v1", months=2, top_n=5, record=False)
+
+    cal = metrics["calibration"]
+    assert cal["population"] == "all_names_test"
+    assert cal["n"] == metrics["test_rows"]  # every test-fold pair, nothing else
+    assert cal["brier"] == metrics["brier"]  # same population as the headline Brier
+    assert len(cal["reliability"]) == 10
+    assert cal["bss"] is not None
+    # Regime conditioning is computed and surfaced, not only the pooled view.
+    assert cal["regimes"]
+    assert {r["name"] for r in cal["regimes"]} <= {"low", "medium", "high"}
+
+
+def test_benchmark_calibration_persists_in_metrics_json(con, monkeypatch):
+    monkeypatch.setattr(backtest, "MIN_TRAIN_ROWS", 500)
+    seed_planted(con)
+    metrics = backtest.run_benchmark(con, "baseline_gbm_v1", months=2, top_n=5)
+    recorded = json.loads(store.list_experiments(con)["metrics"].iloc[0])
+    assert recorded["calibration"]["bss"] == metrics["calibration"]["bss"]
+    assert recorded["calibration"]["population"] == "all_names_test"
+
+
 def test_month_folds_shape():
     dates = pd.Series(pd.bdate_range("2026-01-05", periods=90).date)
     folds = backtest.month_folds(dates, months=2)

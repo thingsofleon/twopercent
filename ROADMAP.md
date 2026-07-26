@@ -319,10 +319,35 @@ Design (staged, each a reviewed PR; quant-skeptic mandatory on Stage A):
   prediction not trade advice). Metric math (reach-rate/base-rate/lift/AUC)
   untouched — Stage B is removal + presentation only. **Supersedes/closes #68**
   (fee removal): no growth number left to be gross or net.
-- **Stage C — calibration as first-class.** The output is P(reach 2%) and the
-  user acts on the number, so it must be honest: add walk-forward calibration
-  (bucket predicted probs vs realized reach-frequency; reliability table +
-  a metric alongside the existing Brier). "40% must mean ~40%."
+- **Stage C — calibration as first-class. SHIPPED (#74, PR — pending
+  review/merge).** MEASURES + DISPLAYS calibration (does NOT recalibrate — that
+  is a scoped follow-up if warranted). New `calibration.py` computes, on the
+  benchmark's held-out all-names test-fold predictions (same population as the
+  recorded AUC/Brier, out-of-sample by construction): a 10-bucket reliability
+  table (mean predicted vs realized reach vs count), a **Brier Skill Score** vs
+  each test day's OWN base rate (`BSS = 1 − Brier_model/Brier_ref`; the daily
+  reference is the honesty choice per quant-skeptic N2 — raw Brier drops "for
+  free" at a higher base rate), and **per-regime** BSS + calibration slope
+  within low/medium/high base-rate-day tertiles (a pooled curve can look
+  calibrated while every regime is off). Recorded into the experiment `metrics`
+  JSON in `run_benchmark` (event `open_to_high`) so the dashboard reads it like
+  the other benchmark tiles. Dashboard gains a "Calibration (walk-forward)"
+  panel: a signed BSS tile, a self-contained inline-SVG reliability curve vs the
+  perfect-calibration diagonal (theme-aware, points sized by count), a
+  plain-language read computed FROM the buckets, and a regime note that flags
+  when calibration differs by regime. Degrades gracefully to "no touch-era
+  benchmark yet"; walk-forward/backtest-labelled and dollar-free.
+  **Measured champion calibration (baseline_gbm_v1, 12mo / 246 test days /
+  723,680 all-names test predictions):** BSS **+0.066**, slope 0.91 — the
+  probabilities add modest skill over the daily base rate and are well
+  calibrated in the bulk (0–60% buckets within ~1–2pp), but **materially
+  OVERCONFIDENT in the high-confidence tail**: the 0.7–0.8 bucket predicts 73%
+  and reaches 67%, and the 0.8–0.9 bucket predicts 83% but reaches only **65%**
+  (n=1,207) — exactly where the user acts most. Calibration also **differs by
+  regime** (BSS 0.13 medium vs 0.01 high; slope 0.78 on low-base days). A
+  recalibration follow-up (isotonic/Platt on the high tail, likely
+  regime-aware) looks warranted — reported in the PR for a scoping decision,
+  deliberately NOT done here (Stage C is measure + display only).
 
 Reinterpretation to expect: touching +2% is far more common than closing +2%,
 so the BASE RATE rises sharply and raw hit rate looks high — **lift and

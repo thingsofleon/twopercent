@@ -174,6 +174,18 @@ _INFO_TEXT = {
     "t_excess": "Live reach-rate minus the base rate (in percentage points), pooled "
     "across live days. Positive means the ranking beat the market — the honesty "
     "metric when lift compresses at a high base rate.",
+    # Calibration panel — does the probability mean what it says.
+    "t_bss": "Brier skill score, walk-forward: 1 − Brier_model / Brier_reference, "
+    "where the reference each day is that day's own base rate. Positive means the "
+    "probabilities add skill BEYOND simply knowing the daily base rate (which swings "
+    "~7%→98%); 0 means no better than the base rate; negative means worse. This is "
+    "the honest calibration headline — raw Brier drops for free at a higher base "
+    "rate, so it is not comparable across the close→touch cutover.",
+    "cal_curve": "Reliability, walk-forward: each point is a predicted-probability "
+    "bucket — its mean predicted chance (x) against how often those picks actually "
+    "reached +2% (y), sized by how many predictions fell in it. On the dashed "
+    "diagonal means the probability is honest (70% predicted → ~70% realized); "
+    "below the line means overconfident, above means underconfident.",
     # Candidates table columns
     "c_rank": "Rank by model probability — 1 is the most likely to reach +2%.",
     "c_sym": "Ticker symbol.",
@@ -327,6 +339,196 @@ def _benchmark_tiles(benchmark: tuple[int, dict, object, object] | None, top: in
         f'<div class="tile"><span class="label">Walk-forward reach-rate (top {bn})'
         f"{_info('t_reach')}</span>"
         f'<b>{reach_val}</b><span class="cmp">{base_cmp}</span></div>'
+    )
+
+
+def _reliability_svg(reliability: list[dict]) -> str:
+    """Reliability curve: predicted-bucket mean (x) vs realized reach (y), with
+    the perfect-calibration diagonal. Self-contained inline SVG, theme-aware —
+    same var(--*) palette as _chart_svg. Points sized by bucket count; empty
+    buckets are simply absent (never plotted as a silent 0)."""
+    width, height, pad_l, pad_b, pad_t, pad_r = 460, 300, 42, 30, 12, 14
+    plot_w, plot_h = width - pad_l - pad_r, height - pad_t - pad_b
+
+    def x(v: float) -> float:
+        return pad_l + plot_w * v
+
+    def y(v: float) -> float:
+        return pad_t + plot_h * (1 - v)
+
+    parts = [
+        '<defs><filter id="cglow" x="-40%" y="-40%" width="180%" height="180%">'
+        '<feGaussianBlur stdDeviation="2" result="b"/>'
+        '<feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>'
+        "</filter></defs>"
+    ]
+    for frac in (0.25, 0.5, 0.75, 1.0):
+        gy, gx = y(frac), x(frac)
+        parts.append(
+            f'<line x1="{pad_l}" y1="{gy:.1f}" x2="{width - pad_r}" y2="{gy:.1f}" '
+            f'stroke="var(--grid)" stroke-width="1"/>'
+            f'<text x="{pad_l - 6}" y="{gy + 3:.1f}" text-anchor="end" font-size="10" '
+            f'font-family="ui-monospace, Consolas, monospace" '
+            f'fill="var(--ink-muted)">{frac:.0%}</text>'
+            f'<text x="{gx:.1f}" y="{height - 10}" text-anchor="middle" font-size="10" '
+            f'fill="var(--ink-muted)">{frac:.0%}</text>'
+        )
+    # Perfect-calibration diagonal (predicted == realized).
+    parts.append(
+        f'<line x1="{x(0):.1f}" y1="{y(0):.1f}" x2="{x(1):.1f}" y2="{y(1):.1f}" '
+        f'stroke="var(--baseline)" stroke-width="1.5" stroke-dasharray="5 4"/>'
+    )
+    populated = [r for r in reliability if r["count"] and _finite(r["mean_pred"])]
+    max_count = max((r["count"] for r in populated), default=1)
+    pts = [(x(r["mean_pred"]), y(r["reach_rate"])) for r in populated]
+    if len(pts) >= 2:
+        path = "M" + " L".join(f"{px:.1f} {py:.1f}" for px, py in pts)
+        parts.append(
+            f'<path d="{path}" fill="none" stroke="var(--info)" stroke-width="2" '
+            f'stroke-opacity="0.75"/>'
+        )
+    for r, (px, py) in zip(populated, pts, strict=True):
+        radius = 3 + 6 * math.sqrt(r["count"] / max_count)
+        parts.append(
+            f"<g><title>predicted {r['mean_pred']:.0%}, realized {r['reach_rate']:.0%} "
+            f"(n={r['count']})</title>"
+            f'<circle cx="{px:.1f}" cy="{py:.1f}" r="{radius:.1f}" fill="var(--info)" '
+            f'fill-opacity="0.85" filter="url(#cglow)"/></g>'
+        )
+    parts.append(
+        f'<line x1="{x(0):.1f}" y1="{y(0):.1f}" x2="{x(0):.1f}" y2="{y(1):.1f}" '
+        f'stroke="var(--baseline)" stroke-width="1"/>'
+        f'<line x1="{x(0):.1f}" y1="{y(0):.1f}" x2="{x(1):.1f}" y2="{y(0):.1f}" '
+        f'stroke="var(--baseline)" stroke-width="1"/>'
+    )
+    # Axis names live in the legend, not as inline SVG labels — an inline label
+    # at the 100% corner collides with the 100% tick text ("predict100%").
+    return (
+        '<div class="legend">'
+        '<span><span class="chip" style="background:var(--info)"></span>'
+        "realized reach (y) vs predicted prob (x)"
+        f"{_info('cal_curve')}</span>"
+        "<span>· · · perfect calibration</span>"
+        "</div>"
+        f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" '
+        f'aria-label="Reliability curve: predicted probability (x) vs realized reach rate (y)">'
+        f"{''.join(parts)}</svg>"
+    )
+
+
+def _calibration_read(cal: dict) -> str:
+    """One honest plain-language sentence computed FROM the buckets — never a
+    canned claim. Reports a representative high-confidence bucket (predicted vs
+    realized) and a verdict from the weighted calibration error and BSS."""
+    populated = [
+        r
+        for r in cal["reliability"]
+        if r["count"] and _finite(r["mean_pred"]) and _finite(r["reach_rate"])
+    ]
+    if not populated:
+        return "Not enough test predictions to read calibration."
+    total = sum(r["count"] for r in populated)
+    # Weighted mean |predicted − realized| across occupied buckets (expected
+    # calibration error): the honest average gap between promise and reality.
+    ece = sum(r["count"] * abs(r["mean_pred"] - r["reach_rate"]) for r in populated) / total
+    # Representative bucket: the most-populated confident (>=50%) bucket, else the
+    # highest-predicted occupied bucket — the number the user most acts on.
+    confident = [r for r in populated if r["mean_pred"] >= 0.5]
+    rep = max(confident or populated, key=lambda r: (r["count"], r["mean_pred"]))
+    verdict = (
+        "well calibrated"
+        if ece < 0.05
+        else "roughly calibrated"
+        if ece < 0.10
+        else "materially miscalibrated"
+    )
+    slope = cal.get("slope")
+    tilt = ""
+    if _finite(slope):
+        if slope < 0.85:
+            tilt = " — the probabilities are overconfident (too extreme)"
+        elif slope > 1.15:
+            tilt = " — the probabilities are underconfident (too timid)"
+    bss = cal.get("bss")
+    skill = ""
+    if _finite(bss) and bss <= 0:
+        skill = (
+            " The probabilities add no skill over just predicting each day's base rate (BSS ≤ 0)."
+        )
+    return (
+        f"Picks the model calls ~{rep['mean_pred']:.0%} reached +2% about "
+        f"{rep['reach_rate']:.0%} of the time. Averaged over all buckets the "
+        f"probability is off by {ece:.0%} — {verdict}{tilt}.{skill}"
+    )
+
+
+def _regime_note(cal: dict) -> str:
+    """Surface calibration that differs across base-rate regimes — a pooled curve
+    can look honest while every regime is off. Renders each stratum's base-rate
+    span, BSS, and slope; flags when the BSS spread across regimes is wide."""
+    regimes = cal.get("regimes") or []
+    if not regimes:
+        return ""
+    cells = []
+    for r in regimes:
+        bss = f"{r['bss']:+.2f}" if _finite(r["bss"]) else "—"
+        slope = f"{r['slope']:.2f}" if _finite(r["slope"]) else "—"
+        cells.append(
+            f"<b>{html.escape(r['name'])}</b> base {r['base_lo']:.0%}–{r['base_hi']:.0%} "
+            f"({r['n_days']}d): BSS {bss}, slope {slope}"
+        )
+    bsss = [r["bss"] for r in regimes if _finite(r["bss"])]
+    flag = ""
+    if len(bsss) >= 2 and (max(bsss) - min(bsss)) >= 0.10:
+        flag = (
+            " Calibration DIFFERS by regime — read per-regime, the pooled curve "
+            "can average away a regime-specific miss."
+        )
+    return (
+        '<p class="sub" style="margin-top:8px">By base-rate regime (walk-forward): '
+        + " · ".join(cells)
+        + f".{flag}</p>"
+    )
+
+
+def _calibration_panel(benchmark: tuple[int, dict, object, object] | None) -> str:
+    """ "Calibration (walk-forward)" section: a BSS tile, the reliability curve,
+    a plain-language read, and the per-regime note. Answers "can I trust the
+    probability". Degrades gracefully — like the other benchmark tiles — when no
+    touch-era benchmark is recorded, or a pre-Stage-C benchmark carries no
+    calibration block. Clearly backtest-labelled; no dollars."""
+    header = "<h2>Calibration (walk-forward)</h2>"
+    empty = (
+        header + '<div class="card"><p class="empty">No touch-era benchmark yet — run '
+        "twopercent benchmark to measure whether the predicted probabilities are "
+        "honest (a 70% pick reaching +2% ~70% of the time).</p></div>"
+    )
+    if benchmark is None:
+        return empty
+    cal = benchmark[1].get("calibration")
+    if not cal or not cal.get("reliability"):
+        return empty
+    bss = cal.get("bss")
+    bss_val = f"{bss:+.2f}" if _finite(bss) else "—"
+    bss_up = "up" if _finite(bss) and bss > 0 else ""
+    tile = (
+        '<div class="tiles">'
+        f'<div class="tile"><span class="label">Brier skill score{_info("t_bss")}</span>'
+        f'<b class="{bss_up}">{bss_val}</b>'
+        f'<span class="cmp">vs predicting the daily base rate · {cal["n"]:,} test '
+        "predictions</span></div></div>"
+    )
+    return (
+        header
+        + tile
+        + "<div class='card'>"
+        + _reliability_svg(cal["reliability"])
+        + f'<p class="sub" style="margin-top:10px">{html.escape(_calibration_read(cal))}</p>'
+        + _regime_note(cal)
+        + '<p class="sub" style="margin-top:8px">Walk-forward on the all-names '
+        "test-fold predictions (same population as the benchmark AUC/Brier) — the "
+        "model never trains on the days it scores. Backtest, not the live record; "
+        "measured, not recalibrated.</p>" + "</div>"
     )
 
 
@@ -878,6 +1080,7 @@ def build_html(
     return (
         head
         + candidates
+        + _calibration_panel(benchmark)
         + "<h2>Track record</h2>"
         + reset_note
         + body

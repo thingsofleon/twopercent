@@ -2,7 +2,7 @@ import pandas as pd
 import pytest
 
 from tests.conftest import seed_history
-from twopercent import dashboard, store, track
+from twopercent import dashboard, store
 from twopercent.predict import predict_for
 
 RUNNER_OC = [0.03 + 0.001 * (i % 5) for i in range(60)]
@@ -75,7 +75,7 @@ def test_dashboard_info_tooltips_present(modeled, tmp_path):
     # An "i" icon with its tooltip appears for a tile, a candidate column, the
     # chart, a track-record column, and an explorer control — one per surface.
     assert 'class="tp-i"' in content
-    for key in ("t_lift", "c_prob", "chart", "r_lift", "e_basket"):
+    for key in ("t_cands", "c_prob", "chart", "r_lift", "e_basket"):
         assert dashboard._INFO_TEXT[key] in content, key
     # Edge columns anchor their tooltip inward so it can't clip the viewport.
     assert "tp-tip--start" in content and "tp-tip--end" in content
@@ -164,24 +164,25 @@ def _record_sim(con, n_days, ranks_per_day=6, strategy="baseline_gbm_v1"):
 
 def test_dashboard_explorer_defaults_match_python_math(modeled, tmp_path):
     # Server-side default view (top-5 basket, 6-month window) must carry the
-    # exact numbers track.sim_windows computes — the JS payload is generated
+    # exact reach-rate _summarize_days computes — the JS payload is generated
     # from the same frames, so this pins Python and JS to one source of truth.
+    # No dollars: the explorer reports reach-rate / base rate / lift only.
     _record_sim(modeled, n_days=130)
     out = tmp_path / "dash.html"
     dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5)
     content = out.read_text()
 
     _, daily = store.latest_experiment_daily(modeled, "baseline_gbm_v1")
-    summary = track.sim_windows(daily, n=5)
-    w126 = next(w for w in summary.windows if w["days"] == 126)
-    growth_txt = dashboard._fixed_half_up(w126["growth"], 3)
-    assert f'id="tp-sim-growth" class="pos">${growth_txt}</td>' in content
-    assert f'<td id="tp-sim-hit">{dashboard._pct_half_up(w126["hit_rate"])}</td>' in content
+    sim_days = dashboard._payload_days(daily, bases={})
+    s126 = dashboard._summarize_days(sim_days[-126:], 5)
+    assert "tp-sim-growth" not in content  # the $-growth column is gone
+    assert f'<td id="tp-sim-hit">{dashboard._pct_half_up(s126["hit"])}</td>' in content
     assert '<td id="tp-sim-days">126</td>' in content  # selection day count visible
 
     assert 'class="badge-sim">SIM</span>' in content
     assert 'class="badge-live">LIVE</span>' in content
     assert "walk-forward, monthly retrain" in content
+    assert "<th>Reach rate" in content and "$" not in content  # reach, never dollars
     # Both selects, with per-window trading-day counts, defaults marked.
     assert '<option value="5" selected>Top 5</option>' in content
     assert '<option value="126" selected>6 months (126 trading days)</option>' in content
@@ -190,10 +191,10 @@ def test_dashboard_explorer_defaults_match_python_math(modeled, tmp_path):
     assert "SIM test span" in content and "months=12" in content
     assert "simulated <b" in content
     assert '<span class="mono">130</span> sim days available' in content
-    # Strengthened survivorship + multiple-comparisons caveats, verbatim tails.
+    # Survivorship + selection + base-rate caveats, verbatim tails.
     assert "delisted names can never contribute their final catastrophic day" in content
     assert "itself a form of selection" in content
-    assert "dominated by a handful of days" in content
+    assert "Lift compresses at a high base rate" in content
     assert "The live record above is the clean test." in content
     assert '<meta charset="utf-8">' in content
 
@@ -212,26 +213,21 @@ def test_dashboard_explorer_payload_json(modeled, tmp_path):
     match = re.search(r'<script type="application/json" id="tp-data">(.*?)</script>', content)
     assert match, "payload script tag missing"
     payload = json.loads(match.group(1))
-    assert payload["cost"] == track.COST_ROUND_TRIP
+    assert "cost" not in payload  # Stage B: no trading cost in the reach payload
     assert len(payload["sim"]) == 6
     day0 = payload["sim"][0]
     assert day0["d"] == "2026-01-05"
-    # Hand-check day 0: (i + rank) % 5 == 0 at rank 5 → one down day.
-    assert day0["picks"] == [
-        [1, 0.0203, 1],
-        [2, 0.0203, 1],
-        [3, 0.0203, 1],
-        [4, 0.0203, 1],
-        [5, -0.0117, 0],
-        [6, 0.0203, 1],
-    ]
-    # Base rate on 2026-01-05: 4 runners of 8 names did ≥2%.
+    # Each pick is [rank, hit] — reach flags only, no $-return.
+    # Hand-check day 0: (i + rank) % 5 == 0 at rank 5 → that one is not a reacher.
+    assert day0["picks"] == [[1, 1], [2, 1], [3, 1], [4, 1], [5, 0], [6, 1]]
+    # Base rate on 2026-01-05: 4 runners of 8 names reached ≥2%.
     assert abs(day0["base"] - 0.5) < 1e-9
     # Live day present with late flag and rank-ordered picks.
     assert len(payload["live"]) == 1
     live0 = payload["live"][0]
     assert live0["late"] is True  # backfilled save, created after the target open
     assert [p[0] for p in live0["picks"]] == sorted(p[0] for p in live0["picks"])
+    assert all(len(p) == 2 for p in live0["picks"])  # [rank, hit], no return field
 
 
 def test_dashboard_explorer_too_few_sim_days_says_so(modeled, tmp_path):
@@ -242,19 +238,18 @@ def test_dashboard_explorer_too_few_sim_days_says_so(modeled, tmp_path):
 
     assert 'class="badge-sim">SIM</span>' in content
     assert "SIM: needs 126 trading days — 4 available" in content
-    assert '<td id="tp-sim-growth">—</td>' in content  # no number pretended
+    assert '<td id="tp-sim-hit">—</td>' in content  # no number pretended
     assert "The live record above is the clean test." in content
 
 
 def test_summarize_days_first_available_substitution_and_short_days():
     days = [
-        {"d": "a", "base": 0.25, "picks": [[2, 0.0203, 1], [3, -0.0117, 0]]},  # rank 1 missing
-        {"d": "b", "base": 0.15, "picks": [[1, 0.04, 1]]},
+        {"d": "a", "base": 0.25, "picks": [[2, 1], [3, 0]]},  # rank 1 missing
+        {"d": "b", "base": 0.15, "picks": [[1, 1]]},
     ]
     s1 = dashboard._summarize_days(days, 1)
-    # First-available rule: day a's top pick is rank 2 (the trader takes it).
-    expected = (1 + 0.0203 - track.COST_ROUND_TRIP) * (1 + 0.04 - track.COST_ROUND_TRIP)
-    assert abs(s1["growth"] - expected) < 1e-12
+    # First-available rule: day a's top pick is rank 2 (the trader takes it) —
+    # a reacher; day b's rank 1 reached too, so reach-rate is 1.0.
     assert s1["hit"] == 1.0
     assert s1["short"] == 0
     assert s1["subst"] == 1  # ...but the substitution is counted, never silent
@@ -268,8 +263,8 @@ def test_summarize_days_first_available_substitution_and_short_days():
 
 def test_explorer_substitution_and_base_coverage_notes():
     days = [
-        {"d": "a", "late": False, "base": 0.25, "picks": [[2, 0.0203, 1]]},  # rank 1 missing
-        {"d": "b", "late": False, "base": None, "picks": [[1, 0.011, 0]]},  # base unknown
+        {"d": "a", "late": False, "base": 0.25, "picks": [[2, 1]]},  # rank 1 missing
+        {"d": "b", "late": False, "base": None, "picks": [[1, 0]]},  # base unknown
     ]
     _, live_s, notes = dashboard._explorer_state([], days, 1, 5)
     assert live_s is not None
@@ -277,8 +272,8 @@ def test_explorer_substitution_and_base_coverage_notes():
     assert "LIVE: base rate from 1 of 2 day(s)" in notes
     # A contiguous full-coverage frame emits neither disclosure.
     clean_days = [
-        {"d": "a", "late": False, "base": 0.25, "picks": [[1, 0.0203, 1]]},
-        {"d": "b", "late": False, "base": 0.25, "picks": [[1, 0.011, 0]]},
+        {"d": "a", "late": False, "base": 0.25, "picks": [[1, 1]]},
+        {"d": "b", "late": False, "base": 0.25, "picks": [[1, 0]]},
     ]
     _, _, clean_notes = dashboard._explorer_state([], clean_days, 1, 5)
     assert not any("substituted" in n or "base rate from" in n for n in clean_notes)
@@ -323,8 +318,9 @@ def test_half_up_formatting_matches_js():
     assert dashboard._fixed_half_up(1.0005, 3) == "1.000"  # ditto, ×1000 FP rounds up
     cells = dashboard._explorer_cells(
         "sim",
-        {"growth": 1.5, "hit": 0.125, "base": 0.125, "days": 8, "short": 0, "corrupt": 0},
+        {"hit": 0.125, "base": 0.125, "days": 8, "short": 0, "corrupt": 0},
     )
+    assert "tp-sim-growth" not in cells  # no $-growth cell
     assert '<td id="tp-sim-hit">13%</td>' in cells
     assert '<td id="tp-sim-base">13%</td>' in cells
     assert '<td id="tp-sim-lift">1.00×</td>' in cells
@@ -343,9 +339,11 @@ def test_embed_json_is_breakout_proof():
 
 
 def test_summarize_days_counts_corrupt_never_averages_around():
+    # A non-finite reach flag (a data error) must be counted as corrupt, never
+    # silently averaged around into a shorter window.
     days = [
-        {"d": "a", "late": False, "base": None, "picks": [[1, float("nan"), 1]]},
-        {"d": "b", "late": False, "base": None, "picks": [[1, 0.01, 0]]},
+        {"d": "a", "late": False, "base": None, "picks": [[1, float("nan")]]},
+        {"d": "b", "late": False, "base": None, "picks": [[1, 0]]},
     ]
     s = dashboard._summarize_days(days, 1)
     assert s["corrupt"] == 1
@@ -356,7 +354,7 @@ def test_summarize_days_counts_corrupt_never_averages_around():
 
 
 def test_explorer_state_live_short_window_disclosures():
-    live = [{"d": str(i), "late": False, "base": None, "picks": [[1, 0.011, 0]]} for i in range(3)]
+    live = [{"d": str(i), "late": False, "base": None, "picks": [[1, 0]]} for i in range(3)]
     sim_s, live_s, notes = dashboard._explorer_state([], live, 5, 126)
     assert sim_s is None
     assert any("No touch-era benchmark yet" in n for n in notes)

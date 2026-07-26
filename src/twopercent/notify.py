@@ -71,11 +71,12 @@ MAX_PNG_BYTES = 20 * 1024 * 1024
 _DISCLAIMER = (
     "This message is automated model output from the twopercent research "
     "system. Model scores are statistical estimates, not calibrated "
-    "probabilities — on any given day most named candidates will not make a "
-    "2% move. Simulated and benchmark results assume perfect fills at the "
-    "open and close with estimated round-trip trading costs, and are subject "
-    "to survivorship bias in the historical candidate pool and to regime "
-    "change. Nothing in this message is investment advice."
+    "probabilities — on any given day most named candidates will not reach a "
+    "2% intraday move. Benchmark results are walk-forward and subject to "
+    "survivorship bias in the historical candidate pool and to regime change. "
+    "This is a ranked PREDICTION of intraday reach, not trade advice: how, or "
+    "whether, to act on it is the reader's decision. Nothing in this message is "
+    "investment advice."
 )
 
 
@@ -237,22 +238,23 @@ def _time_et(generated_at: dt.datetime) -> str:
     return f"{hour}:{generated_at:%M} {'AM' if generated_at.hour < 12 else 'PM'}"
 
 
-_RATIONALE = (
-    "in walk-forward simulation the top-5 equal-weight basket was the only "
-    "configuration with a positive compounded return net of assumed trading costs."
+_PREDICTION_NOTE = (
+    "This is a ranked prediction of which names are most likely to REACH +2% "
+    "intraday (open-to-high) — not trade advice. How, or whether, to act on it "
+    "is your decision; the trading strategy is a separate application."
 )
 
 
 def _basket_note(n_basket: int) -> str:
     if n_basket == 0:
         return (
-            "No candidates cleared today's ranking — no trade is suggested. "
+            "No candidates cleared today's ranking — none are named. "
             "This is stated outright rather than papered over."
         )
     if n_basket < BASKET_SIZE:
         return (
             f"Only {n_basket} candidate(s) cleared today's ranking, fewer than the "
-            f"usual {BASKET_SIZE} — the basket below is smaller than usual, not padded."
+            f"usual {BASKET_SIZE} — the list below is shorter than usual, not padded."
         )
     return ""
 
@@ -282,9 +284,9 @@ def _benchmark_summary(benchmark: tuple[int, dict, dt.date | None, dt.date | Non
             "precision_at_5/base_rate figures, so no precision claim is made."
         )
     return (
-        f"Over the walk-forward test window {window}, the top-5 basket hit the "
-        f"2% target on {p5:.1%} of picks versus an all-names base rate of "
-        f"{base:.1%} — a {p5 / base:.1f}x lift."
+        f"Over the walk-forward test window {window}, the top-5 ranked names "
+        f"reached +2% intraday on {p5:.1%} of picks versus an all-names base "
+        f"rate of {base:.1%} — a {p5 / base:.1f}x lift."
     )
 
 
@@ -299,7 +301,7 @@ def _system_summary_lines(strategy: str, benchmark, perf: PickPerformance) -> li
     return [
         f"Strategy {strategy}: a machine-learned ranking model retrained each "
         "morning on all labeled history, scoring liquid US names for the "
-        "probability of a 2%+ open-to-close move on the target day.",
+        "probability of REACHING +2% intraday (open-to-high) on the target day.",
         _benchmark_summary(benchmark),
         _live_record_line(perf),
     ]
@@ -325,9 +327,9 @@ def compose_signal_email(
     top10 = prediction.scored.head(TABLE_ROWS)
     basket = list(prediction.scored.head(BASKET_SIZE)["symbol"])
     basket_note = _basket_note(len(basket))
-    suggestion = (
-        f"Equal-weight basket of the model's top {len(basket)} candidate(s), "
-        "bought at the open and exited at the close: " + (", ".join(basket) if basket else "(none)")
+    candidates_line = (
+        f"The model's top {len(basket)} candidate(s) most likely to REACH +2% "
+        f"intraday on {date_str}: " + (", ".join(basket) if basket else "(none)")
     )
     summary_lines = _system_summary_lines(prediction.strategy, benchmark, perf)
 
@@ -341,10 +343,10 @@ def compose_signal_email(
             header_line,
             signal_line,
             "",
-            "TRADE SUGGESTION",
-            suggestion,
+            "TODAY'S CANDIDATES",
+            candidates_line,
             *([basket_note] if basket_note else []),
-            f"Why a top-{BASKET_SIZE} basket: {_RATIONALE}",
+            _PREDICTION_NOTE,
             "",
             f"TOP {TABLE_ROWS} CANDIDATES",
             f"{'rank':>5}  {'ticker':<8}{'score'}",
@@ -381,10 +383,10 @@ def compose_signal_email(
         '<h2 style="margin-bottom:2px;">twopercent Daily Signal</h2>'
         f'<p style="margin-top:0;color:#555;">{escape(header_line)}<br>'
         f"{escape(signal_line)}</p>"
-        '<h3 style="border-bottom:1px solid #ccc;padding-bottom:2px;">Trade Suggestion</h3>'
-        f"<p>{escape(suggestion)}</p>"
+        '<h3 style="border-bottom:1px solid #ccc;padding-bottom:2px;">Today\'s Candidates</h3>'
+        f"<p>{escape(candidates_line)}</p>"
         f"{note_html}"
-        f"<p>Why a top-{BASKET_SIZE} basket: {escape(_RATIONALE)}</p>"
+        f"<p><em>{escape(_PREDICTION_NOTE)}</em></p>"
         f'<h3 style="border-bottom:1px solid #ccc;padding-bottom:2px;">'
         f"Top {TABLE_ROWS} Candidates</h3>"
         '<table style="border-collapse:collapse;border:1px solid #ccc;">'

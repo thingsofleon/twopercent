@@ -296,12 +296,29 @@ Design (staged, each a reviewed PR; quant-skeptic mandatory on Stage A):
   migration). Metric definitions versioned via an `event` column on
   experiments/predictions/shadow (M1); degradation detector re-derived to pooled
   excess precision (M3). Stages B and C remain open.
-- **Stage B — remove the trading-P&L layer.** Delete `PickPerformance.growth`,
-  `sim_windows` growth, `backtest` sim_top1/top5 growth, the $-money tiles, and
-  the SIM/LIVE $-growth explorer. Lead with prediction quality: reach-rate
-  (precision), base rate, lift, per-day chart; the explorer becomes Top-N ×
-  window on reach-rate + lift, not dollars. (This subsumes the fee-removal
-  PR #68 — no growth number left to be gross or net.)
+- **Stage B — remove the trading-P&L layer. SHIPPED (#72, PR — pending
+  review/merge).** Deleted `PickPerformance.growth` + `COST_ROUND_TRIP`, the
+  `sim_windows`/`SimWindows` growth machinery (dead outside tests), `backtest`'s
+  `sim_top1_growth`/`sim_top5_growth`/`sim_top1_growth_by_fold` + per-fold growth
+  (precision/base_rate/lift/AUC/brier kept), the $-money tiles, and the SIM/LIVE
+  $-growth explorer column + its JS + the `cost` payload field. Old recorded
+  experiment rows keep their sim_* values as archive — no migration, we just stop
+  computing/recording them. The dashboard now leads with the touch-era
+  walk-forward benchmark (AUC, lift, top-N reach-rate, base rate — AUC is
+  base-rate-invariant, lift compresses at the ~34% touch base rate per N1;
+  degrades to "no touch-era benchmark yet" until `twopercent benchmark` runs),
+  then candidates-today, then the accumulating LIVE reach tiles (reach-rate, lift,
+  excess = precision − base_rate; LIVE days only — a backfilled day never inflates
+  a "live" number). The track-record table's top-pick column shows whether the #1
+  pick REACHED +2% (✓/✗), not a $ return; the trailing-window explorer is
+  Top-N × window on reach-rate/base rate/lift, no dollars. Stale labels fixed:
+  the h1/title/sub now say reach/intraday, not "+2% open-to-close candidates"
+  (prev-day open-to-close stays as a legitimate FEATURE label). The daily email
+  reframed from TRADE suggestions / $ language to prediction language ("today's
+  candidates most likely to REACH +2% intraday", disclaimer that this is a ranked
+  prediction not trade advice). Metric math (reach-rate/base-rate/lift/AUC)
+  untouched — Stage B is removal + presentation only. **Supersedes/closes #68**
+  (fee removal): no growth number left to be gross or net.
 - **Stage C — calibration as first-class.** The output is P(reach 2%) and the
   user acts on the number, so it must be honest: add walk-forward calibration
   (bucket predicted probs vs realized reach-frequency; reliability table +
@@ -453,6 +470,17 @@ truth for *decisions and plan shape*; GitHub is the source of truth for
   `open_to_high`; close-era rows walled off, live record clean-reset), and the
   degradation detector was re-derived to base-rate-invariant pooled excess
   precision (M3). **Required post-merge op:** `twopercent benchmark` to record a
-  touch-era champion. Stages B ($-P&L removal) and C (calibration) remain open.
+  touch-era champion.
+  Shipped (#72, reach-predictor Stage B): the trading-P&L layer is gone — this
+  app is now a PURE PREDICTOR that reports prediction QUALITY, never dollars.
+  Removed `PickPerformance.growth`/`COST_ROUND_TRIP`, the `sim_windows` growth
+  machinery, `backtest`'s sim_top1/top5 growth, the $-money tiles, and the
+  SIM/LIVE $-growth explorer column. The dashboard leads with the touch-era
+  walk-forward benchmark (AUC, lift, top-N reach-rate, base rate) then the
+  accumulating LIVE reach tiles (reach-rate/lift/excess, live days only); the
+  daily table's top pick shows REACHED ✓/✗, the explorer is reach-rate/base/lift.
+  Stale "+2% open-to-close candidates" labels fixed to reach/intraday; the daily
+  email reframed from trade suggestions to ranked-prediction language.
+  Supersedes/closes #68 (fee removal). Stage C (calibration) remains open.
   Exit criterion: a real degradation → investigation cycle observed, or at
   minimum both timers proven live — NOT complete yet.

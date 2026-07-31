@@ -146,6 +146,25 @@ def test_summarize_missing_and_corrupt_days_never_average_around():
     assert s3["corrupt"] == 1 and s3["clean"] == 1
 
 
+def test_partially_corrupt_day_leaks_no_ghost_wins():
+    """A day whose FIRST pick is a winner but whose second pick is NaN must
+    contribute zero to the win-rate numerator: wins are committed only after
+    the whole day validates, or the rate inflates (numerator without its
+    denominator — reviewer finding on PR #77)."""
+    good = {"d": "a", "picks": [[1, 0.001, -0.002, -0.004, 0]]}  # clean losing day
+    partial = {
+        "d": "p",
+        "picks": [
+            [1, 0.03, -0.001, 0.03, 1],  # winning pick, tallied first...
+            [2, 0.02, -0.002, float("nan"), 1],  # ...then the day dies as corrupt
+        ],
+    }
+    s = strategy.summarize_strategy_days([good, partial], 2, "hold_close")
+    assert s["corrupt"] == 1 and s["clean"] == 1
+    assert s["picks"] == 1  # only the clean day's pick counts
+    assert s["ww"] == 0.0 and s["wb"] == 0.0  # the ghost win never leaked
+
+
 def test_dropdown_choices_shape():
     keys = [k for k, _label, _enabled in strategy.STRATEGY_CHOICES]
     assert keys[0] == "reach"  # prediction quality stays the default view

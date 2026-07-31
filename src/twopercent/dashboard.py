@@ -1153,15 +1153,17 @@ var tpMath = (function () {
       if (sub) substDays += 1;
       if (miss) { missing += 1; continue; }
       if (!picks.length) { corrupt += 1; continue; }
-      var sumW = 0, sumB = 0, ok = true;
+      var sumW = 0, sumB = 0, dayWinsW = 0, dayWinsB = 0, ok = true;
       for (j = 0; j < picks.length; j++) {
         var band = pickBand(strat, picks[j][2], picks[j][3], !!picks[j][4]);
         if (!isFinite(band[0]) || !isFinite(band[1])) { ok = false; break; }
         sumW += band[0]; sumB += band[1];
-        if (band[0] > 0) winsW += 1;
-        if (band[1] > 0) winsB += 1;
+        if (band[0] > 0) dayWinsW += 1;
+        if (band[1] > 0) dayWinsB += 1;
       }
       if (!ok) { corrupt += 1; continue; }
+      winsW += dayWinsW;
+      winsB += dayWinsB;
       picksN += picks.length;
       gw *= 1 + sumW / picks.length;
       gb *= 1 + sumB / picks.length;

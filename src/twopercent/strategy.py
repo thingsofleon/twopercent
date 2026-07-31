@@ -125,6 +125,10 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
             corrupt += 1
             continue
         sum_w = sum_b = 0.0
+        # Day-local win tallies: committed only after the whole day validates,
+        # so a partially-corrupt day can never leak ghost wins into the rate
+        # (numerator without its denominator — reviewer finding, PR #77).
+        day_wins_w = day_wins_b = 0
         ok = True
         for p in picks:
             worst, best = pick_return_band(strategy, p[2], p[3], bool(p[4]))
@@ -134,12 +138,14 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
             sum_w += worst
             sum_b += best
             if worst > 0:
-                wins_w += 1
+                day_wins_w += 1
             if best > 0:
-                wins_b += 1
+                day_wins_b += 1
         if not ok:
             corrupt += 1
             continue
+        wins_w += day_wins_w
+        wins_b += day_wins_b
         n_picks += len(picks)
         growth_w *= 1 + sum_w / len(picks)
         growth_b *= 1 + sum_b / len(picks)

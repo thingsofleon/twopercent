@@ -408,8 +408,13 @@ def test_dashboard_render_includes_calibration_panel(modeled, tmp_path):
     assert "$" not in section
 
 
-def _record_sim(con, n_days, ranks_per_day=6, strategy="baseline_gbm_v1"):
-    """Per-rank sim rows: mostly-up rank-1 returns, adversarial values."""
+def _record_sim(con, n_days, ranks_per_day=6, strategy="baseline_gbm_v1", strategy_cols=True):
+    """Per-rank sim rows: mostly-up rank-1 returns, adversarial values.
+
+    strategy_cols=False seeds LEGACY rows (recorded before the oh/ol upgrade)
+    for the degradation path. When present: winners touch +2% intraday (a limit
+    fill) with a shallow low; losers never touch and their low trips the −1%
+    stop — so every exit rule separates from hold-to-close."""
     seq = store.record_experiment(
         con,
         strategy=strategy,
@@ -424,7 +429,11 @@ def _record_sim(con, n_days, ranks_per_day=6, strategy="baseline_gbm_v1"):
     for i, d in enumerate(dates):
         for rank in range(1, ranks_per_day + 1):
             ret = -0.0117 if (i + rank) % 5 == 0 else 0.0203
-            rows.append({"target_date": d, "rank": rank, "ret": ret, "hit": int(ret > 0.02)})
+            row = {"target_date": d, "rank": rank, "ret": ret, "hit": int(ret > 0.02)}
+            if strategy_cols:
+                row["oh"] = 0.0231 if ret > 0.02 else 0.0042
+                row["ol"] = -0.0009 if ret > 0.02 else -0.0117
+            rows.append(row)
     store.record_experiment_daily(con, seq, pd.DataFrame(rows))
     return seq
 
@@ -440,16 +449,18 @@ def test_dashboard_explorer_defaults_match_python_math(modeled, tmp_path):
     content = out.read_text()
 
     _, daily = store.latest_experiment_daily(modeled, "baseline_gbm_v1")
-    sim_days = dashboard._payload_days(daily, bases={})
+    sim_days = dashboard._payload_days(daily.rename(columns={"ret": "oc"}), bases={})
     s126 = dashboard._summarize_days(sim_days[-126:], 5)
-    assert "tp-sim-growth" not in content  # the $-growth column is gone
     assert f'<td id="tp-sim-hit">{dashboard._pct_half_up(s126["hit"])}</td>' in content
     assert '<td id="tp-sim-days">126</td>' in content  # selection day count visible
 
     assert 'class="badge-sim">SIM</span>' in content
     assert 'class="badge-live">LIVE</span>' in content
     assert "walk-forward, monthly retrain" in content
-    assert "<th>Reach rate" in content and "$" not in content  # reach, never dollars
+    # The DEFAULT (reach) card reports reach only — dollars live exclusively in
+    # the opt-in strategy card, which stays hidden until selected.
+    reach_card = content.split("id='tp-card-reach'")[1].split("</div>")[0]
+    assert "<th>Reach rate" in content and "$" not in reach_card
     # Both selects, with per-window trading-day counts, defaults marked.
     assert '<option value="5" selected>Top 5</option>' in content
     assert '<option value="126" selected>6 months (126 trading days)</option>' in content
@@ -480,21 +491,31 @@ def test_dashboard_explorer_payload_json(modeled, tmp_path):
     match = re.search(r'<script type="application/json" id="tp-data">(.*?)</script>', content)
     assert match, "payload script tag missing"
     payload = json.loads(match.group(1))
-    assert "cost" not in payload  # Stage B: no trading cost in the reach payload
+    assert "cost" not in payload  # GROSS returns: no trading-cost constant anywhere
     assert len(payload["sim"]) == 6
     day0 = payload["sim"][0]
     assert day0["d"] == "2026-01-05"
-    # Each pick is [rank, hit] — reach flags only, no $-return.
+    # Each pick is [rank, oh, ol, oc, hit] — raw outcome returns + the guarded
+    # touch/fill flag; growth is DERIVED in lockstep, never shipped as dollars.
     # Hand-check day 0: (i + rank) % 5 == 0 at rank 5 → that one is not a reacher.
-    assert day0["picks"] == [[1, 1], [2, 1], [3, 1], [4, 1], [5, 0], [6, 1]]
+    assert day0["picks"] == [
+        [1, 0.0231, -0.0009, 0.0203, 1],
+        [2, 0.0231, -0.0009, 0.0203, 1],
+        [3, 0.0231, -0.0009, 0.0203, 1],
+        [4, 0.0231, -0.0009, 0.0203, 1],
+        [5, 0.0042, -0.0117, -0.0117, 0],
+        [6, 0.0231, -0.0009, 0.0203, 1],
+    ]
     # Base rate on 2026-01-05: 4 runners of 8 names reached ≥2%.
     assert abs(day0["base"] - 0.5) < 1e-9
-    # Live day present with late flag and rank-ordered picks.
+    # Live day present with late flag and rank-ordered picks; oh/ol/oc are the
+    # daily_returns outcome magnitudes (never null on the live path).
     assert len(payload["live"]) == 1
     live0 = payload["live"][0]
     assert live0["late"] is True  # backfilled save, created after the target open
     assert [p[0] for p in live0["picks"]] == sorted(p[0] for p in live0["picks"])
-    assert all(len(p) == 2 for p in live0["picks"])  # [rank, hit], no return field
+    assert all(len(p) == 5 for p in live0["picks"])
+    assert all(p[1] is not None and p[2] is not None and p[3] is not None for p in live0["picks"])
 
 
 def test_dashboard_explorer_too_few_sim_days_says_so(modeled, tmp_path):
@@ -509,10 +530,15 @@ def test_dashboard_explorer_too_few_sim_days_says_so(modeled, tmp_path):
     assert "The live record above is the clean test." in content
 
 
+def _pick(rank, hit, oh=0.021, ol=-0.002, oc=0.005):
+    """A payload pick [rank, oh, ol, oc, hit] with harmless default returns."""
+    return [rank, oh, ol, oc, hit]
+
+
 def test_summarize_days_first_available_substitution_and_short_days():
     days = [
-        {"d": "a", "base": 0.25, "picks": [[2, 1], [3, 0]]},  # rank 1 missing
-        {"d": "b", "base": 0.15, "picks": [[1, 1]]},
+        {"d": "a", "base": 0.25, "picks": [_pick(2, 1), _pick(3, 0)]},  # rank 1 missing
+        {"d": "b", "base": 0.15, "picks": [_pick(1, 1)]},
     ]
     s1 = dashboard._summarize_days(days, 1)
     # First-available rule: day a's top pick is rank 2 (the trader takes it) —
@@ -530,8 +556,8 @@ def test_summarize_days_first_available_substitution_and_short_days():
 
 def test_explorer_substitution_and_base_coverage_notes():
     days = [
-        {"d": "a", "late": False, "base": 0.25, "picks": [[2, 1]]},  # rank 1 missing
-        {"d": "b", "late": False, "base": None, "picks": [[1, 0]]},  # base unknown
+        {"d": "a", "late": False, "base": 0.25, "picks": [_pick(2, 1)]},  # rank 1 missing
+        {"d": "b", "late": False, "base": None, "picks": [_pick(1, 0)]},  # base unknown
     ]
     _, live_s, notes = dashboard._explorer_state([], days, 1, 5)
     assert live_s is not None
@@ -539,8 +565,8 @@ def test_explorer_substitution_and_base_coverage_notes():
     assert "LIVE: base rate from 1 of 2 day(s)" in notes
     # A contiguous full-coverage frame emits neither disclosure.
     clean_days = [
-        {"d": "a", "late": False, "base": 0.25, "picks": [[1, 1]]},
-        {"d": "b", "late": False, "base": 0.25, "picks": [[1, 0]]},
+        {"d": "a", "late": False, "base": 0.25, "picks": [_pick(1, 1)]},
+        {"d": "b", "late": False, "base": 0.25, "picks": [_pick(1, 0)]},
     ]
     _, _, clean_notes = dashboard._explorer_state([], clean_days, 1, 5)
     assert not any("substituted" in n or "base rate from" in n for n in clean_notes)
@@ -609,8 +635,8 @@ def test_summarize_days_counts_corrupt_never_averages_around():
     # A non-finite reach flag (a data error) must be counted as corrupt, never
     # silently averaged around into a shorter window.
     days = [
-        {"d": "a", "late": False, "base": None, "picks": [[1, float("nan")]]},
-        {"d": "b", "late": False, "base": None, "picks": [[1, 0]]},
+        {"d": "a", "late": False, "base": None, "picks": [_pick(1, float("nan"))]},
+        {"d": "b", "late": False, "base": None, "picks": [_pick(1, 0)]},
     ]
     s = dashboard._summarize_days(days, 1)
     assert s["corrupt"] == 1
@@ -621,7 +647,7 @@ def test_summarize_days_counts_corrupt_never_averages_around():
 
 
 def test_explorer_state_live_short_window_disclosures():
-    live = [{"d": str(i), "late": False, "base": None, "picks": [[1, 0]]} for i in range(3)]
+    live = [{"d": str(i), "late": False, "base": None, "picks": [_pick(1, 0)]} for i in range(3)]
     sim_s, live_s, notes = dashboard._explorer_state([], live, 5, 126)
     assert sim_s is None
     assert any("No touch-era benchmark yet" in n for n in notes)
@@ -632,3 +658,231 @@ def test_explorer_state_live_short_window_disclosures():
     _, live_s2, notes2 = dashboard._explorer_state([], [dict(d, late=True) for d in live], 5, 126)
     assert live_s2 is None
     assert any("no live days yet" in n for n in notes2)
+
+
+# --- strategy explorer (exit-rule what-if) ------------------------------------
+
+
+def test_strategy_dropdown_defaults_to_reach_and_disables_trailing(modeled, tmp_path):
+    # Reach rate (prediction quality) is the DEFAULT view; the P&L card exists
+    # but is hidden until an exit rule is chosen; the trailing stop is listed
+    # DISABLED with its reason (daily bars cannot replay it) — never simulated.
+    _record_sim(modeled, n_days=130)
+    out = tmp_path / "dash.html"
+    dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5)
+    content = out.read_text()
+
+    assert '<option value="reach" selected>Reach rate (prediction quality)</option>' in content
+    assert '<option value="trailing" disabled>Trailing stop (needs intraday data)' in content
+    assert 'id="tp-card-strat" hidden' in content  # opt-in, never the default
+    assert "id='tp-card-reach'" in content  # the default card is the reach table
+    # Selection caveat names strategies explicitly (browsing IS selection).
+    assert "flipping strategies/baskets/windows to find a good-looking cell" in content
+
+
+def test_strategy_card_framing_stamps_and_gross_labels(modeled, tmp_path):
+    _record_sim(modeled, n_days=130)
+    out = tmp_path / "dash.html"
+    dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5)
+    content = out.read_text()
+    card = content.split('id="tp-card-strat"')[1].split("</table>")[0]
+
+    # SIM growth cell: the stamp sits NEXT TO the number, not in a footnote.
+    sim_cell = card.split('id="tp-strat-sim-growth"')[1].split("</td>")[0]
+    assert "OPTIMISTIC UPPER BOUND" in sim_cell
+    # LIVE row is framed as the honest, survivorship-free, small sample.
+    assert "real logged picks — survivorship-free, small sample" in card
+    # Plain-language survivorship line + gross labels ride in the same card.
+    strat_block = content.split('id="tp-card-strat"')[1].split("</div>")[0]
+    assert "excludes every company that delisted" in strat_block
+    assert "if even a few of their blow-up days were real, this could be a loss" in strat_block
+    assert "before trading costs (not estimated)" in strat_block
+    assert "daily data can't tell which came first" in strat_block
+    assert "glitch-suspect high never counts as a fill" in strat_block
+
+
+def test_strategy_row_never_shows_win_rate_without_growth(modeled, tmp_path):
+    # The inviolable pairing (quant-skeptic must-fix #2): every populated
+    # strategy row carries $1→growth AND win rate together; a dashed row dashes
+    # BOTH. Checked on the rendered server default (hold_close).
+    _record_sim(modeled, n_days=130)
+    out = tmp_path / "dash.html"
+    dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5)
+    content = out.read_text()
+
+    sim_growth = content.split('id="tp-strat-sim-growth">')[1].split("<")[0]
+    sim_win = content.split('id="tp-strat-sim-win">')[1].split("<")[0]
+    assert sim_growth.startswith("$1 → $")
+    assert sim_win.endswith("%")
+    # Structural guard on the cell builder itself: populated → both; empty → both dashed.
+    s = {"gw": 1.1, "gb": 1.1, "ww": 0.6, "wb": 0.6, "days": 5}
+    cells = dashboard._strategy_cells("strat-sim", s)
+    assert "$1 → $1.10" in cells and ">60%<" in cells
+    dashed = dashboard._strategy_cells("strat-sim", None)
+    assert dashed.count("—") == 3  # growth, win rate, days — all dashed together
+
+
+def test_strategy_server_default_matches_python_math(modeled, tmp_path):
+    # The hidden strategy table is server-rendered for hold_close from the SAME
+    # payload the JS consumes — Python is the source of truth the JS re-derives.
+    _record_sim(modeled, n_days=130)
+    out = tmp_path / "dash.html"
+    dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5)
+    content = out.read_text()
+
+    _, daily = store.latest_experiment_daily(modeled, "baseline_gbm_v1")
+    sim_days = dashboard._payload_days(daily.rename(columns={"ret": "oc"}), bases={})
+    sim_s, live_s, _ = dashboard._strategy_state(sim_days, [], 5, 126, "hold_close")
+    assert sim_s is not None
+    expected = dashboard._growth_text(sim_s)
+    assert f'id="tp-strat-sim-growth">{expected}</span>' in content
+    assert f'id="tp-strat-sim-win">{dashboard._win_text(sim_s)}</td>' in content
+    read = dashboard._strategy_read(sim_s, live_s)
+    assert "$1 following this rule on the SIM picks became" in read
+    assert read in content
+
+
+def test_strategy_state_missing_ohol_degrades_to_rebenchmark_message(modeled, tmp_path):
+    # Pre-upgrade benchmark rows (no oh/ol): the SIM strategy row must show NO
+    # number — only the re-benchmark message — and the page must not crash.
+    # Reach view stays fully functional (it never needed oh/ol).
+    _record_sim(modeled, n_days=130, strategy_cols=False)
+    out = tmp_path / "dash.html"
+    dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5)
+    content = out.read_text()
+
+    assert "no strategy data recorded on 126 of 126 day(s) — re-run twopercent benchmark" in content
+    assert 'id="tp-strat-sim-growth">—</span>' in content  # no number pretended
+    # Reach default is untouched by the missing strategy data.
+    assert '<td id="tp-sim-days">126</td>' in content
+
+
+def test_strategy_state_live_excludes_late_days(caplog):
+    # The survivorship-free LIVE framing is only honest on genuinely-live picks:
+    # a backfilled day's outcome was known at save time. Late days must vanish
+    # from the strategy LIVE row exactly as they do from the reach row.
+    live_day = {"d": "a", "late": False, "base": None, "picks": [_pick(1, 1, oc=0.03)]}
+    late_day = {"d": "b", "late": True, "base": None, "picks": [_pick(1, 1, oc=0.50)]}
+    sim_s, live_s, notes = dashboard._strategy_state([], [live_day, late_day], 1, 5, "hold_close")
+    assert sim_s is None
+    assert live_s is not None and live_s["days"] == 1  # the late +50% day never counts
+    assert abs(live_s["gw"] - 1.03) < 1e-12
+    assert any("all 1 live day(s)" in n for n in notes)
+    # All days late → no LIVE number at all, said loudly.
+    _, live_s2, notes2 = dashboard._strategy_state([], [late_day], 1, 5, "hold_close")
+    assert live_s2 is None
+    assert any("no live days yet" in n for n in notes2)
+
+
+def test_strategy_growth_and_win_math_hand_checked():
+    # Two days, basket of 2, hold_close: day returns are means of oc, growth
+    # compounds them, win rate counts PICKS (3 of 4 positive).
+    days = [
+        {"d": "a", "base": None, "picks": [_pick(1, 1, oc=0.02), _pick(2, 0, oc=-0.01)]},
+        {"d": "b", "base": None, "picks": [_pick(1, 1, oc=0.04), _pick(2, 1, oc=0.02)]},
+    ]
+    s = dashboard.strategy.summarize_strategy_days(days, 2, "hold_close")
+    assert abs(s["gw"] - (1 + 0.005) * (1 + 0.03)) < 1e-12
+    assert s["gw"] == s["gb"]  # hold_close is exact — no band
+    assert s["ww"] == s["wb"] == 0.75
+    assert s["picks"] == 4 and s["days"] == 2
+    assert dashboard._growth_text(s) == "$1 → $1.04"
+    assert dashboard._win_text(s) == "75%"
+
+
+def test_strategy_band_renders_worst_and_best():
+    # A both-triggered limit+stop day yields a BAND, never a single number.
+    days = [{"d": "a", "base": None, "picks": [_pick(1, 1, ol=-0.015, oc=0.001)]}]
+    s = dashboard.strategy.summarize_strategy_days(days, 1, "limit_stop")
+    assert abs(s["gw"] - 0.99) < 1e-12 and abs(s["gb"] - 1.02) < 1e-12
+    assert s["ww"] == 0.0 and s["wb"] == 1.0
+    assert dashboard._growth_text(s) == "$1 → $0.99–$1.02"
+    assert dashboard._win_text(s) == "0%–100%"
+    assert "between $0.99 (worst case) and $1.02 (best case)" in dashboard._strategy_read(s, None)
+
+
+def test_strategy_lockstep_python_vs_node():
+    # THE lockstep proof for the highest-stakes math on the page: execute the
+    # page's own tpMath script under node on an adversarial payload and demand
+    # bit-identical numbers and identical rendered strings from the Python
+    # mirrors. Covers: fills, stops, both-triggered bands, exact-boundary stop
+    # lows, substitution, short days, and a missing-data (pre-upgrade) day.
+    import json
+    import shutil
+    import subprocess
+
+    import pytest
+
+    if shutil.which("node") is None:
+        pytest.skip("node not available for the JS lockstep")
+
+    days = [
+        {"d": "a", "base": 0.5, "picks": [_pick(1, 1, ol=-0.015, oc=0.001), _pick(2, 0)]},
+        {"d": "b", "base": None, "picks": [_pick(2, 0, ol=-0.01, oc=-0.0117)]},  # subst + short
+        {"d": "c", "base": 0.25, "picks": [_pick(1, 0, ol=-0.009999999999999964, oc=0.0)]},
+        {"d": "d", "base": 0.25, "picks": [_pick(1, 1, oh=0.0203, ol=-0.0009, oc=0.0203)]},
+    ]
+    missing_days = days + [{"d": "e", "base": None, "picks": [[1, None, None, None, 0]]}]
+
+    js = dashboard._JS_MATH.replace("<script>", "").replace("</script>", "")
+    driver = f"""
+{js}
+const days = {json.dumps(days)};
+const missingDays = {json.dumps(missing_days)};
+const out = {{}};
+for (const strat of ["hold_close", "limit_2pct", "limit_stop"]) {{
+  for (const n of [1, 2, 5]) {{
+    const s = tpMath.stratSummarize(days, n, strat);
+    out[strat + ":" + n] = [s.gw, s.gb, s.ww, s.wb, s.picks, s.days, s.clean,
+                            s.shortDays, s.substDays, s.missing, s.corrupt,
+                            tpMath.growthText(s), tpMath.winText(s),
+                            tpMath.readText(s, null)];
+  }}
+  out[strat + ":missing"] = tpMath.stratSummarize(missingDays, 2, strat).missing;
+}}
+const r = tpMath.summarize(days, 2);
+out.reach = [r.hit, r.base, r.days, r.shortDays, r.substDays, r.baseDays, r.corrupt];
+console.log(JSON.stringify(out));
+"""
+    proc = subprocess.run(
+        ["node", "-e", driver], capture_output=True, text=True, timeout=60, check=True
+    )
+    node_out = json.loads(proc.stdout)
+
+    def _nn(x):  # JSON.stringify(NaN) -> null; mirror for comparison
+        import math
+
+        return None if isinstance(x, float) and math.isnan(x) else x
+
+    for strat in ("hold_close", "limit_2pct", "limit_stop"):
+        for n in (1, 2, 5):
+            s = dashboard.strategy.summarize_strategy_days(days, n, strat)
+            expected = [
+                _nn(s["gw"]),
+                _nn(s["gb"]),
+                _nn(s["ww"]),
+                _nn(s["wb"]),
+                s["picks"],
+                s["days"],
+                s["clean"],
+                s["short"],
+                s["subst"],
+                s["missing"],
+                s["corrupt"],
+                dashboard._growth_text(s),
+                dashboard._win_text(s),
+                dashboard._strategy_read(s, None),
+            ]
+            assert node_out[f"{strat}:{n}"] == expected, f"{strat} n={n} diverged"
+        s_missing = dashboard.strategy.summarize_strategy_days(missing_days, 2, strat)
+        assert node_out[f"{strat}:missing"] == s_missing["missing"] == 1
+    r = dashboard._summarize_days(days, 2)
+    assert node_out["reach"] == [
+        _nn(r["hit"]),
+        r["base"],
+        r["days"],
+        r["short"],
+        r["subst"],
+        r["base_days"],
+        r["corrupt"],
+    ]

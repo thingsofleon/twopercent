@@ -17,7 +17,7 @@ from decimal import ROUND_HALF_UP, Decimal
 import duckdb
 import pandas as pd
 
-from twopercent import backtest, store, track
+from twopercent import backtest, store, strategy, track
 from twopercent.predict import PredictResult, predict_for
 
 _CSS = """
@@ -107,6 +107,10 @@ html, body { background: var(--bg); margin: 0; }
   letter-spacing: 0.12em; vertical-align: 1px; margin-right: 6px; }
 .badge-sim { background: var(--amber); }
 .badge-live { background: var(--up); }
+.stamp-ub { display: inline-block; background: var(--amber); color: var(--bg);
+  font-size: 0.6rem; font-weight: 800; padding: 2px 6px; border-radius: 4px;
+  letter-spacing: 0.08em; margin-left: 6px; vertical-align: 1px;
+  font-family: system-ui, sans-serif; white-space: nowrap; }
 .tp-root select { background: var(--card); color: var(--ink-1);
   border: 1px solid var(--card-border); border-radius: 6px; padding: 3px 6px;
   font: inherit; font-size: 0.84rem; }
@@ -219,6 +223,21 @@ _INFO_TEXT = {
     "e_base": "Average share of all symbols that reached +2% over the window.",
     "e_lift": "Reach-rate ÷ base rate over the window. Above 1× beats random.",
     "e_days": "Trading days included in this window.",
+    "e_strategy": "What-if exit rules replayed on the SAME picks — an opt-in "
+    "backtest view, never the headline. Reach rate keeps the default "
+    "prediction-quality view. Every P&L number is gross — before trading costs "
+    "(not estimated) — and the SIM row is an optimistic upper bound "
+    "(survivorship). The trailing stop needs minute-by-minute data we don't "
+    "have, so it is disabled.",
+    "s_growth": "What $1 became following this exit rule: equal-weight basket, "
+    "compounded daily, gross — before trading costs (not estimated). Fills are "
+    "assumed at exactly the trigger price. For the limit+stop rule, daily data "
+    "can't tell which order filled first when both triggered, so the result is "
+    "a worst–best band.",
+    "s_win": "Share of individual picks whose strategy return was positive. "
+    "Never read it without the growth number beside it: a high win rate can "
+    "coexist with losing most of your capital when the losers are bigger than "
+    "the winners.",
 }
 
 
@@ -668,10 +687,11 @@ _SIM_CAVEAT = (
     "Walk-forward simulation: the model never trains on the days it predicts, "
     "but the system was designed with this history visible. Picks require a "
     "next-day bar and today's universe is applied to history, so delisted names "
-    "can never contribute their final catastrophic day — the reach-rate is "
-    "biased up (survivorship). Browsing basket and window combinations is itself "
-    "a form of selection — a good-looking cell found by flipping views is partly "
-    "luck — and short windows are small samples. Lift compresses at a high base "
+    "can never contribute their final catastrophic day — the reach-rate and any "
+    "strategy P&L are biased up (survivorship). Browsing strategy, basket, and "
+    "window combinations is itself a form of selection — flipping "
+    "strategies/baskets/windows to find a good-looking cell is itself luck — and "
+    "short windows are small samples. Lift compresses at a high base "
     "rate (it is capped at 1 / base-rate), so read AUC and excess (reach − base) "
     "too. The live record above is the clean test."
 )
@@ -693,11 +713,25 @@ def _embed_json(payload: dict) -> str:
     return f'<script type="application/json" id="tp-data">{text}</script>'
 
 
+def _payload_num(value) -> float | None:
+    """Payload outcome return: rounded to 6 places; None for a NULL/NaN (a
+    pre-upgrade sim row without oh/ol) → JSON null, which BOTH summarize
+    mirrors treat as 'no strategy data recorded', never as a silent zero.
+    json.dumps(allow_nan=False) could not carry a NaN anyway."""
+    if value is None:
+        return None
+    value = float(value)
+    return round(value, 6) if math.isfinite(value) else None
+
+
 def _payload_days(frame: pd.DataFrame, bases: dict, late: bool = False) -> list[dict]:
     """Per-rank frame -> ordered payload day dicts {d, base, [late,] picks}.
 
-    Each pick is [rank, hit]: Stage B reports reach only, so no per-pick $-return
-    rides in the payload — the explorer summarizes reach-rate, not growth."""
+    Each pick is [rank, oh, ol, oc, hit]: the reach view reads only rank+hit;
+    the strategy explorer replays exit rules from the oh/ol/oc outcome returns
+    (null on rows recorded before the strategy upgrade — degradation, not 0).
+    No dollar figure rides in the payload; growth is computed client/server in
+    lockstep from these raw returns."""
     days: list[dict] = []
     for d, grp in frame.groupby("target_date"):
         day = pd.Timestamp(d).date()
@@ -706,7 +740,10 @@ def _payload_days(frame: pd.DataFrame, bases: dict, late: bool = False) -> list[
             "d": str(day),
             "base": round(float(base), 6) if base is not None else None,
             "picks": [
-                [int(rank), int(hit)] for rank, hit in zip(grp["rank"], grp["hit"], strict=True)
+                [int(rank), _payload_num(oh), _payload_num(ol), _payload_num(oc), int(hit)]
+                for rank, oh, ol, oc, hit in zip(
+                    grp["rank"], grp["oh"], grp["ol"], grp["oc"], grp["hit"], strict=True
+                )
             ],
         }
         if late:
@@ -717,10 +754,11 @@ def _payload_days(frame: pd.DataFrame, bases: dict, late: bool = False) -> list[
 
 def _summarize_days(days: list[dict], n: int) -> dict:
     """Basket reach stats over payload days — EXACT server-side mirror of the
-    inline JS summarize(): basket = first n picks of each day (rank order;
-    taking the next available name IS the substitution rule), day reach = mean
-    of the basket's hit flags. A non-finite basket reach is counted as corrupt,
-    never silently averaged around."""
+    inline JS tpMath.summarize(): basket = first n picks of each day (rank
+    order; taking the next available name IS the substitution rule), day reach
+    = mean of the basket's hit flags (pick index 4 — [rank, oh, ol, oc, hit]).
+    A non-finite basket reach is counted as corrupt, never silently averaged
+    around."""
     hit_sum, base_sum = 0.0, 0.0
     base_known = short = subst = corrupt = 0
     for day in days:
@@ -732,7 +770,7 @@ def _summarize_days(days: list[dict], n: int) -> dict:
             # the same event daily_pick_performance warns about (a missing
             # rank may hide exactly the catastrophic day). Count and disclose.
             subst += 1
-        hit = sum(p[1] for p in picks) / len(picks)
+        hit = sum(p[4] for p in picks) / len(picks)
         if not math.isfinite(hit):
             corrupt += 1
             continue
@@ -842,12 +880,161 @@ def _explorer_cells(prefix: str, s: dict | None) -> str:
     )
 
 
-def _record_explorer(meta: dict | None, sim_days: list[dict], live_days: list[dict]) -> str:
-    """Interactive basket/window explorer: amber SIM row vs green LIVE row.
+def _strategy_state(
+    sim_days: list[dict], live_days: list[dict], n: int, w: int, strat: str
+) -> tuple[dict | None, dict | None, list[str]]:
+    """Strategy-view outcome for both rows + disclosure notes — mirrors the JS
+    updateStrat(). Same honesty rules as _explorer_state, plus: a window
+    containing ANY day without recorded oh/ol/oc (a pre-upgrade benchmark)
+    yields NO number, only 're-run twopercent benchmark' — a growth compounded
+    over a silently different set of days would be the classic silent-drop bug.
+    LIVE uses live-only days (late/backfilled excluded): the survivorship-free
+    framing is only honest if the row truly is genuinely-live picks."""
+    notes: list[str] = []
+    sim_s = None
+    if not sim_days:
+        notes.append("No touch-era benchmark yet — run twopercent benchmark.")
+    elif len(sim_days) < w:
+        notes.append(f"SIM: needs {w} trading days — {len(sim_days)} available")
+    else:
+        s = strategy.summarize_strategy_days(sim_days[-w:], n, strat)
+        if s["missing"]:
+            notes.append(
+                f"SIM: no strategy data recorded on {s['missing']} of {s['days']} "
+                "day(s) — re-run twopercent benchmark"
+            )
+        elif s["corrupt"]:
+            notes.append(f"SIM: {s['corrupt']} corrupt day(s) in window — data error")
+        else:
+            sim_s = s
+            notes.extend(_row_notes("SIM", s, n))
+    live = [d for d in live_days if not d["late"]]
+    live_s = None
+    if not live:
+        notes.append("LIVE: no live days yet")
+    else:
+        s = strategy.summarize_strategy_days(live[-min(w, len(live)) :], n, strat)
+        if s["missing"]:
+            notes.append(f"LIVE: {s['missing']} day(s) missing strategy data — data error")
+        elif s["corrupt"]:
+            notes.append(f"LIVE: {s['corrupt']} corrupt day(s) — data error")
+        else:
+            live_s = s
+            if len(live) < w:
+                notes.append(f"LIVE: all {len(live)} live day(s) — fewer than the {w}-day window")
+            notes.extend(_row_notes("LIVE", s, n))
+    return sim_s, live_s, notes
 
-    Server-side renders the default selection (top-5, 6 months) so the page
-    is meaningful without JS; the inline script recomputes on select change
-    from the embedded JSON payload."""
+
+def _growth_text(s: dict) -> str:
+    """ "$1 → $X", or "$1 → $worst–$best" when the stop/limit band is open —
+    mirrors JS tpMath.growthText(). Band collapse compares the FORMATTED ends
+    (like the JS) so a sub-cent band never renders as a fake spread."""
+    lo, hi = _fixed_half_up(s["gw"], 2), _fixed_half_up(s["gb"], 2)
+    return f"$1 → ${lo}" if lo == hi else f"$1 → ${lo}–${hi}"
+
+
+def _win_text(s: dict) -> str:
+    """Pick win rate, "X%" or band "X%–Y%" — mirrors JS tpMath.winText()."""
+    if not math.isfinite(s["ww"]):
+        return "—"
+    lo, hi = _pct_half_up(s["ww"]), _pct_half_up(s["wb"])
+    return lo if lo == hi else f"{lo}–{hi}"
+
+
+def _became_text(s: dict) -> str:
+    """The read-sentence growth phrase — mirrors JS tpMath.becameText()."""
+    lo, hi = _fixed_half_up(s["gw"], 2), _fixed_half_up(s["gb"], 2)
+    return f"${lo}" if lo == hi else f"between ${lo} (worst case) and ${hi} (best case)"
+
+
+def _strategy_read(sim_s: dict | None, live_s: dict | None) -> str:
+    """One plain-language sentence translating the selected strategy cell for a
+    non-financial reader — mirrors JS tpMath.readText(). SIM leads (it is the
+    cell with the most days) but is always framed as the gross upper bound;
+    with no SIM the LIVE row is translated with its small-sample framing."""
+    if sim_s is not None and math.isfinite(sim_s["gw"]):
+        return (
+            f"$1 following this rule on the SIM picks became {_became_text(sim_s)} over "
+            f"these {sim_s['days']} trading days — gross (before trading costs, not "
+            "estimated), and an optimistic upper bound: the delisted losers are missing "
+            "from the history."
+        )
+    if live_s is not None and math.isfinite(live_s["gw"]):
+        return (
+            f"$1 following this rule on the LIVE picks became {_became_text(live_s)} over "
+            f"{live_s['days']} live day(s) — gross (before trading costs, not estimated); "
+            "real logged picks, but a small sample."
+        )
+    return "No strategy result to translate yet — see the notes below."
+
+
+def _strategy_cells(prefix: str, s: dict | None, stamp: str = "") -> str:
+    """Growth + win rate + days cells for one strategy-table row. Growth and win
+    rate are ALWAYS emitted together — a win rate without its growth number is
+    the exact half-truth quant-skeptic barred (79% wins can lose 60% of $1).
+    The growth number lives in an inner span so the JS can update it while the
+    stamp markup (SIM's OPTIMISTIC UPPER BOUND) stays put beside it."""
+    if s is None or not math.isfinite(s["gw"]):
+        growth = win = days = "—"
+    else:
+        growth, win, days = _growth_text(s), _win_text(s), str(s["days"])
+    return (
+        f'<td><span id="tp-{prefix}-growth">{growth}</span>{stamp}</td>'
+        f'<td id="tp-{prefix}-win">{win}</td>'
+        f'<td id="tp-{prefix}-days">{days}</td>'
+    )
+
+
+# The strategy table is server-rendered for the FIRST enabled exit rule (the
+# page defaults to the reach view; this hidden default keeps the server the
+# source of truth for the numbers the JS re-derives — lockstep, not trust).
+STRATEGY_SERVER_DEFAULT = "hold_close"
+
+_STAMP_UB = ' <span class="stamp-ub">OPTIMISTIC UPPER BOUND</span>'
+
+
+def _strategy_card(sim_days: list[dict], live_days: list[dict], n: int, w: int) -> str:
+    """The P&L what-if card (hidden while Strategy = Reach rate): SIM/LIVE rows
+    of $1-growth + win rate, the survivorship stamp ON the SIM number, and the
+    plain-language framing lines. Every number gross; no cost constant exists."""
+    sim_s, live_s, notes = _strategy_state(sim_days, live_days, n, w, STRATEGY_SERVER_DEFAULT)
+    return (
+        '<div class="card" id="tp-card-strat" hidden><table><tr>'
+        f"<th>Record{_info('e_record', 'start')}</th>"
+        f"<th>$1 → growth{_info('s_growth')}</th>"
+        f"<th>Win rate{_info('s_win')}</th>"
+        f"<th>Days{_info('e_days', 'end')}</th></tr>"
+        '<tr><td><span class="badge-sim">SIM</span> walk-forward backtest</td>'
+        + _strategy_cells("strat-sim", sim_s, _STAMP_UB)
+        + "</tr>"
+        '<tr><td><span class="badge-live">LIVE</span> real logged picks — '
+        "survivorship-free, small sample</td>"
+        + _strategy_cells("strat-live", live_s)
+        + "</tr></table>"
+        f'<p class="sub" id="tp-strat-read">{html.escape(_strategy_read(sim_s, live_s))}</p>'
+        '<p class="sub"><b>SIM is an optimistic upper bound:</b> the backtest history '
+        "excludes every company that delisted; if even a few of their blow-up days "
+        "were real, this could be a loss. The LIVE row is the honest number — real "
+        "logged picks, real outcomes, survivorship-free — but a small sample.</p>"
+        '<p class="sub">All returns are gross — before trading costs (not estimated). '
+        "Limit and stop fills are assumed at exactly the trigger price; a "
+        "glitch-suspect high never counts as a fill. For the limit+stop rule, when "
+        "both could fill on the same day the result is shown as best case / worst "
+        "case — daily data can't tell which came first.</p>"
+        f'<p class="sub" id="tp-strat-note">{html.escape(" · ".join(notes))}</p></div>'
+    )
+
+
+def _record_explorer(meta: dict | None, sim_days: list[dict], live_days: list[dict]) -> str:
+    """Interactive basket/window/strategy explorer: amber SIM row vs green LIVE
+    row, reach-rate by default with opt-in exit-rule P&L views.
+
+    Server-side renders the default selection (top-5, 6 months, reach rate) so
+    the page is meaningful without JS — the reach card is EXACTLY the pre-
+    strategy explorer — plus the hidden strategy card at its server default;
+    the inline script recomputes on select change from the embedded JSON
+    payload."""
     n, w = BASKET_DEFAULT, WINDOW_DEFAULT
     sim_s, live_s, notes = _explorer_state(sim_days, live_days, n, w)
     basket_opts = "".join(
@@ -858,11 +1045,18 @@ def _record_explorer(meta: dict | None, sim_days: list[dict], live_days: list[di
         f'<option value="{d}"{" selected" if d == w else ""}>{label} ({d} trading days)</option>'
         for label, d in track.SIM_WINDOW_SPECS
     )
+    strategy_opts = "".join(
+        f'<option value="{key}"{" selected" if key == "reach" else ""}'
+        f"{'' if enabled else ' disabled'}>{html.escape(label)}</option>"
+        for key, label, enabled in strategy.STRATEGY_CHOICES
+    )
     controls = (
         '<p class="sub controls"><label>Basket '
         f'<select id="tp-basket">{basket_opts}</select></label>{_info("e_basket")} '
         f'<label>Window <select id="tp-window">{window_opts}</select></label>'
-        f"{_info('e_window')}</p>"
+        f"{_info('e_window')} "
+        f'<label>Strategy <select id="tp-strategy">{strategy_opts}</select></label>'
+        f"{_info('e_strategy')}</p>"
     )
     span = ""
     if meta is not None:
@@ -875,7 +1069,7 @@ def _record_explorer(meta: dict | None, sim_days: list[dict], live_days: list[di
             f'<span class="mono">{len(sim_days)}</span> sim days available</p>'
         )
     table = (
-        "<div class='card'><table><tr>"
+        "<div class='card' id='tp-card-reach'><table><tr>"
         f"<th>Record{_info('e_record', 'start')}</th>"
         f"<th>Reach rate{_info('e_hit')}</th><th>Base rate{_info('e_base')}</th>"
         f"<th>Lift{_info('e_lift')}</th><th>Days{_info('e_days', 'end')}</th></tr>"
@@ -891,21 +1085,36 @@ def _record_explorer(meta: dict | None, sim_days: list[dict], live_days: list[di
         "<h2>Record over trailing windows</h2>"
         + controls
         + table
+        + _strategy_card(sim_days, live_days, n, w)
         + span
         + f'<p class="sub" style="margin-top:8px">{_SIM_CAVEAT}</p>'
     )
 
 
-_JS = """
+# Pure explorer math, no DOM: the browser-side HALF of the Python/JS lockstep
+# pair (dashboard._summarize_days / strategy.summarize_strategy_days and the
+# _growth_text/_win_text/_strategy_read formatters are the server mirrors).
+# Kept DOM-free and exposed as `tpMath` so the test suite can execute EXACTLY
+# this script under node and diff its numbers against Python's — the P&L math
+# is the highest-stakes surface on the page, so the mirror is proven, not
+# trusted. The __LIMIT__/__STOP__/__EPS__ constants are injected from
+# strategy.py below so the two sides cannot drift.
+_JS_MATH = """
 <script>
-(function () {
-  var el = function (id) { return document.getElementById(id); };
-  var dataEl = el("tp-data");
-  var basket = el("tp-basket");
-  var win = el("tp-window");
-  if (!dataEl || !basket || !win) return;
-  var data = JSON.parse(dataEl.textContent);
-  var DASH = "\\u2014";
+var tpMath = (function () {
+  var LIMIT = __LIMIT__, STOP = __STOP__, EPS = __EPS__;
+  function pickBand(strat, ol, oc, filled) {
+    if (strat === "hold_close") return [oc, oc];
+    if (strat === "limit_2pct") { var r = filled ? LIMIT : oc; return [r, r]; }
+    if (strat === "limit_stop") {
+      var stopped = ol <= STOP + EPS;
+      if (filled && stopped) return [STOP, LIMIT];
+      if (stopped) return [STOP, STOP];
+      if (filled) return [LIMIT, LIMIT];
+      return [oc, oc];
+    }
+    throw new Error("unknown strategy: " + strat);
+  }
   function summarize(days, n) {
     var hitSum = 0, baseSum = 0;
     var baseKnown = 0, shortDays = 0, substDays = 0, corrupt = 0;
@@ -914,7 +1123,7 @@ _JS = """
       if (picks.length < n) shortDays += 1;
       var hit = 0, sub = false;
       for (var j = 0; j < picks.length; j++) {
-        hit += picks[j][1];
+        hit += picks[j][4];
         if (picks[j][0] !== j + 1) sub = true;
       }
       if (sub) substDays += 1;
@@ -930,6 +1139,42 @@ _JS = """
              days: days.length, shortDays: shortDays, substDays: substDays,
              baseDays: baseKnown, clean: clean, corrupt: corrupt };
   }
+  function stratSummarize(days, n, strat) {
+    var gw = 1, gb = 1, winsW = 0, winsB = 0, picksN = 0;
+    var shortDays = 0, substDays = 0, missing = 0, corrupt = 0;
+    for (var i = 0; i < days.length; i++) {
+      var picks = days[i].picks.slice(0, n);
+      if (picks.length < n) shortDays += 1;
+      var sub = false, miss = false;
+      for (var j = 0; j < picks.length; j++) {
+        if (picks[j][0] !== j + 1) sub = true;
+        if (picks[j][1] == null || picks[j][2] == null || picks[j][3] == null) miss = true;
+      }
+      if (sub) substDays += 1;
+      if (miss) { missing += 1; continue; }
+      if (!picks.length) { corrupt += 1; continue; }
+      var sumW = 0, sumB = 0, dayWinsW = 0, dayWinsB = 0, ok = true;
+      for (j = 0; j < picks.length; j++) {
+        var band = pickBand(strat, picks[j][2], picks[j][3], !!picks[j][4]);
+        if (!isFinite(band[0]) || !isFinite(band[1])) { ok = false; break; }
+        sumW += band[0]; sumB += band[1];
+        if (band[0] > 0) dayWinsW += 1;
+        if (band[1] > 0) dayWinsB += 1;
+      }
+      if (!ok) { corrupt += 1; continue; }
+      winsW += dayWinsW;
+      winsB += dayWinsB;
+      picksN += picks.length;
+      gw *= 1 + sumW / picks.length;
+      gb *= 1 + sumB / picks.length;
+    }
+    var clean = days.length - missing - corrupt;
+    return { gw: clean ? gw : NaN, gb: clean ? gb : NaN,
+             ww: picksN ? winsW / picksN : NaN, wb: picksN ? winsB / picksN : NaN,
+             picks: picksN, days: days.length, clean: clean,
+             shortDays: shortDays, substDays: substDays, baseDays: 0,
+             missing: missing, corrupt: corrupt };
+  }
   function rowNotes(prefix, s, n) {
     var notes = [];
     if (s.shortDays) notes.push(prefix + ": " + s.shortDays +
@@ -940,6 +1185,57 @@ _JS = """
                                                        s.baseDays + " of " + s.clean + " day(s)");
     return notes;
   }
+  function growthText(s) {
+    var lo = s.gw.toFixed(2), hi = s.gb.toFixed(2);
+    return lo === hi ? "$1 \\u2192 $" + lo : "$1 \\u2192 $" + lo + "\\u2013$" + hi;
+  }
+  function winText(s) {
+    if (!isFinite(s.ww)) return "\\u2014";
+    var lo = Math.round(100 * s.ww) + "%", hi = Math.round(100 * s.wb) + "%";
+    return lo === hi ? lo : lo + "\\u2013" + hi;
+  }
+  function becameText(s) {
+    var lo = s.gw.toFixed(2), hi = s.gb.toFixed(2);
+    return lo === hi ? "$" + lo
+                     : "between $" + lo + " (worst case) and $" + hi + " (best case)";
+  }
+  function readText(simS, liveS) {
+    if (simS != null && isFinite(simS.gw))
+      return "$1 following this rule on the SIM picks became " + becameText(simS) +
+             " over these " + simS.days + " trading days \\u2014 gross (before trading " +
+             "costs, not estimated), and an optimistic upper bound: the delisted losers " +
+             "are missing from the history.";
+    if (liveS != null && isFinite(liveS.gw))
+      return "$1 following this rule on the LIVE picks became " + becameText(liveS) +
+             " over " + liveS.days + " live day(s) \\u2014 gross (before trading costs, " +
+             "not estimated); real logged picks, but a small sample.";
+    return "No strategy result to translate yet \\u2014 see the notes below.";
+  }
+  return { pickBand: pickBand, summarize: summarize, stratSummarize: stratSummarize,
+           rowNotes: rowNotes, growthText: growthText, winText: winText,
+           becameText: becameText, readText: readText };
+})();
+</script>
+"""
+_JS_MATH = (
+    _JS_MATH.replace("__LIMIT__", repr(strategy.LIMIT_PROFIT))
+    .replace("__STOP__", repr(strategy.STOP_LEVEL))
+    .replace("__EPS__", repr(strategy._STOP_EPSILON))
+)
+
+_JS = """
+<script>
+(function () {
+  var el = function (id) { return document.getElementById(id); };
+  var dataEl = el("tp-data");
+  var basket = el("tp-basket");
+  var win = el("tp-window");
+  var strat = el("tp-strategy");
+  if (!dataEl || !basket || !win || !strat) return;
+  var data = JSON.parse(dataEl.textContent);
+  var DASH = "\\u2014";
+  var cardReach = el("tp-card-reach");
+  var cardStrat = el("tp-card-strat");
   function setRow(prefix, s) {
     var h = el("tp-" + prefix + "-hit");
     if (s == null || !isFinite(s.hit)) {
@@ -956,9 +1252,19 @@ _JS = """
       s.base != null && s.base > 0 ? (s.hit / s.base).toFixed(2) + "\\u00d7" : DASH;
     el("tp-" + prefix + "-days").textContent = String(s.days);
   }
-  function update() {
-    var n = parseInt(basket.value, 10);
-    var w = parseInt(win.value, 10);
+  function setStratRow(prefix, s) {
+    var g = el("tp-" + prefix + "-growth");
+    if (s == null || !isFinite(s.gw)) {
+      g.textContent = DASH;
+      el("tp-" + prefix + "-win").textContent = DASH;
+      el("tp-" + prefix + "-days").textContent = DASH;
+      return;
+    }
+    g.textContent = tpMath.growthText(s);
+    el("tp-" + prefix + "-win").textContent = tpMath.winText(s);
+    el("tp-" + prefix + "-days").textContent = String(s.days);
+  }
+  function updateReach(n, w) {
     var notes = [];
     if (!data.sim.length) {
       setRow("sim", null);
@@ -969,20 +1275,20 @@ _JS = """
       notes.push("SIM: needs " + w + " trading days " + DASH + " " +
                  data.sim.length + " available");
     } else {
-      var s = summarize(data.sim.slice(-w), n);
+      var s = tpMath.summarize(data.sim.slice(-w), n);
       if (s.corrupt) {
         setRow("sim", null);
         notes.push("SIM: " + s.corrupt + " corrupt day(s) in window " + DASH + " data error");
       } else {
         setRow("sim", s);
-        notes = notes.concat(rowNotes("SIM", s, n));
+        notes = notes.concat(tpMath.rowNotes("SIM", s, n));
       }
     }
     var live = [];
     for (var i = 0; i < data.live.length; i++) if (!data.live[i].late) live.push(data.live[i]);
     if (!live.length) { setRow("live", null); notes.push("LIVE: no live days yet"); }
     else {
-      var s2 = summarize(live.slice(-Math.min(w, live.length)), n);
+      var s2 = tpMath.summarize(live.slice(-Math.min(w, live.length)), n);
       if (s2.corrupt) {
         setRow("live", null);
         notes.push("LIVE: " + s2.corrupt + " corrupt day(s) " + DASH + " data error");
@@ -990,13 +1296,71 @@ _JS = """
         setRow("live", s2);
         if (live.length < w) notes.push("LIVE: all " + live.length + " live day(s) " + DASH +
                                         " fewer than the " + w + "-day window");
-        notes = notes.concat(rowNotes("LIVE", s2, n));
+        notes = notes.concat(tpMath.rowNotes("LIVE", s2, n));
       }
     }
     el("tp-note").textContent = notes.join(" \\u00b7 ");
   }
+  function updateStrat(n, w, key) {
+    var notes = [];
+    var simS = null;
+    if (!data.sim.length) {
+      notes.push("No touch-era benchmark yet " + DASH +
+                 " run twopercent benchmark.");
+    } else if (data.sim.length < w) {
+      notes.push("SIM: needs " + w + " trading days " + DASH + " " +
+                 data.sim.length + " available");
+    } else {
+      var s = tpMath.stratSummarize(data.sim.slice(-w), n, key);
+      if (s.missing) {
+        notes.push("SIM: no strategy data recorded on " + s.missing + " of " + s.days +
+                   " day(s) " + DASH + " re-run twopercent benchmark");
+      } else if (s.corrupt) {
+        notes.push("SIM: " + s.corrupt + " corrupt day(s) in window " + DASH + " data error");
+      } else {
+        simS = s;
+        notes = notes.concat(tpMath.rowNotes("SIM", s, n));
+      }
+    }
+    var live = [];
+    for (var i = 0; i < data.live.length; i++) if (!data.live[i].late) live.push(data.live[i]);
+    var liveS = null;
+    if (!live.length) { notes.push("LIVE: no live days yet"); }
+    else {
+      var s2 = tpMath.stratSummarize(live.slice(-Math.min(w, live.length)), n, key);
+      if (s2.missing) {
+        notes.push("LIVE: " + s2.missing + " day(s) missing strategy data " + DASH +
+                   " data error");
+      } else if (s2.corrupt) {
+        notes.push("LIVE: " + s2.corrupt + " corrupt day(s) " + DASH + " data error");
+      } else {
+        liveS = s2;
+        if (live.length < w) notes.push("LIVE: all " + live.length + " live day(s) " + DASH +
+                                        " fewer than the " + w + "-day window");
+        notes = notes.concat(tpMath.rowNotes("LIVE", s2, n));
+      }
+    }
+    setStratRow("strat-sim", simS);
+    setStratRow("strat-live", liveS);
+    el("tp-strat-read").textContent = tpMath.readText(simS, liveS);
+    el("tp-strat-note").textContent = notes.join(" \\u00b7 ");
+  }
+  function update() {
+    var n = parseInt(basket.value, 10);
+    var w = parseInt(win.value, 10);
+    if (strat.value === "reach") {
+      cardReach.hidden = false;
+      cardStrat.hidden = true;
+      updateReach(n, w);
+      return;
+    }
+    cardReach.hidden = true;
+    cardStrat.hidden = false;
+    updateStrat(n, w, strat.value);
+  }
   basket.addEventListener("change", update);
   win.addEventListener("change", update);
+  strat.addEventListener("change", update);
 })();
 </script>
 """
@@ -1139,8 +1503,19 @@ def build_html(
         for d in frame["target_date"]
     ]
     bases = track.daily_base_rates(con, base_dates)
-    sim_days = _payload_days(sim[1], bases) if sim is not None else []
-    live_days = _payload_days(outcomes, bases, late=True) if len(outcomes) else []
+    # One payload shape for both rows ([rank, oh, ol, oc, hit] per pick): the
+    # sim frame's ret IS the pick's open-to-close return; the live frame comes
+    # straight off daily_returns with the view's column names.
+    sim_days = _payload_days(sim[1].rename(columns={"ret": "oc"}), bases) if sim is not None else []
+    live_days = (
+        _payload_days(
+            outcomes.rename(columns={"high_return": "oh", "low_return": "ol", "oc_return": "oc"}),
+            bases,
+            late=True,
+        )
+        if len(outcomes)
+        else []
+    )
     explorer = _record_explorer(sim[0] if sim is not None else None, sim_days, live_days)
     data_tag = _embed_json({"sim": sim_days, "live": live_days})
 
@@ -1156,6 +1531,7 @@ def build_html(
         + '<p class="note">Generated by twopercent. Model output, not investment advice.</p>'
         + "</div></div>"
         + data_tag
+        + _JS_MATH
         + _JS
     )
 

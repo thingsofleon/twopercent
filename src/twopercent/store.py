@@ -57,11 +57,14 @@ CREATE TABLE IF NOT EXISTS ingest_meta (
 --   high_return = (high  - open) / open  — the open-to-high (intraday reach) move.
 --                 The touch EVENT (scan.touch_event_predicate) is
 --                 high_return >= threshold-eps AND NOT high_glitch_suspect.
+--   low_return  = (low   - open) / open  — the open-to-low move (always <= 0 given
+--                 the OHLC gate). OUTCOME-side input to the strategy explorer's
+--                 stop rules; like high_return it must never become a feature.
 --   high_glitch_suspect (M2) = TRUE only at the isolated-high / close-unconfirmed
 --                 / volume-uncorroborated intersection (see below). ONE definition
 --                 here so every consumer agrees.
 CREATE OR REPLACE VIEW daily_returns AS
-    SELECT symbol, date, open, high, low, close, volume, oc_return, high_return,
+    SELECT symbol, date, open, high, low, close, volume, oc_return, high_return, low_return,
            -- high_glitch_suspect: the touch was decided by the HIGH alone (close
            -- did NOT confirm: oc_return < threshold), the high is an isolated
            -- outlier vs the same bar + PRIOR close only, AND volume did not
@@ -88,6 +91,7 @@ CREATE OR REPLACE VIEW daily_returns AS
         SELECT symbol, date, open, high, low, close, volume,
                (close - open) / open AS oc_return,
                (high - open) / open AS high_return,
+               (low - open) / open AS low_return,
                LAG(close) OVER w AS prev_close,
                avg(volume) OVER wv AS trailing_avg_vol
         FROM prices
@@ -180,6 +184,15 @@ CREATE TABLE IF NOT EXISTS experiment_daily (
     hit INTEGER NOT NULL,
     PRIMARY KEY (seq, target_date, rank)
 );
+-- Strategy-explorer OUTCOME columns (per pick, per test day): oh = the target
+-- day's open-to-high return, ol = open-to-low. With ret (the open-to-close
+-- return) and hit (the guarded touch event = a +2% limit fill), any daily exit
+-- rule is a deterministic function of the stored row — no re-join. These are
+-- LABEL-SIDE quantities: they must never appear in features.FEATURE_COLUMNS or
+-- METADATA_COLUMNS. Rows recorded before this upgrade keep NULL and the
+-- dashboard's strategy views degrade loudly until a re-benchmark.
+ALTER TABLE experiment_daily ADD COLUMN IF NOT EXISTS oh DOUBLE;
+ALTER TABLE experiment_daily ADD COLUMN IF NOT EXISTS ol DOUBLE;
 CREATE TABLE IF NOT EXISTS predictions (
     strategy TEXT NOT NULL,
     signal_date DATE NOT NULL,
@@ -563,27 +576,50 @@ def record_experiment(
 def record_experiment_daily(con: duckdb.DuckDBPyConnection, seq: int, rows: pd.DataFrame) -> int:
     """Store a benchmark's per-day per-rank pick outcomes keyed to its experiments row.
 
-    Expects columns: target_date, rank, ret, hit. Rows with a non-finite ret
-    or a null hit are REJECTED with ValueError — a benchmark producing corrupt
-    sim rows must die loudly, never persist quietly (a NaN would later vanish
-    into skipna aggregations looking like a clean shorter window).
+    Expects columns: target_date, rank, ret, hit, and (from the strategy-explorer
+    upgrade on) oh, ol. Rows with a non-finite ret/oh/ol or a null hit are
+    REJECTED with ValueError — a benchmark producing corrupt sim rows must die
+    loudly, never persist quietly (a NaN would later vanish into skipna
+    aggregations looking like a clean shorter window). A frame WITHOUT the oh/ol
+    pair (a legacy caller) stores NULL and WARNS: those rows render the
+    dashboard's strategy views as "no strategy data recorded" until a
+    re-benchmark. A frame with only one of the pair is corrupt shape → rejected.
     """
     if rows.empty:
         return 0
-    daily = rows[["target_date", "rank", "ret", "hit"]].copy()
-    bad = int((~np.isfinite(daily["ret"].astype(float))).sum() + daily["hit"].isna().sum())
+    has_strategy_cols = {"oh", "ol"} <= set(rows.columns)
+    if not has_strategy_cols and ({"oh", "ol"} & set(rows.columns)):
+        raise ValueError(
+            f"refusing to record experiment_daily for seq {seq}: frame carries only "
+            "one of the oh/ol outcome columns — corrupt shape, record both or neither"
+        )
+    cols = ["target_date", "rank", "ret", "hit"] + (["oh", "ol"] if has_strategy_cols else [])
+    daily = rows[cols].copy()
+    checked = ["ret", "oh", "ol"] if has_strategy_cols else ["ret"]
+    bad = int(
+        (~np.isfinite(daily[checked].astype(float))).any(axis=1).sum() + daily["hit"].isna().sum()
+    )
     if bad:
         raise ValueError(
             f"refusing to record experiment_daily for seq {seq}: {bad} row(s) with "
-            "non-finite ret or null hit — corrupt sim rows must not be persisted"
+            f"non-finite {'/'.join(checked)} or null hit — corrupt sim rows must "
+            "not be persisted"
+        )
+    if not has_strategy_cols:
+        logger.warning(
+            "experiment_daily rows for seq %s carry no oh/ol outcome columns — "
+            "stored as NULL; the dashboard strategy explorer will say 'no strategy "
+            "data recorded' for this experiment until a re-benchmark",
+            seq,
         )
     daily["target_date"] = pd.to_datetime(daily["target_date"])
     daily.insert(0, "seq", seq)
+    oh_ol = "oh, ol" if has_strategy_cols else "NULL AS oh, NULL AS ol"
     con.register("experiment_daily_in", daily)
     con.execute(
-        """
-        INSERT OR REPLACE INTO experiment_daily
-        SELECT seq, CAST(target_date AS DATE), rank, ret, hit
+        f"""
+        INSERT OR REPLACE INTO experiment_daily (seq, target_date, rank, ret, hit, oh, ol)
+        SELECT seq, CAST(target_date AS DATE), rank, ret, hit, {oh_ol}
         FROM experiment_daily_in
         """
     )
@@ -645,7 +681,7 @@ def latest_experiment_daily(
     seq, run_ts, params, test_start, test_end = row
     daily = con.execute(
         """
-        SELECT target_date, rank, ret, hit
+        SELECT target_date, rank, ret, hit, oh, ol
         FROM experiment_daily WHERE seq = ? ORDER BY target_date, rank
         """,
         [seq],

@@ -51,10 +51,13 @@ FEATURE_COLUMNS = [
 # it stays out of FEATURE_COLUMNS.
 METADATA_COLUMNS = ["median_vol_20"]
 # Label-side columns (like did_2pct_next and target_date): FUTURE information.
-# next_oc_return is the label's magnitude — it exists for scoring/simulation
-# and must never appear in FEATURE_COLUMNS or METADATA_COLUMNS (the lookahead
-# canary deliberately excludes label columns, which legitimately change when
-# the future changes).
+# next_oc_return is the label's magnitude; next_high_return / next_low_return
+# are the target day's open-to-high / open-to-low moves (the strategy
+# explorer's exit-rule inputs, recorded per pick by the benchmark). They exist
+# for scoring/simulation and must never appear in FEATURE_COLUMNS or
+# METADATA_COLUMNS (the lookahead canary deliberately excludes label columns,
+# which legitimately change when the future changes) — an explicit test in
+# test_features.py pins their absence.
 
 _SQL = f"""
 WITH per_symbol AS (
@@ -73,7 +76,9 @@ WITH per_symbol AS (
         LEAD(oc_return) OVER w AS next_oc_return,
         -- LEAD of the touch event's inputs → the NEXT day's reached-2% label.
         LEAD(high_return) OVER w AS next_high_return,
-        LEAD(high_glitch_suspect) OVER w AS next_high_glitch_suspect
+        LEAD(high_glitch_suspect) OVER w AS next_high_glitch_suspect,
+        -- LEAD of the open-to-low move: outcome-side stop-rule input, label-only.
+        LEAD(low_return) OVER w AS next_low_return
     FROM daily_returns
     WINDOW
         w AS (PARTITION BY symbol ORDER BY date),
@@ -114,6 +119,8 @@ SELECT
         ELSE 0
     END AS did_2pct_next,
     s.next_oc_return,
+    s.next_high_return,
+    s.next_low_return,
     s.oc_return AS oc_return_today,
     s.ret_5d,
     s.vol_20d,

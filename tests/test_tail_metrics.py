@@ -140,6 +140,11 @@ def test_dashboard_shows_reach_tiles_and_column(con_with_universe, tmp_path):
     assert "Live reach-rate" in content
     assert "Live lift" in content
     assert "Live excess" in content
-    assert "$" not in content  # no money anywhere
+    # No money anywhere BEFORE the explorer: tiles, candidates, calibration and
+    # the track record stay dollar-free. The strategy explorer's $-what-if is
+    # the ONE sanctioned money surface — opt-in, hidden by default, and framed
+    # (gross / upper bound) — so the invariant is scoped to everything above it.
+    assert "$" not in content.split("Record over trailing windows")[0]
+    assert 'id="tp-card-strat" hidden' in content
     assert "<th>Top pick" in content  # column header (now carries an info icon)
     assert "WIN" in content

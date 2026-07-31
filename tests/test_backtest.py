@@ -102,7 +102,23 @@ def test_benchmark_persists_per_rank_daily_rows(con, monkeypatch):
     # Stage B removed the $-growth metrics; the per-rank rows still carry the
     # archival open-to-close return column and the reach flag the dashboard
     # explorer summarizes.
-    assert set(daily.columns) >= {"target_date", "rank", "ret", "hit"}
+    assert set(daily.columns) >= {"target_date", "rank", "ret", "hit", "oh", "ol"}
+
+    # Strategy-explorer outcome columns: recorded per pick, finite, and
+    # OHLC-consistent — oh >= max(0, ret) and ol <= min(0, ret) (high/low
+    # bracket both open and close). A hit implies the day's high reached the
+    # epsilon-guarded +2% threshold (the glitchless fixture makes hit ⇔ touch).
+    import numpy as np
+
+    from twopercent import scan
+
+    assert np.isfinite(daily["oh"]).all() and np.isfinite(daily["ol"]).all()
+    assert (daily["oh"] >= daily["ret"].clip(lower=0) - 1e-12).all()
+    assert (daily["ol"] <= daily["ret"].clip(upper=0) + 1e-12).all()
+    threshold = scan.DEFAULT_THRESHOLD - scan._THRESHOLD_EPSILON
+    hits = daily["hit"] == 1
+    assert (daily.loc[hits, "oh"] >= threshold).all()
+    assert (daily.loc[~hits, "oh"] < threshold).all()
 
     result = store.latest_experiment_daily(con, "baseline_gbm_v1")
     assert result is not None

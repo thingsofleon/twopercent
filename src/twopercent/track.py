@@ -195,10 +195,13 @@ def daily_rank_outcomes(
     available rows of a day in rank order IS the "trader takes the next name"
     rule — a missing rank 1 makes rank 2 the traded top pick.
 
-    Columns: target_date, rank, oc_return, hit, late (the whole day's
-    predictions created at/after that day's 09:30 ET open). hit is the touch
-    event; oc_return is kept as the (open-to-close) return magnitude. Touch era
-    only (event = TOUCH_EVENT): pre-cutover predictions are archived out (M1)."""
+    Columns: target_date, rank, oc_return, high_return, low_return, hit, late
+    (the whole day's predictions created at/after that day's 09:30 ET open).
+    hit is the touch event — the strategy explorer's LIVE rows reuse it as the
+    guarded +2% limit-fill flag (a glitch-suspect high must not count as a
+    fill); high_return/low_return are the same-day open-to-high/open-to-low
+    outcome magnitudes its exit rules replay. Touch era only (event =
+    TOUCH_EVENT): pre-cutover predictions are archived out (M1)."""
     threshold = DEFAULT_THRESHOLD - _THRESHOLD_EPSILON
     frame = con.execute(
         f"""
@@ -211,7 +214,7 @@ def daily_rank_outcomes(
             ) p
             JOIN days d ON d.date > p.signal_date GROUP BY p.signal_date
         )
-        SELECT r.target_date, pr.rank, dr.oc_return,
+        SELECT r.target_date, pr.rank, dr.oc_return, dr.high_return, dr.low_return,
                CASE WHEN {touch_event_predicate("dr.high_return", "dr.high_glitch_suspect")}
                     THEN 1 ELSE 0 END AS hit
         FROM predictions pr

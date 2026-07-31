@@ -420,42 +420,53 @@ data, no re-join. Needs a schema add to the per-rank daily rows + a champion
 re-benchmark to populate (graceful "no strategy data yet" until then).
 
 **Strategies (dropdown; only what daily data supports):**
-- **Reach rate** — the current prediction-quality view (default).
-- **Buy open → sell close** — EXACT (`oc`). The honest loser (~$0.02); shown so the
-  fade is visible, not hidden.
-- **Buy open → +2% limit, else close** — EXACT: `oh ≥ 2% → +2%` else `oc`. THE key
-  test ("does grabbing +2% on winners beat the faders").
-- **+2% limit + −S% stop** — APPROXIMATE: when both `oh≥2%` and `ol≤−S%` on the same
-  day, daily data can't order them → assume the STOP first (conservative lower
-  bound); label it as such.
+- **Reach rate** — the current prediction-quality view (default, byte-for-byte the
+  pre-strategy explorer).
+- **Buy open → sell close** — EXACT (`oc`). The honest loser; shown so the fade is
+  visible, not hidden.
+- **Buy open → +2% limit, else close** — EXACT: fill = the GUARDED touch event
+  (threshold − epsilon AND NOT high_glitch_suspect — a fake print can't fill your
+  order) → +2% exactly, else `oc`. THE key test ("does grabbing +2% on winners
+  beat the faders").
+- **+2% limit + −1% stop** — a best/worst BAND, not a single number (quant-skeptic
+  must-fix: on ~40% of winning days both trigger and daily data can't order them;
+  a lone stop-first number is dishonestly precise). Both triggered → worst −1%
+  (stop first) / best +2% (limit first); labeled "daily data can't tell which came
+  first". Exact fills at trigger prices, stated.
 - **Trailing stop** — DISABLED, greyed with the reason: needs intraday (minute) data
   we don't have (the Polygon upgrade).
 
 **Displayed per Basket × Window × Strategy:** compounded growth ($1→$X, equal-weight
-basket, net of an assumed round-trip cost), win rate (% picks positive), and a
-worst-stretch/drawdown so it isn't only the rosy number. Plain-language read for a
-non-expert user.
+basket) AND win rate (% picks positive) — ALWAYS TOGETHER, never win rate alone
+(79% wins can coexist with losing 60% of capital). **GROSS, decided by the user:
+NO invented trading-cost constant anywhere — every number labeled "before trading
+costs (not estimated)".** Plain-language one-liner translating the selected cell
+for a non-expert user. (A drawdown/worst-stretch figure was deliberately deferred.)
 
 **Honesty guardrails (this is the highest-stakes surface — a non-financial user may
-risk money on it, so quant-skeptic gates the DESIGN before code):**
+risk money on it; quant-skeptic gated the design, its must-fixes are in code):**
 - **Survivorship is the load-bearing risk.** The backtest applies today's universe
   to history, so companies that went to zero and delisted are ABSENT — for a LONG
-  strategy that omits the worst losers and materially FLATTERS returns. Must be
-  disclosed loudly and the design must state it can only be an optimistic-leaning
-  estimate, not a promise. quant-skeptic sizes how bad.
-- **Assumed cost/slippage** — a fixed round-trip cost; real microcap slippage is
-  likely worse and a +2% limit fill assumes you get exactly +2% (fast thin names
-  can slip). Disclosed; cost surfaced, not hidden.
+  strategy that omits the worst losers and materially FLATTERS returns. Final
+  framing: the SIM growth cell carries an adjacent **OPTIMISTIC UPPER BOUND**
+  stamp plus the plain-language delisting line; the **LIVE row is the honest
+  number** (real logged picks, survivorship-free by construction, live/late rule
+  enforced) labeled as a small sample.
 - **Strategy selection is itself multiple comparisons** — browsing Basket × Window ×
-  Strategy for the best cell is p-hacking; the caveat already on the explorer
-  ("browsing views is partly luck; short windows dominated by a few days") extends
-  to strategies.
-- Every number stamped BACKTEST/walk-forward, next to survivorship + cost caveats.
+  Strategy for the best cell is p-hacking; the explorer caveat names strategies
+  explicitly ("flipping strategies/baskets/windows to find a good-looking cell is
+  itself luck").
+- Every number stamped BACKTEST/walk-forward, next to the survivorship + gross
+  caveats. oh/ol are LABEL-SIDE outcome columns — pinned out of FEATURE_COLUMNS/
+  METADATA_COLUMNS by an explicit canary test (the lookahead canary can't see
+  outcome columns).
 
-Build order (each reviewed; quant-skeptic on the P&L math): (1) benchmark records
-oh/ol/oc per pick + re-benchmark; (2) `strategy.py` deterministic exit-rule
-simulation from (oh,ol,oc) + tests; (3) explorer Strategy dropdown + JS + caveats +
-render-verify. Trailing-stop and true fill modeling wait for intraday data.
+**Implemented 2026-07-31** (#76): `daily_returns.low_return`; per-rank oh/ol in
+`experiment_daily` (ADD COLUMN IF NOT EXISTS — pre-upgrade rows degrade to
+"re-run twopercent benchmark"); `strategy.py` pure exit-rule simulation; explorer
+Strategy dropdown with Python/JS lockstep proven by executing the page's tpMath
+under node. POST-MERGE OP: re-run `twopercent benchmark` to populate oh/ol for
+the SIM row. Trailing-stop and true fill modeling wait for intraday data.
 
 ## Status
 

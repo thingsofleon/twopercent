@@ -82,6 +82,10 @@ def test_daily_rank_outcomes_rows_and_hits(con):
     assert frame["rank"].tolist() == [1, 2, 3]
     assert frame["hit"].tolist() == [1, 1, 0]  # HIT2 +2.1%, HIT1 +5%, MISS +0.1%
     assert abs(frame["oc_return"].iloc[0] - 0.021) < 1e-12
+    # Strategy-explorer outcome magnitudes ride along (conftest seeds
+    # high = max(open, close) * 1.001 and low = min(open, close) * 0.999).
+    assert abs(frame["high_return"].iloc[0] - (102.1 * 1.001 - 100.0) / 100.0) < 1e-12
+    assert abs(frame["low_return"].iloc[0] - (100.0 * 0.999 - 100.0) / 100.0) < 1e-12
     assert not frame["late"].any()
     assert all(pd.Timestamp(d).date() == dates[-1] for d in frame["target_date"])
 

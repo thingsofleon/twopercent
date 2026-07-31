@@ -103,7 +103,7 @@ def run_benchmark(
     floored_row_days = 0
     unscoreable_days = 0
     daily_picks: list[tuple[dt.date, int, float]] = []
-    rank_rows: list[tuple[dt.date, int, float, int]] = []
+    rank_rows: list[tuple[dt.date, int, float, int, float, float]] = []
     pick_probs: list[pd.Series] = []
     pick_labels: list[pd.Series] = []
     first_run_start: dt.date | None = None
@@ -151,14 +151,23 @@ def run_benchmark(
             pick_probs.append(top["prob"])
             pick_labels.append(top["did_2pct_next"])
             # One frame drives both the recorded per-rank rows (experiment_daily,
-            # for the dashboard trailing-window reach explorer) and the top-1/
-            # top-5 reach aggregates (rank 1 row, mean of ranks 1-5). The per-rank
-            # next_oc_return is kept as an archival return column; no $-growth is
-            # computed here (Stage B: this app reports reach, not trading P&L).
+            # for the dashboard trailing-window reach explorer + strategy
+            # explorer) and the top-1/top-5 reach aggregates (rank 1 row, mean of
+            # ranks 1-5). Per rank the target day's oh/ol/oc outcome returns are
+            # persisted so any exit rule replays deterministically from the
+            # stored row; no $-growth is computed HERE (the explorer's P&L view
+            # is an explicit opt-in, never a benchmark headline).
             top20 = eligible.nlargest(RECORD_RANKS, "prob")
             for rank, row in enumerate(top20.itertuples(), start=1):
                 rank_rows.append(
-                    (target_date, rank, float(row.next_oc_return), int(row.did_2pct_next))
+                    (
+                        target_date,
+                        rank,
+                        float(row.next_oc_return),
+                        int(row.did_2pct_next),
+                        float(row.next_high_return),
+                        float(row.next_low_return),
+                    )
                 )
             top5 = top20.iloc[:5]
             top1 = top5.iloc[0]
@@ -267,7 +276,9 @@ def run_benchmark(
             )
             # Per-day per-rank pick outcomes land in experiment_daily (dashboard
             # SIM panel), never in the metrics JSON above.
-            rank_frame = pd.DataFrame(rank_rows, columns=["target_date", "rank", "ret", "hit"])
+            rank_frame = pd.DataFrame(
+                rank_rows, columns=["target_date", "rank", "ret", "hit", "oh", "ol"]
+            )
             store.record_experiment_daily(con, seq, rank_frame)
             con.execute("COMMIT")
         except Exception:

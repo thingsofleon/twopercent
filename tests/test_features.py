@@ -170,6 +170,30 @@ def test_median_vol_20_is_trailing_metadata_not_a_feature(con):
         assert frame.loc[idx[pos], "median_vol_20"] == rolling.iloc[bar]
 
 
+def test_outcome_return_columns_are_label_side_never_features(con):
+    """Quant-skeptic guardrail for the strategy explorer: oh/ol are OUTCOME
+    quantities. The lookahead canary deliberately excludes label columns, so
+    their absence from the trainable sets is pinned EXPLICITLY (the
+    median_vol_20 pattern) — a refactor that promoted next_high_return or
+    next_low_return into FEATURE_COLUMNS would be lookahead the canary cannot
+    see."""
+    for col in ("high_return", "low_return", "next_high_return", "next_low_return"):
+        assert col not in FEATURE_COLUMNS, col
+        assert col not in METADATA_COLUMNS, col
+
+    # They ARE in the frame, as label-side values: hand-check that each equals
+    # the NEXT day's open-to-high / open-to-low return (open is always 100.0,
+    # conftest seeds high = max(open, close) * 1.001 and low = min * 0.999).
+    seed_history(con, {"AAA": [0.03, 0.01] * 13})
+    frame = feature_frame(con).set_index("signal_date")
+    dates = sorted(frame.index)
+    row = frame.loc[dates[-3]]  # its target day (bar 24, even index) closed +3%
+    next_close = 100.0 * 1.03
+    assert abs(row["next_high_return"] - (next_close * 1.001 - 100.0) / 100.0) < 1e-12
+    assert abs(row["next_low_return"] - (100.0 * 0.999 - 100.0) / 100.0) < 1e-12
+    assert abs(row["next_oc_return"] - 0.03) < 1e-12
+
+
 def test_thin_history_dropped_loudly(con, caplog):
     seed_history(con, {"NEW": _varied(10, 3)})  # under MIN_HISTORY_DAYS
     frame = feature_frame(con)

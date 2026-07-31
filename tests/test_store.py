@@ -330,3 +330,65 @@ def test_latest_experiment_daily_ignores_parameterized_variants(con):
     meta, daily = store.latest_experiment_daily(con, "s")
     assert meta["seq"] == champ_seq  # never the variant, despite more days + recency
     assert "strategy_params" not in meta["params"]
+
+
+def test_daily_returns_low_return_math_and_guards(con):
+    # low_return = (low - open) / open, adversarial non-round prices; a NaN low
+    # is already excluded by the isfinite gate (test above), so every surfaced
+    # low_return is finite and <= 0 (low <= open is enforced by the view).
+    store.upsert_prices(con, pd.DataFrame([_ohlc_row("VALID", 3.51, 3.62, 3.40, 3.58)]))
+    row = con.execute(
+        "SELECT low_return, high_return, oc_return FROM daily_returns WHERE symbol = 'VALID'"
+    ).fetchone()
+    assert abs(row[0] - (3.40 - 3.51) / 3.51) < 1e-15
+    assert row[0] <= 0 <= row[1]  # ol can't beat the open; oh can't trail it
+
+
+def _strategy_daily_frame(dates):
+    frame = _daily_frame(dates, {1: [0.031, -0.0117]})
+    frame["oh"] = [0.035, 0.004]
+    frame["ol"] = [-0.002, -0.0117]
+    return frame
+
+
+def test_experiment_daily_roundtrips_oh_ol(con):
+    dates = sorted(pd.bdate_range("2026-01-05", periods=2).date)
+    seq = _experiment(con)
+    store.record_experiment_daily(con, seq, _strategy_daily_frame(dates))
+    _, daily = store.latest_experiment_daily(con, "s")
+    assert daily["oh"].tolist() == [0.035, 0.004]
+    assert daily["ol"].tolist() == [-0.002, -0.0117]
+
+
+def test_experiment_daily_legacy_frame_stores_null_and_warns(con, caplog):
+    # A frame WITHOUT oh/ol (the pre-strategy-explorer shape) must persist NULL
+    # — not NaN, which would poison JSON/aggregations — and warn that the
+    # strategy explorer will degrade until a re-benchmark.
+    dates = sorted(pd.bdate_range("2026-01-05", periods=2).date)
+    seq = _experiment(con)
+    with caplog.at_level("WARNING", logger="twopercent.store"):
+        store.record_experiment_daily(con, seq, _daily_frame(dates, {1: [0.01, 0.02]}))
+    assert "no oh/ol outcome columns" in caplog.text
+    _, daily = store.latest_experiment_daily(con, "s")
+    assert daily["oh"].isna().all() and daily["ol"].isna().all()
+    nulls = con.execute(
+        "SELECT count(*) FROM experiment_daily WHERE oh IS NULL AND ol IS NULL"
+    ).fetchone()[0]
+    assert nulls == 2  # SQL NULL, not a stored NaN double
+
+
+def test_experiment_daily_rejects_partial_or_nonfinite_strategy_cols(con):
+    import numpy as np
+    import pytest
+
+    dates = sorted(pd.bdate_range("2026-01-05", periods=2).date)
+    seq = _experiment(con)
+    only_oh = _daily_frame(dates, {1: [0.01, 0.02]}).assign(oh=[0.03, 0.04])
+    with pytest.raises(ValueError, match="only one of the oh/ol"):
+        store.record_experiment_daily(con, seq, only_oh)
+
+    nan_ol = _strategy_daily_frame(dates)
+    nan_ol.loc[0, "ol"] = np.nan
+    with pytest.raises(ValueError, match="non-finite ret/oh/ol"):
+        store.record_experiment_daily(con, seq, nan_ol)
+    assert con.execute("SELECT count(*) FROM experiment_daily").fetchone()[0] == 0

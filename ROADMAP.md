@@ -402,6 +402,61 @@ stays 2% (parameterizable later). Walk-forward preserved throughout.
   (base rate swings 7%→98% daily; raw Brier drops "for free" at cutover);
   reaffirm touch labels are never resolved onto incomplete days (#66).
 
+## Strategy backtester (design, decided 2026-07-31) — the "how would I trade it" layer
+
+The reach predictor says WHICH tickers move; this adds an explicit, user-selected
+backtest of HOW a simple exit rule would have DONE on those picks. It's the
+deferred trading layer, folded into the existing trailing-window explorer as a
+third dropdown (Strategy), alongside Basket (Top-N) and Window. Honesty framing:
+prediction quality stays the DEFAULT; a P&L view is an OPT-IN "what-if", clearly
+stamped BACKTEST — never a headline claim. (This is why Stage B removed the baked-
+in money tiles but an explicit user-chosen strategy explorer is legitimate.)
+
+**Data (the enabling change):** the walk-forward benchmark records, per top-N pick
+per test day, the three intraday-relative returns from that day's OHLC —
+`open→high (oh)`, `open→low (ol)`, `open→close (oc)`. Any threshold exit rule is
+then a deterministic function of (oh, ol, oc) + params, reproducible from stored
+data, no re-join. Needs a schema add to the per-rank daily rows + a champion
+re-benchmark to populate (graceful "no strategy data yet" until then).
+
+**Strategies (dropdown; only what daily data supports):**
+- **Reach rate** — the current prediction-quality view (default).
+- **Buy open → sell close** — EXACT (`oc`). The honest loser (~$0.02); shown so the
+  fade is visible, not hidden.
+- **Buy open → +2% limit, else close** — EXACT: `oh ≥ 2% → +2%` else `oc`. THE key
+  test ("does grabbing +2% on winners beat the faders").
+- **+2% limit + −S% stop** — APPROXIMATE: when both `oh≥2%` and `ol≤−S%` on the same
+  day, daily data can't order them → assume the STOP first (conservative lower
+  bound); label it as such.
+- **Trailing stop** — DISABLED, greyed with the reason: needs intraday (minute) data
+  we don't have (the Polygon upgrade).
+
+**Displayed per Basket × Window × Strategy:** compounded growth ($1→$X, equal-weight
+basket, net of an assumed round-trip cost), win rate (% picks positive), and a
+worst-stretch/drawdown so it isn't only the rosy number. Plain-language read for a
+non-expert user.
+
+**Honesty guardrails (this is the highest-stakes surface — a non-financial user may
+risk money on it, so quant-skeptic gates the DESIGN before code):**
+- **Survivorship is the load-bearing risk.** The backtest applies today's universe
+  to history, so companies that went to zero and delisted are ABSENT — for a LONG
+  strategy that omits the worst losers and materially FLATTERS returns. Must be
+  disclosed loudly and the design must state it can only be an optimistic-leaning
+  estimate, not a promise. quant-skeptic sizes how bad.
+- **Assumed cost/slippage** — a fixed round-trip cost; real microcap slippage is
+  likely worse and a +2% limit fill assumes you get exactly +2% (fast thin names
+  can slip). Disclosed; cost surfaced, not hidden.
+- **Strategy selection is itself multiple comparisons** — browsing Basket × Window ×
+  Strategy for the best cell is p-hacking; the caveat already on the explorer
+  ("browsing views is partly luck; short windows dominated by a few days") extends
+  to strategies.
+- Every number stamped BACKTEST/walk-forward, next to survivorship + cost caveats.
+
+Build order (each reviewed; quant-skeptic on the P&L math): (1) benchmark records
+oh/ol/oc per pick + re-benchmark; (2) `strategy.py` deterministic exit-rule
+simulation from (oh,ol,oc) + tests; (3) explorer Strategy dropdown + JS + caveats +
+render-verify. Trailing-stop and true fill modeling wait for intraday data.
+
 ## Status
 
 Live tracking is on GitHub: **milestones** (one per level) and **issues**

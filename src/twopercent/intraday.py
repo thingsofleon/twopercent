@@ -565,18 +565,34 @@ def stop_fills(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> pd.DataFr
     available price (#86). That assumption is optimistic by construction, and
     the band's lower edge was therefore not a worst case.
 
-    The defensible proxy now that 5m bars exist is the OPEN OF THE NEXT BAR
-    after the trigger — the first price at which the order could realistically
-    have executed. Measured over 8,589 stopped sessions on the real store:
-    median -1.04%, mean -1.08%, 10th percentile -2.6%. Small at the median, with
-    a tail the assumption hid entirely.
+    The proxy is the OPEN OF THE NEXT 5m BAR after the trigger. Measured by
+    running THIS function over every stopped session in the real store
+    (2026-08-10; 2,712 sessions survive all three gates):
+
+        mean -1.06%   median -1.03%   p10 -3.19%
+        49% land BETTER than the trigger, 22% are outright gains
+
+    Quote those numbers only alongside the query that produced them. An earlier
+    revision of this docstring cited an UNGATED population (8,589 sessions,
+    median -1.04%) as though it were this function's output — the ungated set is
+    both larger and more alarming, which is exactly why the provenance matters.
+
+    The next bar's open is the first price at which a market order sent at the
+    trigger could plausibly print, so it is preferred over the trigger bar's
+    close (which is up to 5 minutes of further drift) and over the trigger bar's
+    low (the worst tick of the bar, which no order is guaranteed). But it is up
+    to five minutes AFTER the breach, so it prices in any bounce: ungated, half
+    of these come out BETTER than the trigger and 17% are gains. A stop-market
+    order cannot fill above its trigger, so strategy.pick_return_band CLAMPS the
+    measured exit at STOP_LEVEL. Read these numbers as the distribution of a
+    proxy, not of realised fills.
 
     Only sessions that pass the SAME gates as ordering are used: the record must
     reproduce the daily bar's extremes, and it must be unbroken from the open
     through the stop bar (a gap before it means the real trigger may have been
-    earlier, at a price we never saw). A trigger in the final bar has no next
-    bar and is left unmeasured. Everything unmeasured keeps the -1% assumption,
-    labelled — never silently mixed in as though it were observed.
+    earlier, at a price we never saw). The next bar must also be the adjacent
+    SLOT. A trigger in the final bar is left unmeasured. Everything unmeasured
+    keeps the -1% assumption, labelled — never silently mixed in as observed.
     """
     empty = pd.DataFrame(columns=["symbol", "date", "fill"])
     if pairs.empty:
@@ -632,7 +648,14 @@ def stop_fills(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> pd.DataFr
                             WHERE z.symbol = g.symbol AND z.date = g.date
                               AND z.interval = '{INTERVAL}' AND z.ts > g.stop_ts)
             WHERE g.bars_before >= g.bars_expected AND g.bars_expected > 0
-              AND isfinite(nxt.open) AND g.open > 0
+              -- ADJACENCY. "Next bar" must be the NEXT SLOT, not merely the next
+              -- print. 2% of sessions have a hole after the trigger (max 140
+              -- minutes), and on a name that stops trading after the breach the
+              -- following print is the least fill-like price available -- on
+              -- exactly the illiquid names #86 was about. The contiguity gate
+              -- covers only what happens BEFORE the trigger.
+              AND date_diff('minute', g.stop_ts, nxt.ts) = {BAR_MINUTES}
+              AND isfinite(nxt.open) AND nxt.open > 0 AND g.open > 0
         """).fetchdf()
     finally:
         con.unregister("_fill_pairs")

@@ -537,7 +537,7 @@ def test_dashboard_explorer_too_few_sim_days_says_so(modeled, tmp_path):
 
 
 def _pick(rank, hit, oh=0.021, ol=-0.002, oc=0.005, path=None, fill=None):
-    """A payload pick [rank, oh, ol, oc, hit, path] with harmless defaults.
+    """A payload pick [rank, oh, ol, oc, hit, path, fill] with harmless defaults.
 
     `path` is the intraday verdict (#79); None means unresolved, which is what
     every pick was before intraday ingestion existed."""
@@ -855,8 +855,16 @@ def test_strategy_lockstep_python_vs_node():
                 _pick(1, 1, ol=-0.04, oc=-0.03, fill=-0.031),
                 _pick(2, 1, ol=-0.04, oc=-0.03, path=strategy.SEQ_STOP_FIRST, fill=-0.026),
                 _pick(3, 0, ol=-0.04, oc=-0.03, fill=-0.019),
+                # Fills BETTER than the trigger: half of the real measured
+                # population. The clamp must stop these booking a profit -- and
+                # a stopped pick must never count as a win.
+                _pick(4, 0, ol=-0.04, oc=-0.03, fill=0.031),
+                _pick(5, 1, ol=-0.04, oc=0.01, fill=0.031),
+                _pick(6, 1, ol=-0.04, oc=0.01, path=strategy.SEQ_STOP_FIRST, fill=0.008),
             ],
         },
+        # The stored payload shape between #79 and #86: 6 elements, no fill.
+        {"d": "j", "base": 0.3, "picks": [[1, 0.03, -0.03, 0.01, 1, None]]},
         # 1 resolved of 8 ambiguous = 12.5%, where Python's half-even round()
         # gives 12% and JS Math.round gives 13% -- the drift class
         # dashboard._pct_half_up already exists for. Pinned here so the
@@ -1094,3 +1102,59 @@ def test_mark_helper_renders_both_states_distinctly():
     assert 'aria-label="reached +2%"' in hit
     assert 'aria-label="did not reach +2%"' in miss
     assert "✓" not in hit and "✗" not in miss
+
+
+def test_measured_stop_fill_reaches_the_payload_end_to_end(modeled, tmp_path):
+    """#86: `_attach_fills` shipped as DEAD CODE — defined, never called.
+
+    Every stopped pick was still booked at −1% while the page claimed the exit
+    was measured from 5m bars, and a prose assertion certified the false claim.
+    Unit tests passed because they called intraday.stop_fills directly. This is
+    the missing test: drive build_html with bars present and demand the fill
+    arrive in the payload.
+    """
+    import datetime as dt
+    import json
+    import re
+
+    dates = sorted(pd.bdate_range("2026-01-05", periods=60).date)
+    predict_for(modeled, "baseline_gbm_v1", signal_date=dates[-3], save=True)
+    target = dates[-2]
+    top = modeled.execute(
+        "SELECT symbol FROM predictions WHERE signal_date = ? ORDER BY rank LIMIT 1", [dates[-3]]
+    ).fetchone()[0]
+    # Daily bar that breaches the −1% stop; intraday reproduces its extremes.
+    modeled.execute(
+        "UPDATE prices SET open = 100, high = 101, low = 97, close = 98 "
+        "WHERE symbol = ? AND date = ?",
+        [top, target],
+    )
+    frame = pd.DataFrame(
+        {
+            "symbol": top,
+            "ts": [dt.datetime.combine(target, dt.time(9, 30 + 5 * i)) for i in range(2)],
+            "date": target,
+            "interval": "5m",
+            "open": [100.0, 97.5],  # fill = the second bar's open = −2.5%
+            "high": [101.0, 98.0],
+            "low": [98.9, 97.0],
+            "close": [99.0, 97.4],
+            "volume": [1000, 1000],
+        }
+    )
+    modeled.register("_fillbars", frame)
+    modeled.execute("INSERT INTO intraday_prices SELECT * FROM _fillbars")
+
+    out = tmp_path / "dash.html"
+    dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5)
+    content = out.read_text()
+    payload = json.loads(
+        re.search(r'<script type="application/json" id="tp-data">(.*?)</script>', content).group(1)
+    )
+
+    day = next(d for d in payload["live"] if d["d"] == str(target))
+    fills = [p[6] for p in day["picks"] if p[6] is not None]
+    assert fills, "a measurable stop exit must reach the payload, not stay in dead code"
+    assert abs(fills[0] - (-0.025)) < 1e-6
+    # And the page must disclose that exits are mixed measured/assumed.
+    assert "stop exits:" in content

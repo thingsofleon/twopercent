@@ -505,11 +505,25 @@ def test_unmeasurable_stop_keeps_the_labelled_assumption(con):
 
 
 def test_stop_fill_requires_the_same_gates_as_ordering(con):
-    """A record that fails the daily-bar check cannot price the exit either."""
-    _seed_daily(con, open_=100.0, high=101.0, low=97.0, close=98.0)
-    _ingest(con, _bars([("09:30", 100.0, 100.5, 98.9, 99.0), ("09:35", 97.5, 98.0, 98.5, 97.4)]))
+    """A VALID record that disagrees with its daily bar cannot price the exit.
 
-    assert _stop_fill(con).empty  # intraday low never reaches the daily 97.0
+    The first version of this test seeded low=98.5 above high=98.0 — an
+    OHLC-impossible bar that _flatten drops at ingest, so it passed through the
+    validity gate and never exercised the agreement gate it claimed to test.
+    """
+    _seed_daily(con, open_=100.0, high=101.0, low=97.0, close=98.0)
+    _ingest(
+        con,
+        _bars(
+            [
+                ("09:30", 100.0, 101.0, 98.9, 99.0),
+                # Valid bars, but the record never reaches the daily low of 97.0.
+                ("09:35", 98.5, 98.6, 98.4, 98.5),
+            ]
+        ),
+    )
+
+    assert _stop_fill(con).empty
 
 
 def test_a_bad_fill_cannot_invert_the_band(con):
@@ -517,3 +531,42 @@ def test_a_bad_fill_cannot_invert_the_band(con):
     worst, best = strategy.pick_return_band("limit_stop", -0.05, -0.04, True, None, -0.045)
     assert worst <= best
     assert worst == -0.045 and best == strategy.LIMIT_PROFIT
+
+
+def test_a_fill_better_than_the_trigger_is_clamped(con):
+    """A stop-market order cannot execute above its trigger.
+
+    The proxy is the next bar's OPEN, up to five minutes after the breach, so it
+    prices in whatever bounce followed. Ungated, half the measured population
+    came out better than −1% and 17% were gains — a stopped pick booking a
+    profit, and the "worst-case" win rate rising because of a change sold as a
+    conservatism fix. The clamp is what keeps it monotone.
+    """
+    worst, best = strategy.pick_return_band("limit_stop", -0.04, -0.03, False, None, +0.031)
+    assert worst == best == strategy.STOP_LEVEL
+
+    # And a stopped pick can never be counted as a win.
+    days = [{"d": "a", "base": 0.3, "picks": [[1, 0.03, -0.04, -0.03, 0, None, 0.031]]}]
+    s = strategy.summarize_strategy_days(days, 1, "limit_stop")
+    assert s["ww"] == 0.0 and s["wb"] == 0.0
+
+
+def test_next_bar_must_be_the_adjacent_slot(con):
+    """A print two hours after the breach is not a fill.
+
+    2% of real sessions have a hole after the trigger (max 140 minutes), and on
+    a name that stops trading after the breach the following print is the least
+    fill-like price available — on exactly the illiquid names #86 was about.
+    """
+    _seed_daily(con, open_=100.0, high=101.0, low=97.0, close=98.0)
+    _ingest(
+        con,
+        _bars(
+            [
+                ("09:30", 100.0, 101.0, 98.9, 99.0),  # stop triggers here
+                ("11:30", 97.5, 98.0, 97.0, 97.4),  # next PRINT, not next SLOT
+            ]
+        ),
+    )
+
+    assert _stop_fill(con).empty

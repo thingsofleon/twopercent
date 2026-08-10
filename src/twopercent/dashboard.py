@@ -819,22 +819,38 @@ def _attach_paths(con, frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
     return merged, f"path resolution: {res.summary()}"
 
 
-def _attach_fills(con, frame: pd.DataFrame) -> pd.DataFrame:
-    """Merge the MEASURED stop exit onto each pick, where one could be measured.
+def _attach_fills(con, frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+    """Merge the MEASURED stop exit onto each pick, plus a coverage disclosure.
 
     Absent means "not measurable", and pick_return_band falls back to the -1%
     trigger — never a silent zero, and never a fabricated fill.
+
+    The note is required for the same reason _attach_paths' is: an equity curve
+    that prices some exits from bars and others from an assumption is two
+    accountings stitched together, and 5m retention means the measured segment
+    is always the RECENT one — precisely the segment anyone reads to ask "is it
+    still working". Without the date range on the page, a regime change and an
+    accounting change are indistinguishable.
     """
     if frame.empty or "symbol" not in frame.columns:
-        return frame
+        return frame, None
     pairs = frame[["symbol", "target_date"]].rename(columns={"target_date": "date"}).dropna()
     if pairs.empty:
-        return frame
+        return frame, None
     fills = intraday.stop_fills(con, pairs)
     if fills.empty:
-        return frame
-    return frame.merge(
+        return frame, (
+            "stop exits: none measurable — every stopped pick uses the flat −1% "
+            "trigger, which is optimistic (a stop fills at the next available price)"
+        )
+    merged = frame.merge(
         fills.rename(columns={"date": "target_date"}), on=["symbol", "target_date"], how="left"
+    )
+    lo, hi = fills["date"].min(), fills["date"].max()
+    return merged, (
+        f"stop exits: {len(fills)} session(s) priced from 5m bars ({lo} to {hi}); "
+        "stopped picks outside that range fall back to the flat −1% trigger, which "
+        "is optimistic. Measured and assumed exits are mixed in one curve"
     )
 
 
@@ -1143,10 +1159,11 @@ def _strategy_card(
         '<p class="sub">All returns are gross — before trading costs (not estimated). '
         "The +2% limit is assumed to fill at exactly its trigger. The −1% stop is "
         "NOT: a stop becomes a market order, so where 5-minute bars allow it the "
-        "exit is measured at the next bar's open (typically a few basis points "
-        "below the trigger, occasionally far below), and only falls back to a flat "
-        "−1% where it cannot be measured. A glitch-suspect high never counts as a "
-        "fill. For the limit+stop rule, when both could fill on the same day, "
+        "exit is priced from the next bar's open, capped at the trigger (a stop "
+        "cannot fill above it), and falls back to a flat −1% where it cannot be "
+        "priced — see the coverage line below for how much of this window is "
+        "which. A glitch-suspect high never counts as a fill. For the limit+stop "
+        "rule, when both could fill on the same day, "
         "5-minute bars decide which came first where the record is complete enough "
         "to prove it; everywhere else the result stays a best case / worst case "
         "band, because daily bars carry no clock.</p>"
@@ -1243,14 +1260,15 @@ var tpMath = (function () {
     if (strat === "limit_2pct") { var r = filled ? LIMIT : oc; return [r, r]; }
     if (strat === "limit_stop") {
       var stopped = ol <= STOP + EPS;
-      // fill is the MEASURED stop exit; STOP is only the trigger.
-      var exitRet = (fill === null || fill === undefined) ? STOP : fill;
+      // fill is the MEASURED stop exit, CLAMPED at the trigger: the proxy is
+      // the next bar's open and would otherwise price in a post-breach bounce.
+      var exitRet = (fill === null || fill === undefined) ? STOP : Math.min(fill, STOP);
       if (filled && stopped) {
         // seq is the intraday verdict: which trigger came first. Without it a
         // daily bar cannot tell, so the band stays open.
         if (seq === SEQ_LIMIT_FIRST) return [LIMIT, LIMIT];
         if (seq === SEQ_STOP_FIRST) return [exitRet, exitRet];
-        return [Math.min(exitRet, LIMIT), LIMIT];
+        return [exitRet, LIMIT];
       }
       if (stopped) return [exitRet, exitRet];
       if (filled) return [LIMIT, LIMIT];
@@ -1693,6 +1711,9 @@ def build_html(
         sim_frame, note = _attach_paths(con, sim[1].rename(columns={"ret": "oc"}))
         if note:
             path_notes.append(f"SIM {note}")
+        sim_frame, fill_note = _attach_fills(con, sim_frame)
+        if fill_note:
+            path_notes.append(f"SIM {fill_note}")
         sim_days = _payload_days(sim_frame, bases)
     else:
         sim_days = []
@@ -1703,6 +1724,9 @@ def build_html(
         )
         if note:
             path_notes.append(f"LIVE {note}")
+        live_frame, fill_note = _attach_fills(con, live_frame)
+        if fill_note:
+            path_notes.append(f"LIVE {fill_note}")
         live_days = _payload_days(live_frame, bases, late=True)
     else:
         live_days = []

@@ -99,20 +99,23 @@ def pick_return_band(
         return (ret, ret)
     if strategy == "limit_stop":
         stopped = stop_triggered(ol)
-        # `fill` is the MEASURED stop exit (intraday.stop_fills): the open of
-        # the bar after the trigger, i.e. the first price the market order could
-        # realistically have got. STOP_LEVEL is the trigger, not a fill, and is
-        # optimistic by construction -- it is the fallback only where the exit
-        # could not be measured, and the page says which is which (#86).
-        exit_ret = STOP_LEVEL if fill is None else fill
+        # `fill` is the MEASURED stop exit (intraday.stop_fills). CLAMPED at the
+        # trigger: a stop-market order fills within seconds at or below -1%, but
+        # the proxy is the next 5m bar's open, up to five minutes later, so it
+        # prices in any bounce that followed the air pocket. Unclamped, HALF the
+        # measured fills came out better than the trigger and 17% were GAINS --
+        # a stopped pick booking a profit, and the "worst-case" win rate jumping
+        # +20pp from a change advertised as a conservatism fix (quant-skeptic).
+        # min() keeps the change monotone in the direction it claims.
+        exit_ret = STOP_LEVEL if fill is None else min(fill, STOP_LEVEL)
         if filled and stopped:
             if seq == SEQ_LIMIT_FIRST:
                 return (LIMIT_PROFIT, LIMIT_PROFIT)
             if seq == SEQ_STOP_FIRST:
                 return (exit_ret, exit_ret)
-            # Order unknown: the worst case is the stop exit, which may be below
-            # the trigger, so min() keeps worst <= best even on a bad fill.
-            return (min(exit_ret, LIMIT_PROFIT), LIMIT_PROFIT)
+            # Order unknown: worst is the stop exit (at or below the trigger,
+            # so always below the limit), best is the limit.
+            return (exit_ret, LIMIT_PROFIT)
         if stopped:
             return (exit_ret, exit_ret)
         if filled:

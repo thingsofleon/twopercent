@@ -85,13 +85,33 @@ def test_ingest_reports_symbols_that_returned_nothing(con, caplog):
     )
 
     assert result.symbols_empty == ["GHOST"]
-    assert not result.ok  # a partial fetch is NOT a clean run
+    # ok stays True: delisted picks return empty on EVERY run, so failing the
+    # exit code on that would train the operator to ignore it. The count and the
+    # warning are the signal.
+    assert result.ok
+    assert "GHOST" in result.summary()
     assert "GHOST" in caplog.text
 
 
-def test_ingest_refuses_a_span_yahoo_would_silently_truncate(con):
-    with pytest.raises(ValueError, match="chunk the range"):
-        intraday.ingest(con, ["AAA"], SESSION, SESSION + dt.timedelta(days=90))
+def test_ingest_chunks_a_span_longer_than_one_request(con):
+    """Yahoo caps a 5m request near 60 days; the range is walked, not refused.
+
+    Refusing was why `--days 88` (the CLI's own advertised value) raised, and
+    why the design doc's 60-trading-day backfill was unreachable.
+    """
+    _seed_daily(con)
+    seen: list[tuple] = []
+
+    def spy(syms, s, e):
+        seen.append((s, e))
+        return _bars([("09:30", 100.0, 101.0, 99.5, 100.5)])
+
+    intraday.ingest(con, ["AAA"], SESSION, SESSION + dt.timedelta(days=90), downloader=spy)
+
+    assert len(seen) == 2  # 90 days -> 55 + 35
+    assert seen[0][0] == SESSION
+    assert seen[-1][1] == SESSION + dt.timedelta(days=90)
+    assert all((e - s).days <= intraday.REQUEST_SPAN_DAYS for s, e in seen)
 
 
 def test_empty_response_is_an_error_not_an_empty_success(con, monkeypatch):
@@ -258,3 +278,117 @@ def test_glitch_suspect_high_is_not_an_ambiguous_day(con):
     res = _resolve_one(con)
 
     assert res.both_touched == 0
+
+
+# --- the gates that bound the ERROR, not just the coverage --------------------
+
+
+def test_gap_before_the_first_trigger_refuses_to_resolve(con):
+    """The inversion quant-skeptic reproduced (finding 2).
+
+    Truth: +2% at 09:35, -1% at 10:00 -> LIMIT_FIRST. Yahoo omits the 09:35
+    no-trade interval, so the earliest RECORDED limit bar is 15:00 and the
+    record still reproduces the day's high and low exactly. Ordering on what is
+    present returns STOP_FIRST — confidently wrong, with the completeness gate
+    reporting success. Contiguity from 09:30 through the earlier trigger is what
+    catches it.
+    """
+    _seed_daily(con, open_=100.0, high=104.0, low=98.0, close=101.0)
+    _ingest(
+        con,
+        _bars(
+            [
+                ("09:30", 100.0, 100.5, 99.9, 100.2),
+                ("10:00", 100.2, 100.6, 98.0, 98.4),  # daily LOW reproduced
+                ("15:00", 98.4, 104.0, 98.1, 101.0),  # daily HIGH reproduced
+            ]
+        ),
+    )
+    res = _resolve_one(con)
+
+    assert res.resolved == 0, "a gap before the first trigger must not be ordered"
+    assert res.gappy == 1
+    assert "gap before the first trigger" in res.summary()
+
+
+def test_contiguous_record_still_resolves(con):
+    """The gate must not reject everything — an unbroken record still resolves."""
+    _seed_daily(con, open_=100.0, high=104.0, low=98.0, close=101.0)
+    _ingest(
+        con,
+        _bars(
+            [
+                ("09:30", 100.0, 100.5, 99.9, 100.2),
+                ("09:35", 100.2, 104.0, 100.0, 103.0),  # limit here, no gap before it
+                ("09:40", 103.0, 103.5, 98.0, 98.4),  # stop later
+            ]
+        ),
+    )
+    res = _resolve_one(con)
+
+    assert res.resolved == 1 and res.gappy == 0
+    assert res.frame.iloc[0]["seq"] == intraday.LIMIT_FIRST
+
+
+def test_untraded_opening_window_is_a_gap(con):
+    """Anchored at 09:30, not at the first bar present.
+
+    If the name did not trade until 09:45, the unobserved 09:30-09:45 window
+    could contain either trigger, so the ordering is not proven.
+    """
+    _seed_daily(con, open_=100.0, high=104.0, low=98.0, close=101.0)
+    _ingest(
+        con,
+        _bars(
+            [
+                ("09:45", 100.0, 104.0, 100.0, 103.0),
+                ("09:50", 103.0, 103.5, 98.0, 98.4),
+            ]
+        ),
+    )
+    res = _resolve_one(con)
+
+    assert res.resolved == 0 and res.gappy == 1
+
+
+def test_uniform_scale_error_cannot_manufacture_a_fill(con):
+    """Finding 3: a 0.4% scale error used to pass a 0.5% tolerance.
+
+    Every intraday price is inflated 0.4%. The 09:35 bar's true high is +1.7%
+    (no fill) but reads as +2.08% (fill), which would invert a genuine
+    STOP_FIRST day. The tolerance must be small relative to the 3-point corridor
+    between the stop and the limit, not merely small relative to a split.
+    """
+    scale = 1.004
+    _seed_daily(con, open_=100.0, high=103.0, low=98.0, close=101.0)
+    _ingest(
+        con,
+        _bars(
+            [
+                ("09:30", 100.0 * scale, 100.4 * scale, 99.9 * scale, 100.2 * scale),
+                ("09:35", 100.2 * scale, 101.7 * scale, 100.0 * scale, 101.0 * scale),
+                ("09:40", 101.0 * scale, 101.2 * scale, 98.0 * scale, 98.4 * scale),
+                ("09:45", 98.4 * scale, 103.0 * scale, 98.2 * scale, 101.0 * scale),
+            ]
+        ),
+    )
+    res = _resolve_one(con)
+
+    assert res.resolved == 0 and res.disagreed == 1
+
+
+def test_ohlc_impossible_intraday_bar_is_dropped_and_warned(con, caplog):
+    """The daily path's validity law applies here too (CLAUDE.md)."""
+    _seed_daily(con)
+    result = _ingest(
+        con,
+        _bars(
+            [
+                ("09:30", 100.0, 100.5, 99.5, 100.2),
+                ("09:35", 3.51, 3.40, 3.30, 3.35),  # ENHA shape: high below open
+            ]
+        ),
+    )
+
+    assert result.rows == 1
+    assert "OHLC-impossible" in caplog.text

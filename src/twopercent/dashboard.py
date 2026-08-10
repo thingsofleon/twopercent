@@ -780,14 +780,22 @@ def _attach_paths(con, frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
     to intraday bars at all — that is every sim row recorded before #79, and it
     says so rather than reporting a truthful-but-misleading "0 resolved".
     """
-    if frame.empty or "symbol" not in frame.columns:
+    if frame.empty:
         return frame, None
+    unresolvable = (
+        "path resolution: UNAVAILABLE — these rows carry no symbol, so they cannot "
+        "be looked up in intraday_prices; every band below stays open. Re-run "
+        "`twopercent benchmark` to record symbols (#79)"
+    )
+    # A missing symbol COLUMN and an all-NULL symbol column are the same defect
+    # to a reader and must produce the same disclosure. Returning None here (the
+    # original bug, quant-skeptic finding 1) made the SIM row silently skip
+    # resolution AND silently skip saying so.
+    if "symbol" not in frame.columns:
+        return frame, unresolvable
     pairs = frame[["symbol", "target_date"]].rename(columns={"target_date": "date"}).dropna()
     if pairs.empty:
-        return frame, (
-            "path resolution: unavailable — these rows predate symbol recording; "
-            "re-run `twopercent benchmark` to make them resolvable (#79)"
-        )
+        return frame, unresolvable
     res = intraday.resolve(con, pairs)
     if res.both_touched == 0:
         return frame, None
@@ -972,6 +980,14 @@ def _strategy_state(
             if len(live) < w:
                 notes.append(f"LIVE: all {len(live)} live day(s) — fewer than the {w}-day window")
             notes.extend(_row_notes("LIVE", s, n))
+    # Path coverage, in the SAME card as the collapsed band and for the SAME
+    # selection. Mirrors updateStrat()'s JS branch exactly, so the server render
+    # and the first client repaint say the same thing.
+    if strat == "limit_stop":
+        for prefix, state in (("SIM", sim_s), ("LIVE", live_s)):
+            note = strategy.path_note(prefix, state)
+            if note:
+                notes.append(note)
     return sim_s, live_s, notes
 
 
@@ -1043,11 +1059,21 @@ STRATEGY_SERVER_DEFAULT = "hold_close"
 _STAMP_UB = ' <span class="stamp-ub">OPTIMISTIC UPPER BOUND</span>'
 
 
-def _strategy_card(sim_days: list[dict], live_days: list[dict], n: int, w: int) -> str:
+def _strategy_card(
+    sim_days: list[dict],
+    live_days: list[dict],
+    n: int,
+    w: int,
+    path_notes: list[str] | None = None,
+) -> str:
     """The P&L what-if card (hidden while Strategy = Reach rate): SIM/LIVE rows
     of $1-growth + win rate, the survivorship stamp ON the SIM number, and the
     plain-language framing lines. Every number gross; no cost constant exists."""
     sim_s, live_s, notes = _strategy_state(sim_days, live_days, n, w, STRATEGY_SERVER_DEFAULT)
+    # WHY the unresolved ones are unresolved. Static: it describes the stored
+    # data, not the current selection, and JS must never overwrite it (it only
+    # rewrites #tp-strat-note). The per-selection coverage lives in that note.
+    reasons = f'<p class="sub">{html.escape(" · ".join(path_notes))}</p>' if path_notes else ""
     return (
         '<div class="card" id="tp-card-strat" hidden><table><tr>'
         f"<th>Record{_info('e_record', 'start')}</th>"
@@ -1067,11 +1093,15 @@ def _strategy_card(sim_days: list[dict], live_days: list[dict], n: int, w: int) 
         "were real, this could be a loss. The LIVE row is the honest number — real "
         "logged picks, real outcomes, survivorship-free — but a small sample.</p>"
         '<p class="sub">All returns are gross — before trading costs (not estimated). '
-        "Limit and stop fills are assumed at exactly the trigger price; a "
-        "glitch-suspect high never counts as a fill. For the limit+stop rule, when "
-        "both could fill on the same day the result is shown as best case / worst "
-        "case — daily data can't tell which came first.</p>"
-        f'<p class="sub" id="tp-strat-note">{html.escape(" · ".join(notes))}</p></div>'
+        "Limit and stop fills are assumed at exactly the trigger price — for the "
+        "stop that is optimistic, since a stop fills at the next available price, "
+        "not at the trigger. A glitch-suspect high never counts as a fill. For the "
+        "limit+stop rule, when both could fill on the same day, 5-minute bars "
+        "decide which came first where the record is complete enough to prove it; "
+        "everywhere else the result stays a best case / worst case band, because "
+        "daily bars carry no clock.</p>"
+        + reasons
+        + f'<p class="sub" id="tp-strat-note">{html.escape(" · ".join(notes))}</p></div>'
     )
 
 
@@ -1091,10 +1121,6 @@ def _record_explorer(
     payload."""
     n, w = BASKET_DEFAULT, WINDOW_DEFAULT
     sim_s, live_s, notes = _explorer_state(sim_days, live_days, n, w)
-    # Path-resolution coverage rides with the other per-row disclosures: a
-    # collapsed band and an open one look identical on the page, so the count
-    # of what actually resolved has to be visible beside the number (#79).
-    notes = list(notes) + list(path_notes or [])
     basket_opts = "".join(
         f'<option value="{b}"{" selected" if b == n else ""}>Top {b}</option>'
         for b in BASKET_CHOICES
@@ -1143,7 +1169,7 @@ def _record_explorer(
         "<h2>Record over trailing windows</h2>"
         + controls
         + table
-        + _strategy_card(sim_days, live_days, n, w)
+        + _strategy_card(sim_days, live_days, n, w, path_notes)
         + span
         + f'<p class="sub" style="margin-top:8px">{_SIM_CAVEAT}</p>'
     )
@@ -1206,6 +1232,7 @@ var tpMath = (function () {
   }
   function stratSummarize(days, n, strat) {
     var gw = 1, gb = 1, winsW = 0, winsB = 0, picksN = 0;
+    var ambN = 0, resN = 0;
     var shortDays = 0, substDays = 0, missing = 0, corrupt = 0;
     for (var i = 0; i < days.length; i++) {
       var picks = days[i].picks.slice(0, n);
@@ -1219,9 +1246,17 @@ var tpMath = (function () {
       if (miss) { missing += 1; continue; }
       if (!picks.length) { corrupt += 1; continue; }
       var sumW = 0, sumB = 0, dayWinsW = 0, dayWinsB = 0, ok = true;
+      var dayAmb = 0, dayRes = 0;
       for (j = 0; j < picks.length; j++) {
-        var band = pickBand(strat, picks[j][2], picks[j][3], !!picks[j][4],
-                            picks[j].length > 5 ? picks[j][5] : null);
+        var pseq = picks[j].length > 5 ? picks[j][5] : null;
+        // Ambiguous = both triggers touched, i.e. the band is only a point if
+        // the intraday replay ordered them. Counted for the SELECTED basket and
+        // window so the disclosure matches the number on screen.
+        if (!!picks[j][4] && picks[j][2] <= STOP + EPS) {
+          dayAmb += 1;
+          if (pseq === SEQ_LIMIT_FIRST || pseq === SEQ_STOP_FIRST) dayRes += 1;
+        }
+        var band = pickBand(strat, picks[j][2], picks[j][3], !!picks[j][4], pseq);
         if (!isFinite(band[0]) || !isFinite(band[1])) { ok = false; break; }
         sumW += band[0]; sumB += band[1];
         if (band[0] > 0) dayWinsW += 1;
@@ -1230,6 +1265,8 @@ var tpMath = (function () {
       if (!ok) { corrupt += 1; continue; }
       winsW += dayWinsW;
       winsB += dayWinsB;
+      ambN += dayAmb;
+      resN += dayRes;
       picksN += picks.length;
       gw *= 1 + sumW / picks.length;
       gb *= 1 + sumB / picks.length;
@@ -1237,9 +1274,26 @@ var tpMath = (function () {
     var clean = days.length - missing - corrupt;
     return { gw: clean ? gw : NaN, gb: clean ? gb : NaN,
              ww: picksN ? winsW / picksN : NaN, wb: picksN ? winsB / picksN : NaN,
+             amb: ambN, res: resN,
              picks: picksN, days: days.length, clean: clean,
              shortDays: shortDays, substDays: substDays, baseDays: 0,
              missing: missing, corrupt: corrupt };
+  }
+  function pathNote(prefix, s) {
+    // The band collapses only where the ordering was resolved, so the reader
+    // needs the coverage NEXT TO the number. Rebuilt on every selector change:
+    // a server-rendered note would be destroyed on first interaction and would
+    // describe a different basket/window than the one on screen.
+    if (!s || !s.amb) return null;
+    var pct = Math.round(100 * s.res / s.amb);
+    if (!s.res) {
+      return prefix + ": 0 of " + s.amb + " both-triggered picks resolved " +
+             "\u2014 every band below is the daily worst/best case";
+    }
+    return prefix + ": " + s.res + " of " + s.amb + " both-triggered picks (" + pct +
+           "%) ordered from 5m bars; the rest stay a worst/best band. A collapsed " +
+           "band is conditional on that replay, not proven from daily bars, and " +
+           "resolvable days skew liquid.";
   }
   function rowNotes(prefix, s, n) {
     var notes = [];
@@ -1278,7 +1332,7 @@ var tpMath = (function () {
     return "No strategy result to translate yet \\u2014 see the notes below.";
   }
   return { pickBand: pickBand, summarize: summarize, stratSummarize: stratSummarize,
-           rowNotes: rowNotes, growthText: growthText, winText: winText,
+           rowNotes: rowNotes, pathNote: pathNote, growthText: growthText, winText: winText,
            becameText: becameText, readText: readText };
 })();
 </script>
@@ -1407,6 +1461,12 @@ _JS = """
                                         " fewer than the " + w + "-day window");
         notes = notes.concat(tpMath.rowNotes("LIVE", s2, n));
       }
+    }
+    if (key === "limit_stop") {
+      var pn = tpMath.pathNote("SIM", simS);
+      if (pn) notes.push(pn);
+      var pl = tpMath.pathNote("LIVE", liveS);
+      if (pl) notes.push(pl);
     }
     setStratRow("strat-sim", simS);
     setStratRow("strat-live", liveS);

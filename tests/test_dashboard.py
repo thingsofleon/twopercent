@@ -706,7 +706,9 @@ def test_strategy_card_framing_stamps_and_gross_labels(modeled, tmp_path):
     assert "excludes every company that delisted" in strat_block
     assert "if even a few of their blow-up days were real, this could be a loss" in strat_block
     assert "before trading costs (not estimated)" in strat_block
-    assert "daily data can't tell which came first" in strat_block
+    assert "daily bars carry no clock" in strat_block
+    # The stop's fill-at-trigger assumption is optimistic and must say so (#86).
+    assert "not at the trigger" in strat_block
     assert "glitch-suspect high never counts as a fill" in strat_block
 
 
@@ -908,3 +910,132 @@ console.log(JSON.stringify(out));
         r["base_days"],
         r["corrupt"],
     ]
+
+
+# --- #79 path resolution: the integration, not just the unit ------------------
+
+
+def test_experiment_daily_symbol_survives_the_round_trip(con):
+    """Finding 1: the writer recorded `symbol`, the READER never selected it.
+
+    Without this, no SIM band could ever collapse no matter how much intraday
+    data was ingested — and _attach_paths returned None, so the page did not
+    even say so. A write-then-read assertion is what the original PR lacked.
+    """
+    seq = store.record_experiment(
+        con,
+        strategy="baseline_gbm_v1",
+        params={},
+        train_start=pd.Timestamp("2026-01-05").date(),
+        test_start=pd.Timestamp("2026-02-02").date(),
+        test_end=pd.Timestamp("2026-02-27").date(),
+        metrics={"auc": 0.7, "lift": 2.0, "precision_at_n": 0.5, "base_rate": 0.25, "top_n": 20},
+        event="open_to_high",
+    )
+    store.record_experiment_daily(
+        con,
+        seq,
+        pd.DataFrame(
+            {
+                "target_date": [pd.Timestamp("2026-02-02").date()],
+                "rank": [1],
+                "ret": [0.01],
+                "hit": [1],
+                "oh": [0.03],
+                "ol": [-0.02],
+                "symbol": ["AAA"],
+            }
+        ),
+    )
+
+    meta, frame = store.latest_experiment_daily(con, "baseline_gbm_v1")
+    assert "symbol" in frame.columns
+    assert frame["symbol"].tolist() == ["AAA"]
+
+
+def test_attach_paths_says_so_when_rows_carry_no_symbol(con):
+    """A silent no-op is the failure mode; the reader must be told."""
+    frame = pd.DataFrame(
+        {"target_date": [pd.Timestamp("2026-02-02").date()], "rank": [1], "oh": [0.03]}
+    )
+    out, note = dashboard._attach_paths(con, frame)
+
+    assert out is frame
+    assert note is not None and "UNAVAILABLE" in note
+    assert "twopercent benchmark" in note
+
+
+def test_path_note_reports_coverage_for_the_selected_basket():
+    """Finding 4: the disclosure must describe the selection on screen.
+
+    A note computed over all days at top-20 is not a statement about a top-5,
+    126-day band. path_note() is fed by the same summarize call that produces
+    the number, so the two cannot describe different populations.
+    """
+    from twopercent import strategy as strat_mod
+
+    both = _pick(1, 1, ol=-0.03, oc=-0.01)  # limit + stop touched, unresolved
+    resolved = _pick(2, 1, ol=-0.03, oc=-0.01, path=strat_mod.SEQ_STOP_FIRST)
+    days = [{"d": "a", "base": 0.3, "picks": [both, resolved]}]
+
+    s_all = strat_mod.summarize_strategy_days(days, 2, "limit_stop")
+    assert (s_all["amb"], s_all["res"]) == (2, 1)
+    note = strat_mod.path_note("SIM", s_all)
+    assert "1 of 2 both-triggered picks (50%)" in note
+    assert "conditional on that replay" in note
+
+    # Top-1 selects only the unresolved pick — the note must follow the basket.
+    s_one = strat_mod.summarize_strategy_days(days, 1, "limit_stop")
+    assert (s_one["amb"], s_one["res"]) == (1, 0)
+    assert "0 of 1 both-triggered picks resolved" in strat_mod.path_note("SIM", s_one)
+
+
+def test_resolved_verdict_reaches_the_payload_and_collapses_the_band(modeled, tmp_path):
+    """End-to-end: bars in the store -> verdict in the payload -> band collapses."""
+    import datetime as dt
+
+    from twopercent import intraday
+
+    dates = sorted(pd.bdate_range("2026-01-05", periods=60).date)
+    predict_for(modeled, "baseline_gbm_v1", signal_date=dates[-3], save=True)
+    target = dates[-2]
+    # Make the top pick's target day touch BOTH triggers, then seed an unbroken
+    # 5m record in which the limit came first.
+    top = modeled.execute(
+        "SELECT symbol FROM predictions WHERE signal_date = ? ORDER BY rank LIMIT 1", [dates[-3]]
+    ).fetchone()[0]
+    modeled.execute(
+        "UPDATE prices SET open = 100, high = 104, low = 98, close = 101 "
+        "WHERE symbol = ? AND date = ?",
+        [top, target],
+    )
+    frame = pd.DataFrame(
+        {
+            "symbol": top,
+            "ts": [dt.datetime.combine(target, dt.time(9, 30 + 5 * i)) for i in range(3)],
+            "date": target,
+            "interval": "5m",
+            "open": [100.0, 100.2, 103.0],
+            "high": [100.5, 104.0, 103.5],
+            "low": [99.9, 100.0, 98.0],
+            "close": [100.2, 103.0, 98.4],
+            "volume": [1000, 1000, 1000],
+        }
+    )
+    modeled.register("_bars", frame)
+    modeled.execute("INSERT INTO intraday_prices SELECT * FROM _bars")
+
+    out = tmp_path / "dash.html"
+    dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5)
+    content = out.read_text()
+
+    import json
+    import re
+
+    payload = json.loads(
+        re.search(r'<script type="application/json" id="tp-data">(.*?)</script>', content).group(1)
+    )
+    live_day = next(d for d in payload["live"] if d["d"] == str(target))
+    assert any(p[5] == intraday.LIMIT_FIRST for p in live_day["picks"]), (
+        "a resolvable pick must arrive in the payload with its verdict"
+    )

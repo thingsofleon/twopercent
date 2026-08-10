@@ -17,25 +17,37 @@ unbuilt phase 2 that additionally requires extending the lookahead canary to
 mutate this table — the canary today mutates only `prices`, so a leak here
 would pass it vacuously.
 
-Two integrity gates, both non-destructive and both LOUD, because a silently
-incomplete intraday record biases the answer in a known direction:
+Three integrity gates, all non-destructive and all LOUD, because a silently
+incomplete intraday record does not just add noise — it moves the answer:
 
-  * Sparsity. Yahoo omits no-trade intervals entirely rather than emitting
-    zero-volume bars, and this model picks illiquid small caps (measured: 21-27%
-    of AAPL's 1m bar count on the thinnest names). A missing bar hides a dip,
-    which makes a stop LOOK un-triggered — every gap biases the replay toward
-    the optimistic ordering. Bar counting is the wrong test for this, because a
-    thin name legitimately has fewer bars. session_agreement() instead asks
-    whether the intraday record REPRODUCES the daily bar's open/high/low. If it
-    cannot see the day's own extremes, it certainly cannot order them, and the
-    day resolves UNRESOLVED rather than guessing.
-  * Scale. Intraday bars are unadjusted. A split between the session and the
-    fetch shifts every intraday price by the split factor, which the same
-    open/high/low agreement check catches as a mismatch.
+  * Validity (_flatten). The same law the daily path enforces: open > 0 and
+    OHLC ordering. Impossible bars are dropped, counted and warned.
+  * Completeness (session_agreement_sql). Yahoo omits no-trade intervals rather
+    than emitting zero-volume bars, and this model picks illiquid small caps
+    (measured: 21-27% of AAPL's 1m bar count on the thinnest names). Bar
+    counting is the wrong test — a thin name legitimately has fewer bars — so
+    the record must REPRODUCE the daily bar's HIGH and LOW (not its open; see
+    session_agreement_sql for why). This also catches unadjusted splits, which
+    scale every intraday price.
+  * Contiguity (resolve). Reproducing the extremes proves the record SAW both
+    triggers; it does not prove it saw them FIRST. A no-trade gap before the
+    earlier trigger biases that timestamp late and can INVERT the verdict, so
+    the record must additionally be unbroken from the 09:30 open through the
+    earlier trigger. Only then is the ordering proven rather than inferred.
+    Without this gate the failure is silent and unsigned — it flatters or
+    penalises depending on which gap is longer.
 
 An unresolvable day is never dropped and never assumed — it keeps the daily
-band it already had, and the counts are surfaced so "we resolved 3 of 400" can
-never read as "resolved".
+band it already had, and every reason is counted separately so "we resolved 3
+of 400" can never read as "resolved".
+
+WHAT A COLLAPSED BAND MEANS. Before path resolution the band was a PROOF from
+daily bars: the truth was inside it by construction. A collapsed endpoint is a
+narrower claim — it is correct given the replay, and the gates above exist to
+make that conditional as tight as possible. Resolution is also NOT random: it
+depends on record quality, which tracks liquidity, which tracks outcomes. So
+the amount of narrowing describes the resolvable subset, not the exit rule.
+The dashboard must say so wherever it shows a collapsed band.
 """
 
 from __future__ import annotations
@@ -64,8 +76,19 @@ RETRY_BACKOFF_SECONDS = 2.0
 BATCH_SIZE = 40
 
 # Relative tolerance when checking the intraday record against its daily bar.
-# Generous enough for last-print rounding, far tighter than any split.
-AGREEMENT_TOLERANCE = 0.005
+# Sized against the DECISION, not against splits: the whole ordering question
+# lives in the 3-percentage-point corridor between the -1% stop and the +2%
+# limit, so a tolerance of 0.5% was 1/6th of the corridor — a uniform 0.4%
+# scale error passed the gate on both extremes and manufactured an early limit
+# fill (quant-skeptic finding 3, reproduced). 1e-3 still catches every real
+# split by a factor of hundreds.
+AGREEMENT_TOLERANCE = 0.001
+
+# Regular-session open, minutes past midnight exchange-local, and the bar width.
+# The contiguity gate counts expected bars from the OPEN rather than from the
+# first bar present, so an un-traded opening window cannot hide a trigger.
+SESSION_OPEN_MINUTES = 9 * 60 + 30
+BAR_MINUTES = 5
 
 # Path verdicts. None/UNRESOLVED keeps the daily (worst, best) band.
 LIMIT_FIRST = strategy.SEQ_LIMIT_FIRST
@@ -88,7 +111,14 @@ class IntradayResult:
 
     @property
     def ok(self) -> bool:
-        return self.batches_failed == 0 and not self.symbols_empty
+        """No batch failed. Empty symbols are REPORTED, not failures.
+
+        Delisted or halted names in an old pick set return nothing every single
+        run, so treating any empty symbol as failure would pin the exit code at
+        1 forever and train the operator to ignore it. The count still rides in
+        summary() and the warning still fires.
+        """
+        return self.batches_failed == 0
 
     def summary(self) -> str:
         parts = [
@@ -113,13 +143,15 @@ class ResolutionResult:
     same_bar: int = 0
     no_intraday: int = 0
     disagreed: int = 0
+    gappy: int = 0
 
     def summary(self) -> str:
         pct = 100 * self.resolved / self.both_touched if self.both_touched else 0.0
         return (
             f"{self.resolved}/{self.both_touched} ambiguous pick-days resolved "
             f"({pct:.0f}%); unresolved: {self.no_intraday} no intraday, "
-            f"{self.same_bar} same bar, {self.disagreed} failed the daily-bar check"
+            f"{self.same_bar} same 5m bar, {self.gappy} gap before the first "
+            f"trigger, {self.disagreed} failed the daily-bar check"
         )
 
 
@@ -175,7 +207,29 @@ def _flatten(data: pd.DataFrame, symbols: list[str]) -> pd.DataFrame:
             sub = data[sym] if isinstance(data.columns, pd.MultiIndex) else data
         except KeyError:
             continue
+        before = len(sub)
         sub = sub.dropna(subset=["Open", "High", "Low", "Close"])
+        # The SAME validity law the daily path enforces (CLAUDE.md): a bar is
+        # usable only if open > 0 and the OHLC ordering holds. An impossible bar
+        # (ENHA 2026-07-24 shape: high below open) would otherwise feed the
+        # trigger comparisons directly. Dropped rows are COUNTED and warned —
+        # silent row loss on the path to a reported number is the failure mode
+        # this project keeps paying for.
+        sub = sub[
+            (sub["Open"] > 0)
+            & (sub["High"] >= sub["Open"])
+            & (sub["High"] >= sub["Close"])
+            & (sub["Low"] <= sub["Open"])
+            & (sub["Low"] <= sub["Close"])
+        ]
+        dropped = before - len(sub)
+        if dropped:
+            logger.warning(
+                "intraday %s: dropped %d of %d bar(s) as null or OHLC-impossible",
+                sym,
+                dropped,
+                before,
+            )
         if sub.empty:
             continue
         idx = pd.DatetimeIndex(sub.index)
@@ -220,40 +274,52 @@ def ingest(
     result = IntradayResult(symbols_requested=len(symbols))
     if not symbols:
         return result
-    span = (end - start).days
-    if span > REQUEST_SPAN_DAYS:
-        raise ValueError(
-            f"{start}..{end} spans {span} days; Yahoo caps a single {INTERVAL} "
-            f"request near {REQUEST_SPAN_DAYS} — chunk the range"
-        )
+    # Yahoo caps a single 5m request near 60 days, so walk the range in windows
+    # rather than rejecting it. Refusing was why `--days 88` — the value the CLI
+    # help advertised — raised, and why the design doc's "60 trading days" was
+    # unreachable (55 calendar is only ~38 trading days).
+    windows: list[tuple[dt.date, dt.date]] = []
+    cursor = start
+    while cursor < end:
+        stop = min(cursor + dt.timedelta(days=REQUEST_SPAN_DAYS), end)
+        windows.append((cursor, stop))
+        cursor = stop
     fetch = downloader or _download
     returned: set[str] = set()
-    for i in range(0, len(symbols), BATCH_SIZE):
-        batch = symbols[i : i + BATCH_SIZE]
-        try:
-            raw = fetch(batch, start, end)
-        except Exception as exc:
-            result.batches_failed += 1
-            logger.error("intraday batch %d-%d failed: %s", i, i + len(batch), exc)
-            continue
-        frame = _flatten(raw, batch)
-        if frame.empty:
-            continue
-        returned.update(frame["symbol"].unique().tolist())
-        con.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS _intraday_stage AS "
-            "SELECT * FROM intraday_prices LIMIT 0"
-        )
-        con.execute("DELETE FROM _intraday_stage")
-        con.register("_intraday_frame", frame)
-        con.execute("INSERT INTO _intraday_stage SELECT * FROM _intraday_frame")
-        con.unregister("_intraday_frame")
-        con.execute(
-            "DELETE FROM intraday_prices WHERE (symbol, ts, interval) IN "
-            "(SELECT symbol, ts, interval FROM _intraday_stage)"
-        )
-        con.execute("INSERT INTO intraday_prices SELECT * FROM _intraday_stage")
-        result.rows += len(frame)
+    for win_start, win_end in windows:
+        for i in range(0, len(symbols), BATCH_SIZE):
+            batch = symbols[i : i + BATCH_SIZE]
+            try:
+                raw = fetch(batch, win_start, win_end)
+            except Exception as exc:
+                result.batches_failed += 1
+                logger.error(
+                    "intraday batch %d-%d %s..%s failed: %s",
+                    i,
+                    i + len(batch),
+                    win_start,
+                    win_end,
+                    exc,
+                )
+                continue
+            frame = _flatten(raw, batch)
+            if frame.empty:
+                continue
+            returned.update(frame["symbol"].unique().tolist())
+            con.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS _intraday_stage AS "
+                "SELECT * FROM intraday_prices LIMIT 0"
+            )
+            con.execute("DELETE FROM _intraday_stage")
+            con.register("_intraday_frame", frame)
+            con.execute("INSERT INTO _intraday_stage SELECT * FROM _intraday_frame")
+            con.unregister("_intraday_frame")
+            con.execute(
+                "DELETE FROM intraday_prices WHERE (symbol, ts, interval) IN "
+                "(SELECT symbol, ts, interval FROM _intraday_stage)"
+            )
+            con.execute("INSERT INTO intraday_prices SELECT * FROM _intraday_stage")
+            result.rows += len(frame)
     result.symbols_returned = len(returned)
     result.symbols_empty = [s for s in symbols if s not in returned]
     if result.symbols_empty:
@@ -365,8 +431,34 @@ def resolve(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> ResolutionRe
                        ON i.symbol = a.symbol AND i.date = a.date
                       AND i.interval = '{INTERVAL}'
                 GROUP BY a.symbol, a.date, ag.agrees
+            ),
+            -- CONTIGUITY. Reproducing the day's extremes proves the record saw
+            -- both triggers; it does NOT prove it saw them FIRST. A no-trade gap
+            -- before the earlier trigger biases that timestamp LATE by an
+            -- unbounded amount, and the verdict flips whenever the two lateness
+            -- amounts differ — quant-skeptic inverted a verdict this way while
+            -- the agreement gate reported success. Only bars up to the EARLIER
+            -- trigger can change the answer, so require the record to be
+            -- unbroken from the session open through that bar: then no missing
+            -- bar could have carried the other trigger earlier, and the
+            -- ordering is proven rather than inferred. Anchored at 09:30, not
+            -- at the first recorded bar — a name that did not trade at the open
+            -- has an unobserved window that could contain either trigger.
+            span AS (
+                SELECT h.symbol, h.date, h.agrees, h.limit_ts, h.stop_ts,
+                       least(h.limit_ts, h.stop_ts) AS first_ts,
+                       (SELECT count(*) FROM intraday_prices b
+                         WHERE b.symbol = h.symbol AND b.date = h.date
+                           AND b.interval = '{INTERVAL}'
+                           AND b.ts <= least(h.limit_ts, h.stop_ts)) AS bars_before
+                FROM hits h
             )
-            SELECT symbol, date, agrees, limit_ts, stop_ts FROM hits
+            SELECT symbol, date, agrees, limit_ts, stop_ts,
+                   bars_before,
+                   CASE WHEN first_ts IS NULL THEN NULL ELSE
+                        date_diff('minute', date + INTERVAL '{SESSION_OPEN_MINUTES}' MINUTE,
+                                  first_ts) / {BAR_MINUTES} + 1 END AS bars_expected
+            FROM span
         """,
             [_LIMIT],
         ).fetchdf()
@@ -390,6 +482,19 @@ def resolve(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> ResolutionRe
             continue
         if row.limit_ts == row.stop_ts:
             out.same_bar += 1
+            continue
+        # Contiguity from the open through the EARLIER trigger. Without it the
+        # record can reproduce both extremes yet still be missing the bar that
+        # actually carried the first trigger, which silently INVERTS the verdict
+        # (quant-skeptic finding 2). Only bars up to the earlier trigger matter:
+        # if none are missing there, no unseen bar could have fired the other
+        # trigger sooner.
+        if (
+            pd.isna(row.bars_expected)
+            or row.bars_before < row.bars_expected
+            or row.bars_expected <= 0
+        ):
+            out.gappy += 1
             continue
         verdicts.append(
             {

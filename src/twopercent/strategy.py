@@ -108,6 +108,29 @@ def pick_return_band(
     raise ValueError(f"unknown exit-rule strategy: {strategy!r}")
 
 
+def path_note(prefix: str, s: dict | None) -> str | None:
+    """Coverage disclosure for a collapsed band — mirror of JS tpMath.pathNote().
+
+    Rendered beside the number it qualifies, for the SELECTED basket and window.
+    A static server-side note would describe a different selection than the one
+    on screen and would be destroyed by the first selector change.
+    """
+    if not s or not s.get("amb"):
+        return None
+    amb, res = s["amb"], s["res"]
+    if not res:
+        return (
+            f"{prefix}: 0 of {amb} both-triggered picks resolved "
+            "— every band below is the daily worst/best case"
+        )
+    pct = round(100 * res / amb)
+    return (
+        f"{prefix}: {res} of {amb} both-triggered picks ({pct}%) ordered from 5m "
+        "bars; the rest stay a worst/best band. A collapsed band is conditional "
+        "on that replay, not proven from daily bars, and resolvable days skew liquid."
+    )
+
+
 def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
     """Compounded gross growth + pick win rates of an exit rule over payload days.
 
@@ -132,6 +155,7 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
     """
     growth_w = growth_b = 1.0
     wins_w = wins_b = n_picks = 0
+    amb_n = res_n = 0
     short = subst = missing = corrupt = 0
     for day in days:
         picks = day["picks"][:n]
@@ -150,12 +174,20 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
         # so a partially-corrupt day can never leak ghost wins into the rate
         # (numerator without its denominator — reviewer finding, PR #77).
         day_wins_w = day_wins_b = 0
+        day_amb = day_res = 0
         ok = True
         for p in picks:
             # p[5] is the intraday verdict; absent on payloads written before
             # #79, which must keep rendering as the unresolved band rather than
             # raising or silently reading as "resolved".
             seq = p[5] if len(p) > 5 else None
+            # Ambiguity/resolution tallies for the disclosure: a band is a point
+            # here ONLY because the intraday replay ordered the two triggers, so
+            # the page must be able to say how much of the selection that covers.
+            if bool(p[4]) and stop_triggered(p[2]):
+                day_amb += 1
+                if seq in (SEQ_LIMIT_FIRST, SEQ_STOP_FIRST):
+                    day_res += 1
             worst, best = pick_return_band(strategy, p[2], p[3], bool(p[4]), seq)
             if not (math.isfinite(worst) and math.isfinite(best)):
                 ok = False
@@ -171,6 +203,8 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
             continue
         wins_w += day_wins_w
         wins_b += day_wins_b
+        amb_n += day_amb
+        res_n += day_res
         n_picks += len(picks)
         growth_w *= 1 + sum_w / len(picks)
         growth_b *= 1 + sum_b / len(picks)
@@ -180,6 +214,8 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
         "gb": growth_b if clean else float("nan"),
         "ww": wins_w / n_picks if n_picks else float("nan"),
         "wb": wins_b / n_picks if n_picks else float("nan"),
+        "amb": amb_n,
+        "res": res_n,
         "picks": n_picks,
         "days": len(days),
         "clean": clean,

@@ -723,7 +723,7 @@ def latest_experiment_daily(
     seq, run_ts, params, test_start, test_end = row
     daily = con.execute(
         """
-        SELECT target_date, rank, ret, hit, oh, ol
+        SELECT target_date, rank, ret, hit, oh, ol, symbol
         FROM experiment_daily WHERE seq = ? ORDER BY target_date, rank
         """,
         [seq],

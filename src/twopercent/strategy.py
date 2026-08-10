@@ -69,7 +69,12 @@ def stop_triggered(ol: float) -> bool:
 
 
 def pick_return_band(
-    strategy: str, ol: float, oc: float, filled: bool, seq: int | None = None
+    strategy: str,
+    ol: float,
+    oc: float,
+    filled: bool,
+    seq: int | None = None,
+    fill: float | None = None,
 ) -> tuple[float, float]:
     """(worst, best) day return of one pick under an exit rule, buy-at-open.
 
@@ -94,14 +99,25 @@ def pick_return_band(
         return (ret, ret)
     if strategy == "limit_stop":
         stopped = stop_triggered(ol)
+        # `fill` is the MEASURED stop exit (intraday.stop_fills). CLAMPED at the
+        # trigger: a stop-market order fills within seconds at or below -1%, but
+        # the proxy is the next 5m bar's open, up to five minutes later, so it
+        # prices in any bounce that followed the air pocket. Unclamped, HALF the
+        # measured fills came out better than the trigger and 17% were GAINS --
+        # a stopped pick booking a profit, and the "worst-case" win rate jumping
+        # +20pp from a change advertised as a conservatism fix (quant-skeptic).
+        # min() keeps the change monotone in the direction it claims.
+        exit_ret = STOP_LEVEL if fill is None else min(fill, STOP_LEVEL)
         if filled and stopped:
             if seq == SEQ_LIMIT_FIRST:
                 return (LIMIT_PROFIT, LIMIT_PROFIT)
             if seq == SEQ_STOP_FIRST:
-                return (STOP_LEVEL, STOP_LEVEL)
-            return (STOP_LEVEL, LIMIT_PROFIT)
+                return (exit_ret, exit_ret)
+            # Order unknown: worst is the stop exit (at or below the trigger,
+            # so always below the limit), best is the limit.
+            return (exit_ret, LIMIT_PROFIT)
         if stopped:
-            return (STOP_LEVEL, STOP_LEVEL)
+            return (exit_ret, exit_ret)
         if filled:
             return (LIMIT_PROFIT, LIMIT_PROFIT)
         return (oc, oc)
@@ -134,6 +150,30 @@ def path_note(prefix: str, s: dict | None) -> str | None:
     )
 
 
+def fill_note(prefix: str, s: dict | None) -> str | None:
+    """Measured-vs-assumed stop-exit coverage — mirror of JS tpMath.fillNote().
+
+    The −1% fallback is optimistic (a stop is a trigger, not a fill), so a cell
+    where most stopped picks fall back reads better than one where most are
+    priced. Every fill lives in one recent stretch, so short windows are mostly
+    measured and long ones mostly assumed — a difference a reader would
+    otherwise mistake for the recent stretch genuinely underperforming.
+    """
+    if not s or not s.get("stopped"):
+        return None
+    meas, stopped = s["meas"], s["stopped"]
+    if not meas:
+        return (
+            f"{prefix}: 0 of {stopped} stopped picks priced from 5m bars — all use "
+            "the flat −1% trigger, which is optimistic"
+        )
+    pct = math.floor(100 * meas / stopped + 0.5)
+    return (
+        f"{prefix}: {meas} of {stopped} stopped picks ({pct}%) priced from 5m bars, "
+        "capped at the trigger; the rest assume a flat −1%, which is optimistic"
+    )
+
+
 def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
     """Compounded gross growth + pick win rates of an exit rule over payload days.
 
@@ -159,6 +199,7 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
     growth_w = growth_b = 1.0
     wins_w = wins_b = n_picks = 0
     amb_n = res_n = 0
+    meas_n = stopped_n = 0
     short = subst = missing = corrupt = 0
     for day in days:
         picks = day["picks"][:n]
@@ -178,12 +219,14 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
         # (numerator without its denominator — reviewer finding, PR #77).
         day_wins_w = day_wins_b = 0
         day_amb = day_res = 0
+        day_meas = day_stopped = 0
         ok = True
         for p in picks:
             # p[5] is the intraday verdict; absent on payloads written before
             # #79, which must keep rendering as the unresolved band rather than
             # raising or silently reading as "resolved".
             seq = p[5] if len(p) > 5 else None
+            fill = p[6] if len(p) > 6 else None
             # Ambiguity/resolution tallies for the disclosure: a band is a point
             # here ONLY because the intraday replay ordered the two triggers, so
             # the page must be able to say how much of the selection that covers.
@@ -191,7 +234,16 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
                 day_amb += 1
                 if seq in (SEQ_LIMIT_FIRST, SEQ_STOP_FIRST):
                     day_res += 1
-            worst, best = pick_return_band(strategy, p[2], p[3], bool(p[4]), seq)
+            # Measured-vs-assumed stop EXITS, for the same selection. Coverage
+            # of fills swings ~13x across the windows the user flips between
+            # (79% at 1 week, 6% at 1 year, because every fill lives in one
+            # recent 22-day stretch), so one frame-wide sentence cannot describe
+            # the cell on screen.
+            if stop_triggered(p[2]):
+                day_stopped += 1
+                if fill is not None:
+                    day_meas += 1
+            worst, best = pick_return_band(strategy, p[2], p[3], bool(p[4]), seq, fill)
             if not (math.isfinite(worst) and math.isfinite(best)):
                 ok = False
                 break
@@ -208,6 +260,8 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
         wins_b += day_wins_b
         amb_n += day_amb
         res_n += day_res
+        meas_n += day_meas
+        stopped_n += day_stopped
         n_picks += len(picks)
         growth_w *= 1 + sum_w / len(picks)
         growth_b *= 1 + sum_b / len(picks)
@@ -219,6 +273,8 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
         "wb": wins_b / n_picks if n_picks else float("nan"),
         "amb": amb_n,
         "res": res_n,
+        "meas": meas_n,
+        "stopped": stopped_n,
         "picks": n_picks,
         "days": len(days),
         "clean": clean,

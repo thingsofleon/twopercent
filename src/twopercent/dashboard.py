@@ -739,10 +739,12 @@ def _payload_days(frame: pd.DataFrame, bases: dict, late: bool = False) -> list[
     # frame carries it — reading that column as a verdict would feed ids like
     # 42 into pickBand.
     has_seq = "path" in frame.columns
+    has_fill = "fill" in frame.columns
     for d, grp in frame.groupby("target_date"):
         day = pd.Timestamp(d).date()
         base = bases.get(day)
         seqs = grp["path"] if has_seq else [None] * len(grp)
+        fills = grp["fill"] if has_fill else [None] * len(grp)
         entry = {
             "d": str(day),
             "base": round(float(base), 6) if base is not None else None,
@@ -754,9 +756,17 @@ def _payload_days(frame: pd.DataFrame, bases: dict, late: bool = False) -> list[
                     _payload_num(oc),
                     int(hit),
                     None if seq is None or pd.isna(seq) else int(seq),
+                    _payload_num(fill),
                 ]
-                for rank, oh, ol, oc, hit, seq in zip(
-                    grp["rank"], grp["oh"], grp["ol"], grp["oc"], grp["hit"], seqs, strict=True
+                for rank, oh, ol, oc, hit, seq, fill in zip(
+                    grp["rank"],
+                    grp["oh"],
+                    grp["ol"],
+                    grp["oc"],
+                    grp["hit"],
+                    seqs,
+                    fills,
+                    strict=True,
                 )
             ],
         }
@@ -807,6 +817,47 @@ def _attach_paths(con, frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
         how="left",
     ).rename(columns={"seq": "path"})
     return merged, f"path resolution: {res.summary()}"
+
+
+def _attach_fills(con, frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+    """Merge the MEASURED stop exit onto each pick, plus a coverage disclosure.
+
+    Absent means "not measurable", and pick_return_band falls back to the -1%
+    trigger — never a silent zero, and never a fabricated fill.
+
+    The note is required for the same reason _attach_paths' is: an equity curve
+    that prices some exits from bars and others from an assumption is two
+    accountings stitched together, and 5m retention means the measured segment
+    is always the RECENT one — precisely the segment anyone reads to ask "is it
+    still working". Without the date range on the page, a regime change and an
+    accounting change are indistinguishable.
+    """
+    if frame.empty:
+        return frame, None
+    if "symbol" not in frame.columns:
+        return frame, (
+            "stop exits: UNAVAILABLE — these rows carry no symbol, so every stopped "
+            "pick uses the flat −1% trigger"
+        )
+    pairs = frame[["symbol", "target_date"]].rename(columns={"target_date": "date"}).dropna()
+    if pairs.empty:
+        return frame, None
+    fills = intraday.stop_fills(con, pairs)
+    if fills.empty:
+        return frame, (
+            "stop exits: none measurable — every stopped pick uses the flat −1% "
+            "trigger, which is optimistic (a stop fills at the next available price)"
+        )
+    merged = frame.merge(
+        fills.rename(columns={"date": "target_date"}), on=["symbol", "target_date"], how="left"
+    )
+    lo = pd.Timestamp(fills["date"].min()).date()
+    hi = pd.Timestamp(fills["date"].max()).date()
+    return merged, (
+        f"stop exits: {len(fills)} session(s) priced from 5m bars ({lo} to {hi}); "
+        "stopped picks outside that range fall back to the flat −1% trigger, which "
+        "is optimistic. Measured and assumed exits are mixed in one curve"
+    )
 
 
 def _summarize_days(days: list[dict], n: int) -> dict:
@@ -1004,9 +1055,10 @@ def _strategy_state(
     # and the first client repaint say the same thing.
     if strat == "limit_stop":
         for prefix, state in (("SIM", sim_s), ("LIVE", live_s)):
-            note = strategy.path_note(prefix, state)
-            if note:
-                notes.append(note)
+            for builder in (strategy.path_note, strategy.fill_note):
+                note = builder(prefix, state)
+                if note:
+                    notes.append(note)
     return sim_s, live_s, notes
 
 
@@ -1112,13 +1164,16 @@ def _strategy_card(
         "were real, this could be a loss. The LIVE row is the honest number — real "
         "logged picks, real outcomes, survivorship-free — but a small sample.</p>"
         '<p class="sub">All returns are gross — before trading costs (not estimated). '
-        "Limit and stop fills are assumed at exactly the trigger price — for the "
-        "stop that is optimistic, since a stop fills at the next available price, "
-        "not at the trigger. A glitch-suspect high never counts as a fill. For the "
-        "limit+stop rule, when both could fill on the same day, 5-minute bars "
-        "decide which came first where the record is complete enough to prove it; "
-        "everywhere else the result stays a best case / worst case band, because "
-        "daily bars carry no clock.</p>"
+        "The +2% limit is assumed to fill at exactly its trigger. The −1% stop is "
+        "NOT: a stop becomes a market order, so where 5-minute bars allow it the "
+        "exit is priced from the next bar's open, capped at the trigger (a stop "
+        "cannot fill above it), and falls back to a flat −1% where it cannot be "
+        "priced — the coverage line below states how much of the SELECTED window "
+        "is which. A glitch-suspect high never counts as a fill. For the limit+stop "
+        "rule, when both could fill on the same day, "
+        "5-minute bars decide which came first where the record is complete enough "
+        "to prove it; everywhere else the result stays a best case / worst case "
+        "band, because daily bars carry no clock.</p>"
         + reasons
         + f'<p class="sub" id="tp-strat-note">{html.escape(" · ".join(notes))}</p></div>'
     )
@@ -1207,19 +1262,22 @@ _JS_MATH = """
 var tpMath = (function () {
   var LIMIT = __LIMIT__, STOP = __STOP__, EPS = __EPS__;
   var SEQ_LIMIT_FIRST = __SEQ_LIMIT__, SEQ_STOP_FIRST = __SEQ_STOP__;
-  function pickBand(strat, ol, oc, filled, seq) {
+  function pickBand(strat, ol, oc, filled, seq, fill) {
     if (strat === "hold_close") return [oc, oc];
     if (strat === "limit_2pct") { var r = filled ? LIMIT : oc; return [r, r]; }
     if (strat === "limit_stop") {
       var stopped = ol <= STOP + EPS;
+      // fill is the MEASURED stop exit, CLAMPED at the trigger: the proxy is
+      // the next bar's open and would otherwise price in a post-breach bounce.
+      var exitRet = (fill === null || fill === undefined) ? STOP : Math.min(fill, STOP);
       if (filled && stopped) {
         // seq is the intraday verdict: which trigger came first. Without it a
         // daily bar cannot tell, so the band stays open.
         if (seq === SEQ_LIMIT_FIRST) return [LIMIT, LIMIT];
-        if (seq === SEQ_STOP_FIRST) return [STOP, STOP];
-        return [STOP, LIMIT];
+        if (seq === SEQ_STOP_FIRST) return [exitRet, exitRet];
+        return [exitRet, LIMIT];
       }
-      if (stopped) return [STOP, STOP];
+      if (stopped) return [exitRet, exitRet];
       if (filled) return [LIMIT, LIMIT];
       return [oc, oc];
     }
@@ -1251,7 +1309,7 @@ var tpMath = (function () {
   }
   function stratSummarize(days, n, strat) {
     var gw = 1, gb = 1, winsW = 0, winsB = 0, picksN = 0;
-    var ambN = 0, resN = 0;
+    var ambN = 0, resN = 0, measN = 0, stoppedN = 0;
     var shortDays = 0, substDays = 0, missing = 0, corrupt = 0;
     for (var i = 0; i < days.length; i++) {
       var picks = days[i].picks.slice(0, n);
@@ -1265,9 +1323,10 @@ var tpMath = (function () {
       if (miss) { missing += 1; continue; }
       if (!picks.length) { corrupt += 1; continue; }
       var sumW = 0, sumB = 0, dayWinsW = 0, dayWinsB = 0, ok = true;
-      var dayAmb = 0, dayRes = 0;
+      var dayAmb = 0, dayRes = 0, dayMeas = 0, dayStopped = 0;
       for (j = 0; j < picks.length; j++) {
         var pseq = picks[j].length > 5 ? picks[j][5] : null;
+        var pfill = picks[j].length > 6 ? picks[j][6] : null;
         // Ambiguous = both triggers touched, i.e. the band is only a point if
         // the intraday replay ordered them. Counted for the SELECTED basket and
         // window so the disclosure matches the number on screen.
@@ -1275,7 +1334,11 @@ var tpMath = (function () {
           dayAmb += 1;
           if (pseq === SEQ_LIMIT_FIRST || pseq === SEQ_STOP_FIRST) dayRes += 1;
         }
-        var band = pickBand(strat, picks[j][2], picks[j][3], !!picks[j][4], pseq);
+        if (picks[j][2] <= STOP + EPS) {
+          dayStopped += 1;
+          if (pfill !== null && pfill !== undefined) dayMeas += 1;
+        }
+        var band = pickBand(strat, picks[j][2], picks[j][3], !!picks[j][4], pseq, pfill);
         if (!isFinite(band[0]) || !isFinite(band[1])) { ok = false; break; }
         sumW += band[0]; sumB += band[1];
         if (band[0] > 0) dayWinsW += 1;
@@ -1286,6 +1349,8 @@ var tpMath = (function () {
       winsB += dayWinsB;
       ambN += dayAmb;
       resN += dayRes;
+      measN += dayMeas;
+      stoppedN += dayStopped;
       picksN += picks.length;
       gw *= 1 + sumW / picks.length;
       gb *= 1 + sumB / picks.length;
@@ -1293,7 +1358,7 @@ var tpMath = (function () {
     var clean = days.length - missing - corrupt;
     return { gw: clean ? gw : NaN, gb: clean ? gb : NaN,
              ww: picksN ? winsW / picksN : NaN, wb: picksN ? winsB / picksN : NaN,
-             amb: ambN, res: resN,
+             amb: ambN, res: resN, meas: measN, stopped: stoppedN,
              picks: picksN, days: days.length, clean: clean,
              shortDays: shortDays, substDays: substDays, baseDays: 0,
              missing: missing, corrupt: corrupt };
@@ -1313,6 +1378,17 @@ var tpMath = (function () {
            "%) ordered from 5m bars; the rest stay a worst/best band. A collapsed " +
            "band is conditional on that replay, not proven from daily bars, and " +
            "resolvable days skew liquid.";
+  }
+  function fillNote(prefix, s) {
+    if (!s || !s.stopped) return null;
+    if (!s.meas) {
+      return prefix + ": 0 of " + s.stopped + " stopped picks priced from 5m bars " +
+             "\u2014 all use the flat \u22121% trigger, which is optimistic";
+    }
+    var pct = Math.floor(100 * s.meas / s.stopped + 0.5);
+    return prefix + ": " + s.meas + " of " + s.stopped + " stopped picks (" + pct +
+           "%) priced from 5m bars, capped at the trigger; the rest assume a flat " +
+           "\u22121%, which is optimistic";
   }
   function rowNotes(prefix, s, n) {
     var notes = [];
@@ -1351,7 +1427,8 @@ var tpMath = (function () {
     return "No strategy result to translate yet \\u2014 see the notes below.";
   }
   return { pickBand: pickBand, summarize: summarize, stratSummarize: stratSummarize,
-           rowNotes: rowNotes, pathNote: pathNote, growthText: growthText, winText: winText,
+           rowNotes: rowNotes, pathNote: pathNote, fillNote: fillNote,
+           growthText: growthText, winText: winText,
            becameText: becameText, readText: readText };
 })();
 </script>
@@ -1486,6 +1563,10 @@ _JS = """
       if (pn) notes.push(pn);
       var pl = tpMath.pathNote("LIVE", liveS);
       if (pl) notes.push(pl);
+      var fs = tpMath.fillNote("SIM", simS);
+      if (fs) notes.push(fs);
+      var fl = tpMath.fillNote("LIVE", liveS);
+      if (fl) notes.push(fl);
     }
     setStratRow("strat-sim", simS);
     setStratRow("strat-live", liveS);
@@ -1659,6 +1740,9 @@ def build_html(
         sim_frame, note = _attach_paths(con, sim[1].rename(columns={"ret": "oc"}))
         if note:
             path_notes.append(f"SIM {note}")
+        sim_frame, fill_note = _attach_fills(con, sim_frame)
+        if fill_note:
+            path_notes.append(f"SIM {fill_note}")
         sim_days = _payload_days(sim_frame, bases)
     else:
         sim_days = []
@@ -1669,6 +1753,9 @@ def build_html(
         )
         if note:
             path_notes.append(f"LIVE {note}")
+        live_frame, fill_note = _attach_fills(con, live_frame)
+        if fill_note:
+            path_notes.append(f"LIVE {fill_note}")
         live_days = _payload_days(live_frame, bases, late=True)
     else:
         live_days = []

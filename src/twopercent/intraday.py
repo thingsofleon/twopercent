@@ -555,3 +555,118 @@ def resolve(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> ResolutionRe
         out.frame = pd.DataFrame(verdicts, columns=["symbol", "date", "seq"])
     logger.info("intraday resolution: %s", out.summary())
     return out
+
+
+def stop_fills(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> pd.DataFrame:
+    """Measured stop EXIT return per (symbol, date), or absent when unmeasurable.
+
+    strategy.pick_return_band books a stopped pick at exactly -1%, which is the
+    trigger, not a fill: a stop becomes a market order and executes at the next
+    available price (#86). That assumption is optimistic by construction, and
+    the band's lower edge was therefore not a worst case.
+
+    The proxy is the OPEN OF THE NEXT 5m BAR after the trigger. Measured by
+    running THIS function, on data/twopercent.duckdb as of 2026-08-10, over the
+    pairs from:
+
+        SELECT DISTINCT symbol, date FROM daily_returns
+        WHERE isfinite(low_return) AND low_return <= -0.01 + 1e-9
+
+    -> 6,968 sessions survive all three gates:
+
+        mean -1.01%   median -1.02%   p10 -2.49%   max +16.78%
+        49.2% land BETTER than the trigger, 17.0% are outright gains
+        after the clamp in strategy.pick_return_band: mean -1.49%
+
+    Quote those numbers only with that query and that store. Two earlier
+    revisions of this docstring got the provenance wrong in two different ways:
+    the first cited an UNGATED population (8,589 sessions), the second was
+    measured against a PARTIAL copy of the store holding 126 symbols instead of
+    504 (2,712 sessions). Both were plausible and both were wrong, which is why
+    the query and the file now sit next to the figures.
+
+    The adjacency gate costs 2.0% of coverage (7,112 -> 6,968), not the large
+    share an earlier note guessed at.
+
+    The next bar's open is the first price at which a market order sent at the
+    trigger could plausibly print, so it is preferred over the trigger bar's
+    close (which is up to 5 minutes of further drift) and over the trigger bar's
+    low (the worst tick of the bar, which no order is guaranteed). But it is up
+    to five minutes AFTER the breach, so it prices in any bounce: ungated, half
+    of these come out BETTER than the trigger and 17% are gains. A stop-market
+    order cannot fill above its trigger, so strategy.pick_return_band CLAMPS the
+    measured exit at STOP_LEVEL. Read these numbers as the distribution of a
+    proxy, not of realised fills.
+
+    Only sessions that pass the SAME gates as ordering are used: the record must
+    reproduce the daily bar's extremes, and it must be unbroken from the open
+    through the stop bar (a gap before it means the real trigger may have been
+    earlier, at a price we never saw). The next bar must also be the adjacent
+    SLOT. A trigger in the final bar is left unmeasured. Everything unmeasured
+    keeps the -1% assumption, labelled — never silently mixed in as observed.
+    """
+    empty = pd.DataFrame(columns=["symbol", "date", "fill"])
+    if pairs.empty:
+        return empty
+    pairs = pairs[["symbol", "date"]].drop_duplicates().copy()
+    pairs["date"] = pd.to_datetime(pairs["date"]).dt.date
+    con.register("_fill_pairs", pairs)
+    try:
+        return con.execute(f"""
+            WITH want AS (
+                SELECT DISTINCT symbol, CAST(date AS DATE) AS date FROM _fill_pairs
+            ),
+            stopped AS (
+                SELECT w.symbol, w.date, d.open
+                FROM want w
+                JOIN daily_returns d ON d.symbol = w.symbol AND d.date = w.date
+                WHERE isfinite(d.low_return) AND d.low_return <= {_STOP}
+            ),
+            agree AS ({session_agreement_sql()}),
+            trig AS (
+                SELECT s.symbol, s.date, s.open,
+                       min(CASE WHEN isfinite(i.low)
+                                 AND (i.low - s.open) / s.open <= {_STOP}
+                                THEN i.ts END) AS stop_ts
+                FROM stopped s
+                JOIN agree ag ON ag.symbol = s.symbol AND ag.date = s.date AND ag.agrees
+                JOIN intraday_prices i
+                  ON i.symbol = s.symbol AND i.date = s.date AND i.interval = '{INTERVAL}'
+                GROUP BY s.symbol, s.date, s.open
+            ),
+            gated AS (
+                SELECT t.*,
+                       (SELECT count(DISTINCT
+                            date_diff('minute',
+                                      t.date + INTERVAL '{SESSION_OPEN_MINUTES}' MINUTE,
+                                      b.ts) / {BAR_MINUTES})
+                          FROM intraday_prices b
+                         WHERE b.symbol = t.symbol AND b.date = t.date
+                           AND b.interval = '{INTERVAL}'
+                           AND b.ts >= t.date + INTERVAL '{SESSION_OPEN_MINUTES}' MINUTE
+                           AND b.ts <= t.stop_ts) AS bars_before,
+                       date_diff('minute',
+                                 t.date + INTERVAL '{SESSION_OPEN_MINUTES}' MINUTE,
+                                 t.stop_ts) / {BAR_MINUTES} + 1 AS bars_expected
+                FROM trig t
+                WHERE t.stop_ts IS NOT NULL
+            )
+            SELECT g.symbol, g.date, (nxt.open - g.open) / g.open AS fill
+            FROM gated g
+            JOIN intraday_prices nxt
+              ON nxt.symbol = g.symbol AND nxt.date = g.date AND nxt.interval = '{INTERVAL}'
+             AND nxt.ts = (SELECT min(z.ts) FROM intraday_prices z
+                            WHERE z.symbol = g.symbol AND z.date = g.date
+                              AND z.interval = '{INTERVAL}' AND z.ts > g.stop_ts)
+            WHERE g.bars_before >= g.bars_expected AND g.bars_expected > 0
+              -- ADJACENCY. "Next bar" must be the NEXT SLOT, not merely the next
+              -- print. 2% of sessions have a hole after the trigger (max 140
+              -- minutes), and on a name that stops trading after the breach the
+              -- following print is the least fill-like price available -- on
+              -- exactly the illiquid names #86 was about. The contiguity gate
+              -- covers only what happens BEFORE the trigger.
+              AND date_diff('minute', g.stop_ts, nxt.ts) = {BAR_MINUTES}
+              AND isfinite(nxt.open) AND nxt.open > 0 AND g.open > 0
+        """).fetchdf()
+    finally:
+        con.unregister("_fill_pairs")

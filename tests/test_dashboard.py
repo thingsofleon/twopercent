@@ -495,19 +495,19 @@ def test_dashboard_explorer_payload_json(modeled, tmp_path):
     assert len(payload["sim"]) == 6
     day0 = payload["sim"][0]
     assert day0["d"] == "2026-01-05"
-    # Each pick is [rank, oh, ol, oc, hit, path] — raw outcome returns, the
+    # Each pick is [rank, oh, ol, oc, hit, path, fill] — raw outcome returns, the
     # guarded touch/fill flag, and the intraday path verdict; growth is DERIVED
     # in lockstep, never shipped as dollars. path is null here because no
     # intraday bars are ingested: the band must stay open, never default to a
     # resolved ordering (#79).
     # Hand-check day 0: (i + rank) % 5 == 0 at rank 5 → that one is not a reacher.
     assert day0["picks"] == [
-        [1, 0.0231, -0.0009, 0.0203, 1, None],
-        [2, 0.0231, -0.0009, 0.0203, 1, None],
-        [3, 0.0231, -0.0009, 0.0203, 1, None],
-        [4, 0.0231, -0.0009, 0.0203, 1, None],
-        [5, 0.0042, -0.0117, -0.0117, 0, None],
-        [6, 0.0231, -0.0009, 0.0203, 1, None],
+        [1, 0.0231, -0.0009, 0.0203, 1, None, None],
+        [2, 0.0231, -0.0009, 0.0203, 1, None, None],
+        [3, 0.0231, -0.0009, 0.0203, 1, None, None],
+        [4, 0.0231, -0.0009, 0.0203, 1, None, None],
+        [5, 0.0042, -0.0117, -0.0117, 0, None, None],
+        [6, 0.0231, -0.0009, 0.0203, 1, None, None],
     ]
     # Base rate on 2026-01-05: 4 runners of 8 names reached ≥2%.
     assert abs(day0["base"] - 0.5) < 1e-9
@@ -517,10 +517,10 @@ def test_dashboard_explorer_payload_json(modeled, tmp_path):
     live0 = payload["live"][0]
     assert live0["late"] is True  # backfilled save, created after the target open
     assert [p[0] for p in live0["picks"]] == sorted(p[0] for p in live0["picks"])
-    assert all(len(p) == 6 for p in live0["picks"])
+    assert all(len(p) == 7 for p in live0["picks"])
     # Nothing is path-resolved without intraday bars — every verdict stays null,
     # so every band stays open (#79).
-    assert all(p[5] is None for p in live0["picks"])
+    assert all(p[5] is None and p[6] is None for p in live0["picks"])
     assert all(p[1] is not None and p[2] is not None and p[3] is not None for p in live0["picks"])
 
 
@@ -536,12 +536,12 @@ def test_dashboard_explorer_too_few_sim_days_says_so(modeled, tmp_path):
     assert "The live record above is the clean test." in content
 
 
-def _pick(rank, hit, oh=0.021, ol=-0.002, oc=0.005, path=None):
-    """A payload pick [rank, oh, ol, oc, hit, path] with harmless defaults.
+def _pick(rank, hit, oh=0.021, ol=-0.002, oc=0.005, path=None, fill=None):
+    """A payload pick [rank, oh, ol, oc, hit, path, fill] with harmless defaults.
 
     `path` is the intraday verdict (#79); None means unresolved, which is what
     every pick was before intraday ingestion existed."""
-    return [rank, oh, ol, oc, hit, path]
+    return [rank, oh, ol, oc, hit, path, fill]
 
 
 def test_summarize_days_first_available_substitution_and_short_days():
@@ -708,7 +708,7 @@ def test_strategy_card_framing_stamps_and_gross_labels(modeled, tmp_path):
     assert "before trading costs (not estimated)" in strat_block
     assert "daily bars carry no clock" in strat_block
     # The stop's fill-at-trigger assumption is optimistic and must say so (#86).
-    assert "not at the trigger" in strat_block
+    assert "a stop becomes a market order" in strat_block
     assert "glitch-suspect high never counts as a fill" in strat_block
 
 
@@ -845,6 +845,26 @@ def test_strategy_lockstep_python_vs_node():
         # A pre-#79 pick with only 5 elements must still parse as unresolved on
         # BOTH sides rather than raising or reading index 5 as resolved.
         {"d": "g", "base": 0.3, "picks": [[1, 0.03, -0.03, 0.01, 1]]},
+        # Measured stop exits (#86), including one WORSE than the -1% trigger --
+        # the case that made the old band's lower edge not a worst case, and the
+        # one where min(exit, LIMIT) has to keep worst <= best.
+        {
+            "d": "i",
+            "base": 0.3,
+            "picks": [
+                _pick(1, 1, ol=-0.04, oc=-0.03, fill=-0.031),
+                _pick(2, 1, ol=-0.04, oc=-0.03, path=strategy.SEQ_STOP_FIRST, fill=-0.026),
+                _pick(3, 0, ol=-0.04, oc=-0.03, fill=-0.019),
+                # Fills BETTER than the trigger: half of the real measured
+                # population. The clamp must stop these booking a profit -- and
+                # a stopped pick must never count as a win.
+                _pick(4, 0, ol=-0.04, oc=-0.03, fill=0.031),
+                _pick(5, 1, ol=-0.04, oc=0.01, fill=0.031),
+                _pick(6, 1, ol=-0.04, oc=0.01, path=strategy.SEQ_STOP_FIRST, fill=0.008),
+            ],
+        },
+        # The stored payload shape between #79 and #86: 6 elements, no fill.
+        {"d": "j", "base": 0.3, "picks": [[1, 0.03, -0.03, 0.01, 1, None]]},
         # 1 resolved of 8 ambiguous = 12.5%, where Python's half-even round()
         # gives 12% and JS Math.round gives 13% -- the drift class
         # dashboard._pct_half_up already exists for. Pinned here so the
@@ -869,7 +889,8 @@ for (const strat of ["hold_close", "limit_2pct", "limit_stop"]) {{
     const s = tpMath.stratSummarize(days, n, strat);
     out[strat + ":" + n] = [s.gw, s.gb, s.ww, s.wb, s.picks, s.days, s.clean,
                             s.shortDays, s.substDays, s.missing, s.corrupt,
-                            s.amb, s.res, tpMath.pathNote("SIM", s),
+                            s.amb, s.res, s.meas, s.stopped,
+                            tpMath.pathNote("SIM", s), tpMath.fillNote("SIM", s),
                             tpMath.growthText(s), tpMath.winText(s),
                             tpMath.readText(s, null)];
   }}
@@ -906,7 +927,10 @@ console.log(JSON.stringify(out));
                 s["corrupt"],
                 s["amb"],
                 s["res"],
+                s["meas"],
+                s["stopped"],
                 dashboard.strategy.path_note("SIM", s),
+                dashboard.strategy.fill_note("SIM", s),
                 dashboard._growth_text(s),
                 dashboard._win_text(s),
                 dashboard._strategy_read(s, None),
@@ -1082,3 +1106,59 @@ def test_mark_helper_renders_both_states_distinctly():
     assert 'aria-label="reached +2%"' in hit
     assert 'aria-label="did not reach +2%"' in miss
     assert "✓" not in hit and "✗" not in miss
+
+
+def test_measured_stop_fill_reaches_the_payload_end_to_end(modeled, tmp_path):
+    """#86: `_attach_fills` shipped as DEAD CODE — defined, never called.
+
+    Every stopped pick was still booked at −1% while the page claimed the exit
+    was measured from 5m bars, and a prose assertion certified the false claim.
+    Unit tests passed because they called intraday.stop_fills directly. This is
+    the missing test: drive build_html with bars present and demand the fill
+    arrive in the payload.
+    """
+    import datetime as dt
+    import json
+    import re
+
+    dates = sorted(pd.bdate_range("2026-01-05", periods=60).date)
+    predict_for(modeled, "baseline_gbm_v1", signal_date=dates[-3], save=True)
+    target = dates[-2]
+    top = modeled.execute(
+        "SELECT symbol FROM predictions WHERE signal_date = ? ORDER BY rank LIMIT 1", [dates[-3]]
+    ).fetchone()[0]
+    # Daily bar that breaches the −1% stop; intraday reproduces its extremes.
+    modeled.execute(
+        "UPDATE prices SET open = 100, high = 101, low = 97, close = 98 "
+        "WHERE symbol = ? AND date = ?",
+        [top, target],
+    )
+    frame = pd.DataFrame(
+        {
+            "symbol": top,
+            "ts": [dt.datetime.combine(target, dt.time(9, 30 + 5 * i)) for i in range(2)],
+            "date": target,
+            "interval": "5m",
+            "open": [100.0, 97.5],  # fill = the second bar's open = −2.5%
+            "high": [101.0, 98.0],
+            "low": [98.9, 97.0],
+            "close": [99.0, 97.4],
+            "volume": [1000, 1000],
+        }
+    )
+    modeled.register("_fillbars", frame)
+    modeled.execute("INSERT INTO intraday_prices SELECT * FROM _fillbars")
+
+    out = tmp_path / "dash.html"
+    dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5)
+    content = out.read_text()
+    payload = json.loads(
+        re.search(r'<script type="application/json" id="tp-data">(.*?)</script>', content).group(1)
+    )
+
+    day = next(d for d in payload["live"] if d["d"] == str(target))
+    fills = [p[6] for p in day["picks"] if p[6] is not None]
+    assert fills, "a measurable stop exit must reach the payload, not stay in dead code"
+    assert abs(fills[0] - (-0.025)) < 1e-6
+    # And the page must disclose that exits are mixed measured/assumed.
+    assert "stop exits:" in content

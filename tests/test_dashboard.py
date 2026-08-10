@@ -1053,3 +1053,32 @@ def test_resolved_verdict_reaches_the_payload_and_collapses_the_band(modeled, tm
     assert any(p[5] == intraday.LIMIT_FIRST for p in live_day["picks"]), (
         "a resolvable pick must arrive in the payload with its verdict"
     )
+
+
+def test_hit_mark_is_drawn_not_a_font_glyph(modeled, tmp_path):
+    """#90: the emailed PNG showed tofu boxes where the hit/miss mark belongs.
+
+    U+2713/U+2717 have no coverage in the headless Chromium that renders the
+    email body, so recipients saw a box in the at-a-glance "did the top pick
+    work" column. String assertions on the HTML could never catch that, which is
+    exactly why it shipped — so assert the page depends on no font at all here.
+    """
+    dates = sorted(pd.bdate_range("2026-01-05", periods=60).date)
+    predict_for(modeled, "baseline_gbm_v1", signal_date=dates[-3], save=True)
+    predict_for(modeled, "baseline_gbm_v1", signal_date=dates[-2], save=True)
+
+    out = tmp_path / "dash.html"
+    dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5)
+    content = out.read_text()
+
+    assert "✓" not in content and "✗" not in content
+    assert 'aria-label="reached +2%"' in content  # accessible name survives
+    assert 'stroke="currentColor"' in content  # inherits .pos/.neg colour
+
+
+def test_mark_helper_renders_both_states_distinctly():
+    hit, miss = dashboard._mark(True), dashboard._mark(False)
+    assert hit != miss
+    assert 'aria-label="reached +2%"' in hit
+    assert 'aria-label="did not reach +2%"' in miss
+    assert "✓" not in hit and "✗" not in miss

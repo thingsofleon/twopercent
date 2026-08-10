@@ -1073,7 +1073,7 @@ def test_hit_mark_is_drawn_not_a_font_glyph(modeled, tmp_path):
 
     assert "✓" not in content and "✗" not in content
     assert 'aria-label="reached +2%"' in content  # accessible name survives
-    assert "stroke=\"currentColor\"" in content  # inherits .pos/.neg colour
+    assert 'stroke="currentColor"' in content  # inherits .pos/.neg colour
 
 
 def test_mark_helper_renders_both_states_distinctly():

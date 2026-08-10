@@ -53,6 +53,7 @@ def _ingest(con, frame, symbol="AAA"):
         SESSION,
         SESSION + dt.timedelta(days=1),
         downloader=lambda syms, s, e: frame,
+        today=SESSION,  # these sessions are historical; the clamp is provider-relative
     )
 
 
@@ -82,6 +83,7 @@ def test_ingest_reports_symbols_that_returned_nothing(con, caplog):
         SESSION,
         SESSION + dt.timedelta(days=1),
         downloader=lambda syms, s, e: _bars([("09:30", 100.0, 101.0, 99.5, 100.5)]),
+        today=SESSION,
     )
 
     assert result.symbols_empty == ["GHOST"]
@@ -106,7 +108,9 @@ def test_ingest_chunks_a_span_longer_than_one_request(con):
         seen.append((s, e))
         return _bars([("09:30", 100.0, 101.0, 99.5, 100.5)])
 
-    intraday.ingest(con, ["AAA"], SESSION, SESSION + dt.timedelta(days=90), downloader=spy)
+    intraday.ingest(
+        con, ["AAA"], SESSION, SESSION + dt.timedelta(days=90), downloader=spy, today=SESSION
+    )
 
     assert len(seen) == 2  # 90 days -> 55 + 35
     assert seen[0][0] == SESSION
@@ -417,6 +421,41 @@ def test_off_grid_bar_cannot_mask_a_missing_slot(con):
     res = _resolve_one(con)
 
     assert res.resolved == 0 and res.gappy == 1
+
+
+def test_ingest_clamps_a_request_beyond_yahoos_window_and_says_so(con, caplog):
+    """#87: asking beyond the served window returns EMPTY, not an error.
+
+    An unclamped request therefore produced a whole window of "failed" batches
+    on a healthy system, burying the signal that a batch failure is supposed to
+    carry. Clamping is announced — silently shortening the range would be the
+    silent-success shape itself.
+    """
+    _seed_daily(con)
+    seen: list[tuple] = []
+
+    def spy(syms, s, e):
+        seen.append((s, e))
+        return _bars([("09:30", 100.0, 101.0, 99.5, 100.5)])
+
+    today = dt.date.today()
+    intraday.ingest(con, ["AAA"], today - dt.timedelta(days=400), today, downloader=spy)
+
+    assert seen, "the clamped range must still be fetched"
+    assert seen[0][0] == today - dt.timedelta(days=intraday.MAX_LOOKBACK_DAYS)
+    assert "clamping" in caplog.text
+    assert "340 day(s) dropped" in caplog.text
+
+
+def test_ingest_with_nothing_left_after_clamping_is_a_noop(con, caplog):
+    _seed_daily(con)
+    old = dt.date.today() - dt.timedelta(days=400)
+    result = intraday.ingest(
+        con, ["AAA"], old, old + dt.timedelta(days=5), downloader=lambda *a: pytest.fail("fetched")
+    )
+
+    assert result.rows == 0
+    assert "nothing to fetch" in caplog.text
 
 
 # --- #86: the stop books a TRIGGER, not a fill --------------------------------

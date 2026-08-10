@@ -12,6 +12,7 @@ import typer
 
 from twopercent import doctor as doctor_mod
 from twopercent import ingest as ingest_mod
+from twopercent import intraday as intraday_mod
 from twopercent import scan as scan_mod
 from twopercent import store, universe
 from twopercent.compare import compare_verdict as _compare_verdict
@@ -379,7 +380,9 @@ def ingest_cmd(
 @app.command("intraday")
 def intraday_cmd(
     days: int = typer.Option(
-        55, "--days", help="Calendar days back to fetch (Yahoo serves ~88 at 5m)."
+        intraday_mod.MAX_LOOKBACK_DAYS,
+        "--days",
+        help="Calendar days back to fetch (Yahoo serves ~60 at 5m; longer is clamped).",
     ),
     top: int = typer.Option(20, "--top", help="Pick ranks whose symbols to fetch."),
     db: Path = DbOption,
@@ -390,12 +393,10 @@ def intraday_cmd(
     the -1% stop on days the model traded, not the whole universe. Exit codes:
     0 clean, 1 ran with gaps (some symbols returned nothing), 2 failed.
     """
-    from twopercent import intraday as intraday_mod
-
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     con = store.connect(db)
     end = dt.date.today() + dt.timedelta(days=1)
-    start = end - dt.timedelta(days=min(days, intraday_mod.MAX_LOOKBACK_DAYS))
+    start = end - dt.timedelta(days=days)  # ingest clamps and says so
     symbols = [
         r[0]
         for r in con.execute(

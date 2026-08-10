@@ -66,9 +66,13 @@ from twopercent import scan, strategy
 logger = logging.getLogger(__name__)
 
 INTERVAL = "5m"
-# Yahoo serves 5m bars for roughly the last 60 TRADING days (~88 calendar),
-# measured 2026-08-10. Beyond that the API returns an empty frame, not an error.
-MAX_LOOKBACK_DAYS = 88
+# How far back Yahoo actually serves 5m bars for an explicit start/end request:
+# ~60 CALENDAR days. The earlier value of 88 came from measuring `period="60d"`,
+# where Yahoo counts 60 TRADING days (~88 calendar) — a different API path with a
+# different limit. Sending start/end beyond this returns an EMPTY frame, so a
+# request for 88 days produced a whole window of "failed" batches on a healthy
+# system and only ~36 trading days of usable data (#87).
+MAX_LOOKBACK_DAYS = 60
 # Yahoo caps a single 5m request at 60 days; stay under it.
 REQUEST_SPAN_DAYS = 55
 MAX_RETRIES = 3
@@ -274,6 +278,7 @@ def ingest(
     start: dt.date,
     end: dt.date,
     downloader=None,
+    today: dt.date | None = None,
 ) -> IntradayResult:
     """Fetch and upsert 5m bars for `symbols` over [start, end).
 
@@ -286,10 +291,30 @@ def ingest(
     result = IntradayResult(symbols_requested=len(symbols))
     if not symbols:
         return result
+    # Clamp to what Yahoo will actually serve. Asking for more does not fail
+    # loudly at the API — it returns empty frames that look exactly like "this
+    # symbol did not trade", so an unclamped request buries a real signal under
+    # boundary noise. Clamping is announced; silently shortening would be the
+    # very failure this project keeps paying for.
+    # `today` is injectable so tests can exercise real historical sessions: the
+    # clamp is a property of the PROVIDER's rolling window, not of the code.
+    earliest = (today or dt.date.today()) - dt.timedelta(days=MAX_LOOKBACK_DAYS)
+    if start < earliest:
+        logger.warning(
+            "intraday: requested from %s but Yahoo serves only ~%d calendar days "
+            "of %s bars — clamping to %s (%d day(s) dropped)",
+            start,
+            MAX_LOOKBACK_DAYS,
+            INTERVAL,
+            earliest,
+            (earliest - start).days,
+        )
+        start = earliest
+    if start >= end:
+        logger.warning("intraday: nothing to fetch — %s is not before %s", start, end)
+        return result
     # Yahoo caps a single 5m request near 60 days, so walk the range in windows
-    # rather than rejecting it. Refusing was why `--days 88` — the value the CLI
-    # help advertised — raised, and why the design doc's "60 trading days" was
-    # unreachable (55 calendar is only ~38 trading days).
+    # rather than rejecting it.
     windows: list[tuple[dt.date, dt.date]] = []
     cursor = start
     while cursor < end:

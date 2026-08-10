@@ -207,7 +207,7 @@ _INFO_TEXT = {
     "base rate, red missed it. The amber dash marks that day's base rate — the "
     "share of all symbols that reached +2% intraday.",
     "r_day": "The trading day these picks were made for.",
-    "r_pick": "The #1 ranked pick and whether it reached +2% intraday (✓/✗). A † "
+    "r_pick": "The #1 ranked pick and whether it reached +2% intraday (check or cross). A † "
     "means the day was backfilled, not a live forecast.",
     "r_hits": "How many of that day's scored top-N picks reached +2%.",
     "r_hit": "Reachers ÷ picks scored that day. Green beat the market base rate.",
@@ -933,6 +933,25 @@ def _explorer_state(
     return sim_s, live_s, notes
 
 
+def _mark(reached: bool) -> str:
+    """Hit/miss mark as inline SVG, NOT a font glyph.
+
+    U+2713/U+2717 render as tofu boxes in the headless Chromium that produces
+    the emailed PNG — the font simply has no coverage — so every recipient saw
+    a box in the at-a-glance "did the top pick work" column while the HTML
+    looked perfect to string assertions (#90). Drawn strokes depend on nothing
+    but the renderer, and `currentColor` keeps the existing .pos/.neg colours.
+    """
+    path = "M2 6.2 L4.8 9 L10 2.6" if reached else "M2.4 2.4 L9.6 9.6 M9.6 2.4 L2.4 9.6"
+    label = "reached +2%" if reached else "did not reach +2%"
+    return (
+        f'<svg viewBox="0 0 12 12" width="11" height="11" role="img" '
+        f'aria-label="{label}" style="vertical-align:-1px">'
+        f'<path d="{path}" fill="none" stroke="currentColor" stroke-width="1.8" '
+        f'stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    )
+
+
 def _pct_half_up(x: float) -> str:
     """Percent rounded half-UP, matching JS Math.round — Python's :.0% rounds
     half-even (0.125 → "12%") and would visibly flicker to the JS "13%" on the
@@ -1591,17 +1610,16 @@ def build_html(
 
         def _pick_cell(day) -> str:
             # Prediction quality, not P&L: show whether the #1 pick REACHED +2%
-            # intraday (✓/✗), never a dollar return.
+            # intraday, never a dollar return.
             p = pick_by_day.get(day)
             if p is None:
                 return "<td>—</td>"
             reached = bool(p.top1_hit)
             cls = "pos" if reached else "neg"
-            mark = "✓" if reached else "✗"
             marker = " †" if p.late else ""
             return (
                 f'<td><span class="sym">{html.escape(p.top1_symbol)}</span> '
-                f'<span class="{cls}">{mark}</span>{marker}</td>'
+                f'<span class="{cls}">{_mark(reached)}</span>{marker}</td>'
             )
 
         trs = "".join(

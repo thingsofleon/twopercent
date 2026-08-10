@@ -374,3 +374,46 @@ def ingest_cmd(
             f"Failed: {', '.join(result.symbols_failed[:20])}"
             + (" ..." if len(result.symbols_failed) > 20 else "")
         )
+
+
+@app.command("intraday")
+def intraday_cmd(
+    days: int = typer.Option(
+        55, "--days", help="Calendar days back to fetch (Yahoo serves ~88 at 5m)."
+    ),
+    top: int = typer.Option(20, "--top", help="Pick ranks whose symbols to fetch."),
+    db: Path = DbOption,
+) -> None:
+    """Fetch 5m bars for the symbols this model actually picked, for path resolution.
+
+    Picks-only by design: the explorer needs the ordering of the +2% limit and
+    the -1% stop on days the model traded, not the whole universe. Exit codes:
+    0 clean, 1 ran with gaps (some symbols returned nothing), 2 failed.
+    """
+    from twopercent import intraday as intraday_mod
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    con = store.connect(db)
+    end = dt.date.today() + dt.timedelta(days=1)
+    start = end - dt.timedelta(days=min(days, intraday_mod.MAX_LOOKBACK_DAYS))
+    symbols = [
+        r[0]
+        for r in con.execute(
+            "SELECT DISTINCT symbol FROM predictions WHERE rank <= ? "
+            "UNION SELECT DISTINCT symbol FROM experiment_daily "
+            "WHERE symbol IS NOT NULL AND rank <= ?",
+            [top, top],
+        ).fetchall()
+    ]
+    if not symbols:
+        typer.echo("No picked symbols found — run `twopercent predict` or `benchmark` first.")
+        raise typer.Exit(2)
+    typer.echo(
+        f"Fetching {intraday_mod.INTERVAL} bars for {len(symbols)} picked symbol(s), "
+        f"{start} .. {end}"
+    )
+    result = intraday_mod.ingest(con, symbols, start, end)
+    typer.echo(result.summary())
+    if result.batches_failed:
+        raise typer.Exit(2)
+    raise typer.Exit(0 if result.ok else 1)

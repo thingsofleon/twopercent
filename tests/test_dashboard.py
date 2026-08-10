@@ -2,7 +2,7 @@ import pandas as pd
 import pytest
 
 from tests.conftest import seed_history
-from twopercent import dashboard, store, track
+from twopercent import dashboard, store, strategy, track
 from twopercent.predict import predict_for
 
 RUNNER_OC = [0.03 + 0.001 * (i % 5) for i in range(60)]
@@ -495,16 +495,19 @@ def test_dashboard_explorer_payload_json(modeled, tmp_path):
     assert len(payload["sim"]) == 6
     day0 = payload["sim"][0]
     assert day0["d"] == "2026-01-05"
-    # Each pick is [rank, oh, ol, oc, hit] — raw outcome returns + the guarded
-    # touch/fill flag; growth is DERIVED in lockstep, never shipped as dollars.
+    # Each pick is [rank, oh, ol, oc, hit, path] — raw outcome returns, the
+    # guarded touch/fill flag, and the intraday path verdict; growth is DERIVED
+    # in lockstep, never shipped as dollars. path is null here because no
+    # intraday bars are ingested: the band must stay open, never default to a
+    # resolved ordering (#79).
     # Hand-check day 0: (i + rank) % 5 == 0 at rank 5 → that one is not a reacher.
     assert day0["picks"] == [
-        [1, 0.0231, -0.0009, 0.0203, 1],
-        [2, 0.0231, -0.0009, 0.0203, 1],
-        [3, 0.0231, -0.0009, 0.0203, 1],
-        [4, 0.0231, -0.0009, 0.0203, 1],
-        [5, 0.0042, -0.0117, -0.0117, 0],
-        [6, 0.0231, -0.0009, 0.0203, 1],
+        [1, 0.0231, -0.0009, 0.0203, 1, None],
+        [2, 0.0231, -0.0009, 0.0203, 1, None],
+        [3, 0.0231, -0.0009, 0.0203, 1, None],
+        [4, 0.0231, -0.0009, 0.0203, 1, None],
+        [5, 0.0042, -0.0117, -0.0117, 0, None],
+        [6, 0.0231, -0.0009, 0.0203, 1, None],
     ]
     # Base rate on 2026-01-05: 4 runners of 8 names reached ≥2%.
     assert abs(day0["base"] - 0.5) < 1e-9
@@ -514,7 +517,10 @@ def test_dashboard_explorer_payload_json(modeled, tmp_path):
     live0 = payload["live"][0]
     assert live0["late"] is True  # backfilled save, created after the target open
     assert [p[0] for p in live0["picks"]] == sorted(p[0] for p in live0["picks"])
-    assert all(len(p) == 5 for p in live0["picks"])
+    assert all(len(p) == 6 for p in live0["picks"])
+    # Nothing is path-resolved without intraday bars — every verdict stays null,
+    # so every band stays open (#79).
+    assert all(p[5] is None for p in live0["picks"])
     assert all(p[1] is not None and p[2] is not None and p[3] is not None for p in live0["picks"])
 
 
@@ -530,9 +536,12 @@ def test_dashboard_explorer_too_few_sim_days_says_so(modeled, tmp_path):
     assert "The live record above is the clean test." in content
 
 
-def _pick(rank, hit, oh=0.021, ol=-0.002, oc=0.005):
-    """A payload pick [rank, oh, ol, oc, hit] with harmless default returns."""
-    return [rank, oh, ol, oc, hit]
+def _pick(rank, hit, oh=0.021, ol=-0.002, oc=0.005, path=None):
+    """A payload pick [rank, oh, ol, oc, hit, path] with harmless defaults.
+
+    `path` is the intraday verdict (#79); None means unresolved, which is what
+    every pick was before intraday ingestion existed."""
+    return [rank, oh, ol, oc, hit, path]
 
 
 def test_summarize_days_first_available_substitution_and_short_days():
@@ -697,7 +706,9 @@ def test_strategy_card_framing_stamps_and_gross_labels(modeled, tmp_path):
     assert "excludes every company that delisted" in strat_block
     assert "if even a few of their blow-up days were real, this could be a loss" in strat_block
     assert "before trading costs (not estimated)" in strat_block
-    assert "daily data can't tell which came first" in strat_block
+    assert "daily bars carry no clock" in strat_block
+    # The stop's fill-at-trigger assumption is optimistic and must say so (#86).
+    assert "not at the trigger" in strat_block
     assert "glitch-suspect high never counts as a fill" in strat_block
 
 
@@ -821,6 +832,29 @@ def test_strategy_lockstep_python_vs_node():
         {"d": "b", "base": None, "picks": [_pick(2, 0, ol=-0.01, oc=-0.0117)]},  # subst + short
         {"d": "c", "base": 0.25, "picks": [_pick(1, 0, ol=-0.009999999999999964, oc=0.0)]},
         {"d": "d", "base": 0.25, "picks": [_pick(1, 1, oh=0.0203, ol=-0.0009, oc=0.0203)]},
+        # Both triggers touched, ordering RESOLVED each way (#79): the band must
+        # collapse to a single point, and identically in both languages.
+        {
+            "d": "f",
+            "base": 0.4,
+            "picks": [
+                _pick(1, 1, ol=-0.03, oc=-0.02, path=strategy.SEQ_LIMIT_FIRST),
+                _pick(2, 1, ol=-0.03, oc=0.04, path=strategy.SEQ_STOP_FIRST),
+            ],
+        },
+        # A pre-#79 pick with only 5 elements must still parse as unresolved on
+        # BOTH sides rather than raising or reading index 5 as resolved.
+        {"d": "g", "base": 0.3, "picks": [[1, 0.03, -0.03, 0.01, 1]]},
+        # 1 resolved of 8 ambiguous = 12.5%, where Python's half-even round()
+        # gives 12% and JS Math.round gives 13% -- the drift class
+        # dashboard._pct_half_up already exists for. Pinned here so the
+        # coverage claim itself cannot drift, not just its rounding.
+        {
+            "d": "h",
+            "base": 0.35,
+            "picks": [_pick(1, 1, ol=-0.05, oc=-0.02, path=strategy.SEQ_STOP_FIRST)]
+            + [_pick(i, 1, ol=-0.05, oc=-0.02) for i in range(2, 9)],
+        },
     ]
     missing_days = days + [{"d": "e", "base": None, "picks": [[1, None, None, None, 0]]}]
 
@@ -835,6 +869,7 @@ for (const strat of ["hold_close", "limit_2pct", "limit_stop"]) {{
     const s = tpMath.stratSummarize(days, n, strat);
     out[strat + ":" + n] = [s.gw, s.gb, s.ww, s.wb, s.picks, s.days, s.clean,
                             s.shortDays, s.substDays, s.missing, s.corrupt,
+                            s.amb, s.res, tpMath.pathNote("SIM", s),
                             tpMath.growthText(s), tpMath.winText(s),
                             tpMath.readText(s, null)];
   }}
@@ -869,6 +904,9 @@ console.log(JSON.stringify(out));
                 s["subst"],
                 s["missing"],
                 s["corrupt"],
+                s["amb"],
+                s["res"],
+                dashboard.strategy.path_note("SIM", s),
                 dashboard._growth_text(s),
                 dashboard._win_text(s),
                 dashboard._strategy_read(s, None),
@@ -886,3 +924,132 @@ console.log(JSON.stringify(out));
         r["base_days"],
         r["corrupt"],
     ]
+
+
+# --- #79 path resolution: the integration, not just the unit ------------------
+
+
+def test_experiment_daily_symbol_survives_the_round_trip(con):
+    """Finding 1: the writer recorded `symbol`, the READER never selected it.
+
+    Without this, no SIM band could ever collapse no matter how much intraday
+    data was ingested — and _attach_paths returned None, so the page did not
+    even say so. A write-then-read assertion is what the original PR lacked.
+    """
+    seq = store.record_experiment(
+        con,
+        strategy="baseline_gbm_v1",
+        params={},
+        train_start=pd.Timestamp("2026-01-05").date(),
+        test_start=pd.Timestamp("2026-02-02").date(),
+        test_end=pd.Timestamp("2026-02-27").date(),
+        metrics={"auc": 0.7, "lift": 2.0, "precision_at_n": 0.5, "base_rate": 0.25, "top_n": 20},
+        event="open_to_high",
+    )
+    store.record_experiment_daily(
+        con,
+        seq,
+        pd.DataFrame(
+            {
+                "target_date": [pd.Timestamp("2026-02-02").date()],
+                "rank": [1],
+                "ret": [0.01],
+                "hit": [1],
+                "oh": [0.03],
+                "ol": [-0.02],
+                "symbol": ["AAA"],
+            }
+        ),
+    )
+
+    meta, frame = store.latest_experiment_daily(con, "baseline_gbm_v1")
+    assert "symbol" in frame.columns
+    assert frame["symbol"].tolist() == ["AAA"]
+
+
+def test_attach_paths_says_so_when_rows_carry_no_symbol(con):
+    """A silent no-op is the failure mode; the reader must be told."""
+    frame = pd.DataFrame(
+        {"target_date": [pd.Timestamp("2026-02-02").date()], "rank": [1], "oh": [0.03]}
+    )
+    out, note = dashboard._attach_paths(con, frame)
+
+    assert out is frame
+    assert note is not None and "UNAVAILABLE" in note
+    assert "twopercent benchmark" in note
+
+
+def test_path_note_reports_coverage_for_the_selected_basket():
+    """Finding 4: the disclosure must describe the selection on screen.
+
+    A note computed over all days at top-20 is not a statement about a top-5,
+    126-day band. path_note() is fed by the same summarize call that produces
+    the number, so the two cannot describe different populations.
+    """
+    from twopercent import strategy as strat_mod
+
+    both = _pick(1, 1, ol=-0.03, oc=-0.01)  # limit + stop touched, unresolved
+    resolved = _pick(2, 1, ol=-0.03, oc=-0.01, path=strat_mod.SEQ_STOP_FIRST)
+    days = [{"d": "a", "base": 0.3, "picks": [both, resolved]}]
+
+    s_all = strat_mod.summarize_strategy_days(days, 2, "limit_stop")
+    assert (s_all["amb"], s_all["res"]) == (2, 1)
+    note = strat_mod.path_note("SIM", s_all)
+    assert "1 of 2 both-triggered picks (50%)" in note
+    assert "conditional on that replay" in note
+
+    # Top-1 selects only the unresolved pick — the note must follow the basket.
+    s_one = strat_mod.summarize_strategy_days(days, 1, "limit_stop")
+    assert (s_one["amb"], s_one["res"]) == (1, 0)
+    assert "0 of 1 both-triggered picks resolved" in strat_mod.path_note("SIM", s_one)
+
+
+def test_resolved_verdict_reaches_the_payload_and_collapses_the_band(modeled, tmp_path):
+    """End-to-end: bars in the store -> verdict in the payload -> band collapses."""
+    import datetime as dt
+
+    from twopercent import intraday
+
+    dates = sorted(pd.bdate_range("2026-01-05", periods=60).date)
+    predict_for(modeled, "baseline_gbm_v1", signal_date=dates[-3], save=True)
+    target = dates[-2]
+    # Make the top pick's target day touch BOTH triggers, then seed an unbroken
+    # 5m record in which the limit came first.
+    top = modeled.execute(
+        "SELECT symbol FROM predictions WHERE signal_date = ? ORDER BY rank LIMIT 1", [dates[-3]]
+    ).fetchone()[0]
+    modeled.execute(
+        "UPDATE prices SET open = 100, high = 104, low = 98, close = 101 "
+        "WHERE symbol = ? AND date = ?",
+        [top, target],
+    )
+    frame = pd.DataFrame(
+        {
+            "symbol": top,
+            "ts": [dt.datetime.combine(target, dt.time(9, 30 + 5 * i)) for i in range(3)],
+            "date": target,
+            "interval": "5m",
+            "open": [100.0, 100.2, 103.0],
+            "high": [100.5, 104.0, 103.5],
+            "low": [99.9, 100.0, 98.0],
+            "close": [100.2, 103.0, 98.4],
+            "volume": [1000, 1000, 1000],
+        }
+    )
+    modeled.register("_bars", frame)
+    modeled.execute("INSERT INTO intraday_prices SELECT * FROM _bars")
+
+    out = tmp_path / "dash.html"
+    dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5)
+    content = out.read_text()
+
+    import json
+    import re
+
+    payload = json.loads(
+        re.search(r'<script type="application/json" id="tp-data">(.*?)</script>', content).group(1)
+    )
+    live_day = next(d for d in payload["live"] if d["d"] == str(target))
+    assert any(p[5] == intraday.LIMIT_FIRST for p in live_day["picks"]), (
+        "a resolvable pick must arrive in the payload with its verdict"
+    )

@@ -43,6 +43,13 @@ STOP_LEVEL = -0.01
 # fail to trigger without it.
 _STOP_EPSILON = 1e-9
 
+# Intraday path verdicts for a day that touched BOTH triggers. Defined here
+# rather than imported from intraday.py so this module stays dependency-free
+# for the JS-lockstep tests; intraday.py re-exports these as LIMIT_FIRST /
+# STOP_FIRST and a test pins the two definitions together.
+SEQ_LIMIT_FIRST = 1
+SEQ_STOP_FIRST = 2
+
 # (key, dropdown label, enabled). `reach` is the DEFAULT prediction-quality
 # view (not an exit rule); the trailing stop is listed but disabled because
 # daily bars cannot replay it — do not "approximate" it into existence.
@@ -61,14 +68,24 @@ def stop_triggered(ol: float) -> bool:
     return ol <= STOP_LEVEL + _STOP_EPSILON
 
 
-def pick_return_band(strategy: str, ol: float, oc: float, filled: bool) -> tuple[float, float]:
+def pick_return_band(
+    strategy: str, ol: float, oc: float, filled: bool, seq: int | None = None
+) -> tuple[float, float]:
     """(worst, best) day return of one pick under an exit rule, buy-at-open.
 
-    Equal endpoints mean the rule's outcome is exact from daily data; they
-    differ only for `limit_stop` on a day where BOTH the limit and the stop
-    were touched — worst assumes the stop filled first (−1%), best assumes the
-    limit did (+2%). Always worst <= best. `filled` is the guarded touch event
-    (see module docstring) — never a raw high comparison.
+    Equal endpoints mean the rule's outcome is exact; they differ only for
+    `limit_stop` on a day where BOTH the limit and the stop were touched and
+    the ORDER is unknown — worst assumes the stop filled first (−1%), best
+    assumes the limit did (+2%). Always worst <= best. `filled` is the guarded
+    touch event (see module docstring) — never a raw high comparison.
+
+    `seq` is that day's intraday verdict (intraday.LIMIT_FIRST / STOP_FIRST,
+    None when unresolved). Daily bars carry no clock, so `seq` is the ONLY way
+    the band can collapse; when it is None the band is returned exactly as
+    before, which keeps every pre-intraday row rendering unchanged. A verdict
+    is only ever produced by intraday.resolve() after the session passed its
+    agreement check, so a sparse or split-shifted record cannot collapse a band
+    on the strength of bars it never saw.
     """
     if strategy == "hold_close":
         return (oc, oc)
@@ -78,6 +95,10 @@ def pick_return_band(strategy: str, ol: float, oc: float, filled: bool) -> tuple
     if strategy == "limit_stop":
         stopped = stop_triggered(ol)
         if filled and stopped:
+            if seq == SEQ_LIMIT_FIRST:
+                return (LIMIT_PROFIT, LIMIT_PROFIT)
+            if seq == SEQ_STOP_FIRST:
+                return (STOP_LEVEL, STOP_LEVEL)
             return (STOP_LEVEL, LIMIT_PROFIT)
         if stopped:
             return (STOP_LEVEL, STOP_LEVEL)
@@ -85,6 +106,32 @@ def pick_return_band(strategy: str, ol: float, oc: float, filled: bool) -> tuple
             return (LIMIT_PROFIT, LIMIT_PROFIT)
         return (oc, oc)
     raise ValueError(f"unknown exit-rule strategy: {strategy!r}")
+
+
+def path_note(prefix: str, s: dict | None) -> str | None:
+    """Coverage disclosure for a collapsed band — mirror of JS tpMath.pathNote().
+
+    Rendered beside the number it qualifies, for the SELECTED basket and window.
+    A static server-side note would describe a different selection than the one
+    on screen and would be destroyed by the first selector change.
+    """
+    if not s or not s.get("amb"):
+        return None
+    amb, res = s["amb"], s["res"]
+    if not res:
+        return (
+            f"{prefix}: 0 of {amb} both-triggered picks resolved "
+            "— every band below is the daily worst/best case"
+        )
+    # floor(x + 0.5), NOT round(): Python rounds half-even (1/8 -> "12%") while
+    # JS Math.round is half-up ("13%"), so the server render would flicker on the
+    # first selector change. Same drift dashboard._pct_half_up exists for.
+    pct = math.floor(100 * res / amb + 0.5)
+    return (
+        f"{prefix}: {res} of {amb} both-triggered picks ({pct}%) ordered from 5m "
+        "bars; the rest stay a worst/best band. A collapsed band is conditional "
+        "on that replay, not proven from daily bars, and resolvable days skew liquid."
+    )
 
 
 def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
@@ -111,6 +158,7 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
     """
     growth_w = growth_b = 1.0
     wins_w = wins_b = n_picks = 0
+    amb_n = res_n = 0
     short = subst = missing = corrupt = 0
     for day in days:
         picks = day["picks"][:n]
@@ -129,9 +177,21 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
         # so a partially-corrupt day can never leak ghost wins into the rate
         # (numerator without its denominator — reviewer finding, PR #77).
         day_wins_w = day_wins_b = 0
+        day_amb = day_res = 0
         ok = True
         for p in picks:
-            worst, best = pick_return_band(strategy, p[2], p[3], bool(p[4]))
+            # p[5] is the intraday verdict; absent on payloads written before
+            # #79, which must keep rendering as the unresolved band rather than
+            # raising or silently reading as "resolved".
+            seq = p[5] if len(p) > 5 else None
+            # Ambiguity/resolution tallies for the disclosure: a band is a point
+            # here ONLY because the intraday replay ordered the two triggers, so
+            # the page must be able to say how much of the selection that covers.
+            if bool(p[4]) and stop_triggered(p[2]):
+                day_amb += 1
+                if seq in (SEQ_LIMIT_FIRST, SEQ_STOP_FIRST):
+                    day_res += 1
+            worst, best = pick_return_band(strategy, p[2], p[3], bool(p[4]), seq)
             if not (math.isfinite(worst) and math.isfinite(best)):
                 ok = False
                 break
@@ -146,6 +206,8 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
             continue
         wins_w += day_wins_w
         wins_b += day_wins_b
+        amb_n += day_amb
+        res_n += day_res
         n_picks += len(picks)
         growth_w *= 1 + sum_w / len(picks)
         growth_b *= 1 + sum_b / len(picks)
@@ -155,6 +217,8 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
         "gb": growth_b if clean else float("nan"),
         "ww": wins_w / n_picks if n_picks else float("nan"),
         "wb": wins_b / n_picks if n_picks else float("nan"),
+        "amb": amb_n,
+        "res": res_n,
         "picks": n_picks,
         "days": len(days),
         "clean": clean,

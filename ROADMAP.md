@@ -429,13 +429,17 @@ re-benchmark to populate (graceful "no strategy data yet" until then).
   (threshold − epsilon AND NOT high_glitch_suspect — a fake print can't fill your
   order) → +2% exactly, else `oc`. THE key test ("does grabbing +2% on winners
   beat the faders").
-- **+2% limit + −1% stop** — a best/worst BAND, not a single number (quant-skeptic
-  must-fix: on ~40% of winning days both trigger and daily data can't order them;
-  a lone stop-first number is dishonestly precise). Both triggered → worst −1%
-  (stop first) / best +2% (limit first); labeled "daily data can't tell which came
-  first". Exact fills at trigger prices, stated.
-- **Trailing stop** — DISABLED, greyed with the reason: needs intraday (minute) data
-  we don't have (the Polygon upgrade).
+- **+2% limit + −1% stop** — a best/worst BAND wherever the ordering is unknown
+  (quant-skeptic must-fix: on ~61% of pick-days BOTH trigger, and daily bars carry
+  no clock; a lone stop-first number is dishonestly precise). Both triggered and
+  UNRESOLVED → worst −1% (stop first) / best +2% (limit first). Since #79 the band
+  COLLAPSES to a point on days 5m bars can order — measured on the live record:
+  61% of ambiguous pick-days resolve, narrowing the top-5 band from
+  $0.96–$1.15 to $0.99–$1.07. Exact fills at trigger prices, stated (see the open
+  thread below — that assumption is itself optimistic).
+- **Trailing stop** — still DISABLED. #79 phase 1 stores 5m bars, which resolve
+  ORDERING but do not replay a trailing stop's continuous path; that needs a finer
+  interval and its own design.
 
 **Displayed per Basket × Window × Strategy:** compounded growth ($1→$X, equal-weight
 basket) AND win rate (% picks positive) — ALWAYS TOGETHER, never win rate alone
@@ -468,6 +472,22 @@ risk money on it; quant-skeptic gated the design, its must-fixes are in code):**
 Strategy dropdown with Python/JS lockstep proven by executing the page's tpMath
 under node. POST-MERGE OP: re-run `twopercent benchmark` to populate oh/ol for
 the SIM row. Trailing-stop and true fill modeling wait for intraday data.
+
+**Implemented 2026-08-10** (#79 phase 1): `intraday_prices` (5m, picks only, via
+`twopercent intraday`), `intraday.resolve()` ordering the two triggers, and a
+`path` verdict carried per pick into the explorer payload so the band collapses
+where the ordering is known. Two integrity gates, both non-destructive: a session
+must REPRODUCE its daily bar's high and low (a sparse record that never saw the
+day's low would otherwise score a hidden stop as un-triggered — every gap biases
+the replay optimistic), which also catches unadjusted splits. Unresolved days keep
+the band and the coverage is disclosed on the page. `experiment_daily.symbol` is
+new and NULLABLE — pre-#79 sim rows cannot be path-resolved until a re-benchmark.
+POST-MERGE OPS: re-run `twopercent benchmark` (records symbol), then
+`twopercent intraday`. LIMITS, measured not assumed: Yahoo serves ~60 TRADING days
+of 5m bars, so the SIM row's earlier history can NEVER be resolved; and ~29% of
+ambiguous days have both triggers inside ONE 5m bar, which no amount of backfill
+fixes. Phase 2 (prior-day intraday FEATURES) is NOT built — it additionally
+requires extending the lookahead canary to mutate `intraday_prices`.
 
 ## Status
 

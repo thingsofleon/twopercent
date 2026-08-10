@@ -17,6 +17,13 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = Path("data/twopercent.duckdb")
 
+# A run qualifies as the dashboard's reference SIM record if its day count is
+# within this fraction of the longest available. Above the floor, RECENCY wins;
+# below it, length still does. Sized to admit normal month-to-month drift in a
+# standard 12-month walk-forward (a few percent) while excluding any materially
+# shorter run.
+REFERENCE_RUN_MIN_DAYS_FRACTION = 0.9
+
 # High-spike glitch guard (M2), used inside the daily_returns view. A touch
 # decided by the day's HIGH alone is a GLITCH-SUSPECT (excluded from the touch
 # event) ONLY at the narrow intersection quant-skeptic sized at ~150 bars / 5yr
@@ -693,16 +700,31 @@ def latest_experiment_daily(
     """
     rows = con.execute(
         """
-        SELECT e.id, e.run_ts, e.params, e.test_start, e.test_end
-        FROM experiments e
-        JOIN (
+        WITH counted AS (
             SELECT seq, count(DISTINCT target_date) AS n_days
             FROM experiment_daily GROUP BY seq
-        ) d ON d.seq = e.id
-        WHERE e.strategy = ? AND e.event = ?
-        ORDER BY d.n_days DESC, e.run_ts DESC, e.id DESC
+        ),
+        eligible AS (
+            SELECT e.id, e.run_ts, e.params, e.test_start, e.test_end, d.n_days,
+                   max(d.n_days) OVER () AS best_days
+            FROM experiments e
+            JOIN counted d ON d.seq = e.id
+            WHERE e.strategy = ? AND e.event = ?
+        )
+        SELECT id, run_ts, params, test_start, test_end
+        FROM eligible
+        -- NEWEST first among runs of comparable LENGTH, rather than longest
+        -- outright. Ranking on length alone let a stale run pin the dashboard
+        -- forever once a schema addition landed only in newer runs: after #79
+        -- added experiment_daily.symbol, a fresh 256-day run carrying symbols
+        -- lost to a three-week-old 263-day run without them, so the SIM row
+        -- reported "path resolution: UNAVAILABLE" no matter how many times the
+        -- documented post-merge benchmark was re-run (#88). The length floor
+        -- still keeps the original hazard out: a `--months 2` run or a compare
+        -- is nowhere near the bar and can never displace the reference.
+        ORDER BY (n_days >= ? * best_days) DESC, run_ts DESC, id DESC
         """,
-        [strategy, scan.TOUCH_EVENT],
+        [strategy, scan.TOUCH_EVENT, REFERENCE_RUN_MIN_DAYS_FRACTION],
     ).fetchall()
     row = None
     for candidate in rows:

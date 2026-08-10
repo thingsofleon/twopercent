@@ -76,7 +76,7 @@ def test_score_mode_clock_gate(ready, monkeypatch, when, allowed):
     # Gate test only — skip the expensive real model/dashboard tail.
     monkeypatch.setattr(routine, "predict_for", lambda *a, **kw: None)
     monkeypatch.setattr(routine.dashboard, "render", lambda *a, **kw: "x")
-    report = routine.run(db_path=_db(ready), mode="score")
+    report = routine.run(out_path="dash.html", db_path=_db(ready), mode="score")
     if allowed:
         assert [s.name for s in report.steps] != ["clock"]
         assert report.steps[0].status == "ok"
@@ -102,7 +102,7 @@ def test_score_mode_happy_path_no_predict_no_universe_refresh(ready, monkeypatch
         return real_predict(con_, strat, **kw)
 
     monkeypatch.setattr(routine, "predict_for", spy)
-    report = routine.run(db_path=_db(ready), mode="score")
+    report = routine.run(out_path="dash.html", db_path=_db(ready), mode="score")
 
     names = [s.name for s in report.steps]
     assert names == [
@@ -135,7 +135,7 @@ def test_score_mode_never_refreshes_universe_even_when_stale(ready, monkeypatch)
     ready.execute("UPDATE universe SET as_of = ?", [POST_CLOSE.date() - dt.timedelta(days=30)])
     monkeypatch.setattr(routine, "predict_for", lambda *a, **kw: None)
     monkeypatch.setattr(routine.dashboard, "render", lambda *a, **kw: "x")
-    report = routine.run(db_path=_db(ready), mode="score")
+    report = routine.run(out_path="dash.html", db_path=_db(ready), mode="score")
     assert "universe" not in [s.name for s in report.steps]  # refresh stub would pytest.fail
 
 
@@ -158,7 +158,7 @@ def test_score_mode_counts_newly_resolved_days(ready, monkeypatch):
         return ingest.IngestResult(symbols_ok=list(symbols))
 
     monkeypatch.setattr(routine.ingest, "ingest", resolving_ingest)
-    report = routine.run(db_path=_db(ready), mode="score")
+    report = routine.run(out_path="dash.html", db_path=_db(ready), mode="score")
     score_step = next(s for s in report.steps if s.name == "score")
     assert score_step.status == "ok"
     assert "1 new day(s) scored" in score_step.detail
@@ -170,7 +170,7 @@ def test_score_mode_zero_new_days_warns(ready, monkeypatch):
     # No predictions at all: nothing scoreable — the run says so and exits 1.
     monkeypatch.setattr(routine, "predict_for", lambda *a, **kw: None)
     monkeypatch.setattr(routine.dashboard, "render", lambda *a, **kw: "x")
-    report = routine.run(db_path=_db(ready), mode="score")
+    report = routine.run(out_path="dash.html", db_path=_db(ready), mode="score")
     score_step = next(s for s in report.steps if s.name == "score")
     assert score_step.status == "warn"
     assert "0 new day(s) scored" in score_step.detail
@@ -289,7 +289,7 @@ def _gh_spy(
 
 def test_degraded_files_issue_and_exits_2(degraded, monkeypatch):
     calls = _gh_spy(monkeypatch)
-    report = routine.run(db_path=_db(degraded), mode="score")
+    report = routine.run(out_path="dash.html", db_path=_db(degraded), mode="score")
 
     assert report.exit_code == 2
     detector = next(s for s in report.steps if s.name == "detector")
@@ -323,7 +323,7 @@ def test_degraded_files_issue_and_exits_2(degraded, monkeypatch):
 
 def test_degraded_dedups_existing_open_issue(degraded, monkeypatch):
     calls = _gh_spy(monkeypatch, list_stdout='[{"number": 42, "title": "Auto: earlier"}]')
-    report = routine.run(db_path=_db(degraded), mode="score")
+    report = routine.run(out_path="dash.html", db_path=_db(degraded), mode="score")
     assert report.exit_code == 2  # detector FAIL stands even without a new issue
     issue = next(s for s in report.steps if s.name == "issue")
     assert issue.status == "warn" and "#42" in issue.detail
@@ -334,7 +334,7 @@ def test_degraded_lock_failure_warns_but_issue_stands(degraded, monkeypatch):
     # Lock is best-effort: its failure must not unfile the issue or be silent.
     err = subprocess.CalledProcessError(1, ["gh"], stderr="lock forbidden")
     calls = _gh_spy(monkeypatch, fail=err, fail_on=["gh", "issue", "lock"])
-    report = routine.run(db_path=_db(degraded), mode="score")
+    report = routine.run(out_path="dash.html", db_path=_db(degraded), mode="score")
     assert report.exit_code == 2
     assert any(args[:3] == ["gh", "issue", "create"] for args, _ in calls)
     issue = next(s for s in report.steps if s.name == "issue")
@@ -359,7 +359,7 @@ def test_detector_pinned_to_top_20_regardless_of_cli_top(ready, monkeypatch):
     )
     monkeypatch.setattr(routine, "predict_for", lambda *a, **kw: None)
     monkeypatch.setattr(routine.dashboard, "render", lambda *a, **kw: "x")
-    routine.run(db_path=_db(ready), top=5, mode="score")
+    routine.run(out_path="dash.html", db_path=_db(ready), top=5, mode="score")
     assert seen and all(n == 20 for n in seen)
 
 
@@ -370,7 +370,7 @@ def test_score_mode_malformed_champion_fails_with_report(ready, monkeypatch):
         raise ValueError("champion.json is malformed")
 
     monkeypatch.setattr(routine.champion, "get_champion", boom)
-    report = routine.run(db_path=_db(ready), mode="score")
+    report = routine.run(out_path="dash.html", db_path=_db(ready), mode="score")
     assert report.exit_code == 2
     assert report.steps[-1].name == "score" and report.steps[-1].status == "fail"
     assert "champion" in report.steps[-1].detail
@@ -396,7 +396,7 @@ def test_pre_ingest_snapshot_failure_reports_unknown_new_days(ready, monkeypatch
     )
     monkeypatch.setattr(routine, "predict_for", lambda *a, **kw: None)
     monkeypatch.setattr(routine.dashboard, "render", lambda *a, **kw: "x")
-    report = routine.run(db_path=_db(ready), mode="score")
+    report = routine.run(out_path="dash.html", db_path=_db(ready), mode="score")
     score_step = next(s for s in report.steps if s.name == "score")
     assert score_step.status == "warn"
     assert "unknown new days" in score_step.detail
@@ -409,7 +409,7 @@ def test_post_ingest_scoring_crash_fails_run(ready, monkeypatch):
         raise RuntimeError("scoring exploded")
 
     monkeypatch.setattr(routine.track, "score_predictions", broken)
-    report = routine.run(db_path=_db(ready), mode="score")
+    report = routine.run(out_path="dash.html", db_path=_db(ready), mode="score")
     score_step = next(s for s in report.steps if s.name == "score")
     assert score_step.status == "fail" and "scoring exploded" in score_step.detail
     assert report.exit_code == 2
@@ -417,7 +417,7 @@ def test_post_ingest_scoring_crash_fails_run(ready, monkeypatch):
 
 def test_degraded_gh_missing_warns_and_still_exits_2(degraded, monkeypatch):
     _gh_spy(monkeypatch, fail=FileNotFoundError("gh"))
-    report = routine.run(db_path=_db(degraded), mode="score")
+    report = routine.run(out_path="dash.html", db_path=_db(degraded), mode="score")
     assert report.exit_code == 2
     issue = next(s for s in report.steps if s.name == "issue")
     assert issue.status == "warn" and "NO issue was filed" in issue.detail
@@ -426,7 +426,7 @@ def test_degraded_gh_missing_warns_and_still_exits_2(degraded, monkeypatch):
 def test_degraded_gh_error_warns_and_still_exits_2(degraded, monkeypatch):
     err = subprocess.CalledProcessError(1, ["gh"], stderr="auth required")
     _gh_spy(monkeypatch, fail=err)
-    report = routine.run(db_path=_db(degraded), mode="score")
+    report = routine.run(out_path="dash.html", db_path=_db(degraded), mode="score")
     assert report.exit_code == 2
     issue = next(s for s in report.steps if s.name == "issue")
     assert issue.status == "warn" and "auth required" in issue.detail
@@ -437,7 +437,7 @@ def test_degraded_gh_error_warns_and_still_exits_2(degraded, monkeypatch):
 
 def test_unknown_mode_rejected(ready):
     with pytest.raises(ValueError, match="unknown routine mode"):
-        routine.run(db_path=_db(ready), mode="bogus")
+        routine.run(out_path="dash.html", db_path=_db(ready), mode="bogus")
 
 
 def test_issue_body_quotes_default_config_benchmark_not_variant(degraded, monkeypatch):
@@ -464,7 +464,7 @@ def test_issue_body_quotes_default_config_benchmark_not_variant(degraded, monkey
         metrics={"lift": 9.9, "auc": 0.99},
     )
     calls = _gh_spy(monkeypatch)
-    routine.run(db_path=_db(degraded), mode="score")
+    routine.run(out_path="dash.html", db_path=_db(degraded), mode="score")
 
     _, create_kw = next((args, kw) for args, kw in calls if args[:3] == ["gh", "issue", "create"])
     body = create_kw["input"]

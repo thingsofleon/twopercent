@@ -7,6 +7,23 @@ import pytest
 from twopercent import store
 
 
+@pytest.fixture(autouse=True)
+def isolate_cwd(tmp_path, monkeypatch):
+    """Run every test in its own empty directory.
+
+    Several library paths resolve against the CALLER's working directory —
+    champion.json, research/queue.json, research/shadow.json, the DuckDB store.
+    A test that omits one of them writes into the developer's checkout instead
+    of failing, which is how `pytest` from the repo root came to overwrite the
+    live dashboard.html with fixture output while reporting green (#81).
+
+    Isolating the CWD makes that whole class of accident land in a temp dir.
+    It is the backstop, not the fix: library code must still not default to a
+    CWD-relative path (see routine.run).
+    """
+    monkeypatch.chdir(tmp_path)
+
+
 @pytest.fixture
 def con(tmp_path):
     return store.connect(tmp_path / "test.duckdb")

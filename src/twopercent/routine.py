@@ -149,11 +149,19 @@ def _bar_keys(frame: pd.DataFrame) -> set[tuple[str, str]]:
 
 def run(
     db_path: Path | str = store.DEFAULT_DB_PATH,
-    out_path: str = "dashboard.html",
+    *,
+    out_path: str,
     top: int = 20,
     universe_max_age_days: int = UNIVERSE_MAX_AGE_DAYS,
     mode: str = "predict",
 ) -> RoutineReport:
+    """Run one routine cycle. `out_path` is REQUIRED and keyword-only.
+
+    It used to default to the relative "dashboard.html", which resolves against
+    the CALLER's working directory — so `pytest` from the repo root silently
+    replaced the live dashboard with fixture output and still reported green
+    (#81). Only the CLI decides where the dashboard lands.
+    """
     if mode not in ("predict", "score"):
         raise ValueError(f"unknown routine mode {mode!r} (expected 'predict' or 'score')")
     report = RoutineReport()

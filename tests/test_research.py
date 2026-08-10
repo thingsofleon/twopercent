@@ -604,6 +604,10 @@ def test_winner_beyond_promotion_band_files_promotion_issue(
     champ_id = _seed_champion_experiment(con, lift=2.0)
     gh = _gh_spy(monkeypatch)
     bench_spy["lifts"]['{"max_depth": 4}'] = 2.5  # margin 0.5 >= 0.27 band
+    # A champion.json in the isolated CWD (conftest.isolate_cwd) — the runner must
+    # leave it byte-identical. Written here rather than read from the checkout so
+    # the assertion cannot pass by touching the developer's real file.
+    Path("champion.json").write_text('{"champion": "baseline_gbm_v1"}\n')
     champion_before = Path("champion.json").read_bytes()
     prices_before = store.price_row_count(con)
 

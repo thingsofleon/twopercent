@@ -79,7 +79,7 @@ def _fake_render(monkeypatch, png=b"\x89PNG-STEP-SENTINEL"):
 
 
 def test_routine_happy_path_completes_all_steps(ready):
-    report = routine.run(db_path=_db(ready))
+    report = routine.run(out_path="dash.html", db_path=_db(ready))
     names = [s.name for s in report.steps]
     assert names == [
         "clock",
@@ -103,7 +103,7 @@ def test_routine_happy_path_completes_all_steps(ready):
 def test_routine_refuses_to_run_while_market_open(ready, monkeypatch):
     midday = dt.datetime(2026, 7, 17, 11, 0, tzinfo=routine._EASTERN)  # Friday 11:00 ET
     monkeypatch.setattr(routine, "_now_eastern", lambda: midday)
-    report = routine.run(db_path=_db(ready))
+    report = routine.run(out_path="dash.html", db_path=_db(ready))
     assert report.status == "fail"
     assert [s.name for s in report.steps] == ["clock"]
     assert "partial" in report.steps[0].detail
@@ -135,7 +135,7 @@ def test_routine_aborts_on_ingest_introduced_corruption(ready, monkeypatch):
         return ingest.IngestResult(symbols_skipped=list(symbols))
 
     monkeypatch.setattr(routine.ingest, "ingest", corrupting_ingest)
-    report = routine.run(db_path=_db(ready))
+    report = routine.run(out_path="dash.html", db_path=_db(ready))
     assert report.status == "fail"
     assert report.steps[-1].name == "recheck"
     assert "EVIL" in report.steps[-1].detail
@@ -152,7 +152,7 @@ def test_routine_backfilled_historical_extremes_warn_not_fail(ready, monkeypatch
         return ingest.IngestResult(symbols_skipped=list(symbols))
 
     monkeypatch.setattr(routine.ingest, "ingest", backfilling_ingest)
-    report = routine.run(db_path=_db(ready))
+    report = routine.run(out_path="dash.html", db_path=_db(ready))
     recheck = next(s for s in report.steps if s.name == "recheck")
     assert recheck.status == "warn"
     assert "backfill" in recheck.detail
@@ -163,7 +163,7 @@ def test_routine_preexisting_problems_warn_but_run(ready):
     # A pre-existing extreme bar (present in the pre-ingest baseline) must not
     # abort the run — it warns via the doctor step and the model proceeds.
     seed_history(ready, {"OLDX": [0.0] * 3 + [0.9]}, start="2026-06-01")
-    report = routine.run(db_path=_db(ready))
+    report = routine.run(out_path="dash.html", db_path=_db(ready))
     assert report.status == "warn"
     assert any(s.name == "predict" for s in report.steps)  # ran to completion
     doctor_step = next(s for s in report.steps if s.name == "doctor")
@@ -173,7 +173,7 @@ def test_routine_preexisting_problems_warn_but_run(ready):
 def test_routine_staleness_gate(ready):
     # Age the store by dropping everything newer than 60 days before the pinned clock.
     ready.execute("DELETE FROM prices WHERE date > ?", [CLOSED.date() - dt.timedelta(days=60)])
-    report = routine.run(db_path=_db(ready))
+    report = routine.run(out_path="dash.html", db_path=_db(ready))
     assert report.status == "fail"
     assert report.steps[-1].name == "freshness"
     assert "track record" in report.steps[-1].detail
@@ -190,10 +190,10 @@ def test_routine_ingest_failure_rate_boundary(ready, monkeypatch):
         return fake
 
     monkeypatch.setattr(routine.ingest, "ingest", fail_n(1))
-    assert routine.run(db_path=_db(ready)).status in ("ok", "warn")
+    assert routine.run(out_path="dash.html", db_path=_db(ready)).status in ("ok", "warn")
 
     monkeypatch.setattr(routine.ingest, "ingest", fail_n(2))
-    report = routine.run(db_path=_db(ready))
+    report = routine.run(out_path="dash.html", db_path=_db(ready))
     assert report.status == "fail"
     assert report.steps[-1].name == "ingest"
 
@@ -203,7 +203,7 @@ def test_routine_unaccounted_symbols_fail(ready, monkeypatch):
         return ingest.IngestResult(symbols_skipped=list(symbols)[:-3])  # drops 3
 
     monkeypatch.setattr(routine.ingest, "ingest", lossy_ingest)
-    report = routine.run(db_path=_db(ready))
+    report = routine.run(out_path="dash.html", db_path=_db(ready))
     assert report.status == "fail"
     assert "unaccounted" in report.steps[-1].detail
 
@@ -215,7 +215,7 @@ def test_routine_universe_refresh_failure_degrades_not_aborts(ready, monkeypatch
         raise RuntimeError("screener down")
 
     monkeypatch.setattr(routine.universe, "refresh_universe", broken_refresh)
-    report = routine.run(db_path=_db(ready))
+    report = routine.run(out_path="dash.html", db_path=_db(ready))
     uni_step = next(s for s in report.steps if s.name == "universe")
     assert uni_step.status == "warn"
     assert "screener down" in uni_step.detail
@@ -234,13 +234,13 @@ def test_routine_stale_universe_triggers_refresh(ready, monkeypatch):
         )
 
     monkeypatch.setattr(routine.universe, "refresh_universe", fake_refresh)
-    routine.run(db_path=_db(ready))
+    routine.run(out_path="dash.html", db_path=_db(ready))
     assert called.get("yes")
     assert store.latest_universe(ready)["as_of"].iloc[0].date() == CLOSED.date()
 
 
 def test_predictions_record_universe_snapshot(ready):
-    routine.run(db_path=_db(ready))
+    routine.run(out_path="dash.html", db_path=_db(ready))
     as_of = ready.execute("SELECT DISTINCT universe_as_of FROM predictions").fetchall()
     assert as_of == [(CLOSED.date(),)]
 
@@ -248,14 +248,14 @@ def test_predictions_record_universe_snapshot(ready):
 def test_predict_mode_explicit_runs_predict_and_no_detector(ready):
     # Level 4 regression: --mode predict (and bare routine, above) is the
     # pre-open cycle — champion predict runs, score-mode steps never appear.
-    report = routine.run(db_path=_db(ready), mode="predict")
+    report = routine.run(out_path="dash.html", db_path=_db(ready), mode="predict")
     names = [s.name for s in report.steps]
     assert "predict" in names
     assert not {"score", "detector", "issue"} & set(names)
 
 
 def test_summary_lines_shape(ready):
-    report = routine.run(db_path=_db(ready))
+    report = routine.run(out_path="dash.html", db_path=_db(ready))
     lines = report.summary_lines()
     assert lines[0].startswith("routine:")
     assert any("top candidates" in line for line in lines)
@@ -330,7 +330,7 @@ def _capture_resend(monkeypatch):
 
 
 def test_notify_unconfigured_skips_without_degrading_exit(ready):
-    report = routine.run(db_path=_db(ready))
+    report = routine.run(out_path="dash.html", db_path=_db(ready))
     step = next(s for s in report.steps if s.name == "notify")
     assert step.name == "notify"
     assert step.status == "ok"  # deliberate non-setup is not an exception
@@ -523,7 +523,7 @@ def test_notify_generic_send_failure_scrubs_secrets(ready, monkeypatch, tmp_path
 def test_notify_misconfigured_recipient_warns(ready, monkeypatch):
     _configure_resend(monkeypatch)
     monkeypatch.setenv(notify.ENV_TO, "not-an-address")
-    report = routine.run(db_path=_db(ready))
+    report = routine.run(out_path="dash.html", db_path=_db(ready))
     step = next(s for s in report.steps if s.name == "notify")
     assert step.status == "warn"
     assert "misconfigured" in step.detail
@@ -537,7 +537,7 @@ def test_notify_malformed_env_file_warns_not_crashes(ready, monkeypatch, tmp_pat
     bad = tmp_path / "bad.env"
     bad.write_bytes(b"TWOPERCENT_EMAIL_TO=caf\xe9@example.com\n")  # latin-1 byte
     monkeypatch.setattr(notify, "DEFAULT_ENV_PATH", bad)
-    report = routine.run(db_path=_db(ready))
+    report = routine.run(out_path="dash.html", db_path=_db(ready))
     step = next(s for s in report.steps if s.name == "notify")
     assert step.status == "warn"
     assert "misconfigured" in step.detail
@@ -548,7 +548,38 @@ def test_notify_malformed_env_file_warns_not_crashes(ready, monkeypatch, tmp_pat
 def test_notify_partial_smtp_config_warns_not_skips(ready, monkeypatch):
     _configure_common(monkeypatch)
     monkeypatch.setenv(notify.ENV_SMTP_HOST, "smtp.example.com")  # no user/password
-    report = routine.run(db_path=_db(ready))
+    report = routine.run(out_path="dash.html", db_path=_db(ready))
     step = next(s for s in report.steps if s.name == "notify")
     assert step.status == "warn"  # half-configured must never look like deliberate non-setup
     assert "partial SMTP configuration" in step.detail
+
+
+# --- #81: the routine must never write into the caller's checkout -------------
+
+
+def test_run_requires_an_explicit_out_path():
+    """out_path is keyword-only and required.
+
+    It defaulted to the relative "dashboard.html", so every `pytest` from the
+    repo root replaced the live dashboard with fixture output — green suite,
+    corrupted operational state. A caller must now name the file.
+    """
+    with pytest.raises(TypeError, match="out_path"):
+        routine.run(db_path=":memory:")  # type: ignore[call-arg]
+
+
+def test_run_writes_only_where_told(ready, tmp_path):
+    """The dashboard lands at out_path and nowhere else.
+
+    Guards the regression directly: a stray "dashboard.html" beside the CWD
+    means something is still resolving a bare relative default.
+    """
+    target = tmp_path / "elsewhere" / "dash.html"
+    target.parent.mkdir()
+
+    report = routine.run(db_path=_db(ready), out_path=str(target))
+
+    assert report.status in ("ok", "warn")
+    assert target.exists() and target.stat().st_size > 0
+    assert not (tmp_path / "dashboard.html").exists()
+    assert not list(tmp_path.glob("dashboard.htm*"))

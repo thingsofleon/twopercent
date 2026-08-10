@@ -23,6 +23,7 @@ uv run twopercent scan --date 2026-07-17
 uv run twopercent doctor               # data-quality checks (read-only)
 uv run twopercent predict              # ranked +2% candidates (logged)
 uv run twopercent dashboard            # static dashboard.html
+uv run twopercent intraday             # 5m bars for picked symbols (exit-path resolution)
 uv run twopercent benchmark            # walk-forward benchmark -> experiments row
 uv run twopercent routine              # pre-open daily cycle (predict mode)
 uv run twopercent routine --mode score # post-close scoring + degradation check

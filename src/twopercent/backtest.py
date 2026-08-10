@@ -103,7 +103,7 @@ def run_benchmark(
     floored_row_days = 0
     unscoreable_days = 0
     daily_picks: list[tuple[dt.date, int, float]] = []
-    rank_rows: list[tuple[dt.date, int, float, int, float, float]] = []
+    rank_rows: list[tuple[dt.date, int, float, int, float, float, str]] = []
     pick_probs: list[pd.Series] = []
     pick_labels: list[pd.Series] = []
     first_run_start: dt.date | None = None
@@ -167,6 +167,10 @@ def run_benchmark(
                         int(row.did_2pct_next),
                         float(row.next_high_return),
                         float(row.next_low_return),
+                        # symbol is recorded ONLY so the explorer can look this
+                        # pick's target day up in intraday_prices (#79). It is
+                        # an outcome-side key, never a feature.
+                        str(row.symbol),
                     )
                 )
             top5 = top20.iloc[:5]
@@ -277,7 +281,7 @@ def run_benchmark(
             # Per-day per-rank pick outcomes land in experiment_daily (dashboard
             # SIM panel), never in the metrics JSON above.
             rank_frame = pd.DataFrame(
-                rank_rows, columns=["target_date", "rank", "ret", "hit", "oh", "ol"]
+                rank_rows, columns=["target_date", "rank", "ret", "hit", "oh", "ol", "symbol"]
             )
             store.record_experiment_daily(con, seq, rank_frame)
             con.execute("COMMIT")

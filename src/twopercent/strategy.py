@@ -43,6 +43,13 @@ STOP_LEVEL = -0.01
 # fail to trigger without it.
 _STOP_EPSILON = 1e-9
 
+# Intraday path verdicts for a day that touched BOTH triggers. Defined here
+# rather than imported from intraday.py so this module stays dependency-free
+# for the JS-lockstep tests; intraday.py re-exports these as LIMIT_FIRST /
+# STOP_FIRST and a test pins the two definitions together.
+SEQ_LIMIT_FIRST = 1
+SEQ_STOP_FIRST = 2
+
 # (key, dropdown label, enabled). `reach` is the DEFAULT prediction-quality
 # view (not an exit rule); the trailing stop is listed but disabled because
 # daily bars cannot replay it — do not "approximate" it into existence.
@@ -61,14 +68,24 @@ def stop_triggered(ol: float) -> bool:
     return ol <= STOP_LEVEL + _STOP_EPSILON
 
 
-def pick_return_band(strategy: str, ol: float, oc: float, filled: bool) -> tuple[float, float]:
+def pick_return_band(
+    strategy: str, ol: float, oc: float, filled: bool, seq: int | None = None
+) -> tuple[float, float]:
     """(worst, best) day return of one pick under an exit rule, buy-at-open.
 
-    Equal endpoints mean the rule's outcome is exact from daily data; they
-    differ only for `limit_stop` on a day where BOTH the limit and the stop
-    were touched — worst assumes the stop filled first (−1%), best assumes the
-    limit did (+2%). Always worst <= best. `filled` is the guarded touch event
-    (see module docstring) — never a raw high comparison.
+    Equal endpoints mean the rule's outcome is exact; they differ only for
+    `limit_stop` on a day where BOTH the limit and the stop were touched and
+    the ORDER is unknown — worst assumes the stop filled first (−1%), best
+    assumes the limit did (+2%). Always worst <= best. `filled` is the guarded
+    touch event (see module docstring) — never a raw high comparison.
+
+    `seq` is that day's intraday verdict (intraday.LIMIT_FIRST / STOP_FIRST,
+    None when unresolved). Daily bars carry no clock, so `seq` is the ONLY way
+    the band can collapse; when it is None the band is returned exactly as
+    before, which keeps every pre-intraday row rendering unchanged. A verdict
+    is only ever produced by intraday.resolve() after the session passed its
+    agreement check, so a sparse or split-shifted record cannot collapse a band
+    on the strength of bars it never saw.
     """
     if strategy == "hold_close":
         return (oc, oc)
@@ -78,6 +95,10 @@ def pick_return_band(strategy: str, ol: float, oc: float, filled: bool) -> tuple
     if strategy == "limit_stop":
         stopped = stop_triggered(ol)
         if filled and stopped:
+            if seq == SEQ_LIMIT_FIRST:
+                return (LIMIT_PROFIT, LIMIT_PROFIT)
+            if seq == SEQ_STOP_FIRST:
+                return (STOP_LEVEL, STOP_LEVEL)
             return (STOP_LEVEL, LIMIT_PROFIT)
         if stopped:
             return (STOP_LEVEL, STOP_LEVEL)
@@ -131,7 +152,11 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
         day_wins_w = day_wins_b = 0
         ok = True
         for p in picks:
-            worst, best = pick_return_band(strategy, p[2], p[3], bool(p[4]))
+            # p[5] is the intraday verdict; absent on payloads written before
+            # #79, which must keep rendering as the unresolved band rather than
+            # raising or silently reading as "resolved".
+            seq = p[5] if len(p) > 5 else None
+            worst, best = pick_return_band(strategy, p[2], p[3], bool(p[4]), seq)
             if not (math.isfinite(worst) and math.isfinite(best)):
                 ok = False
                 break

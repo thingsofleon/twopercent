@@ -17,7 +17,7 @@ from decimal import ROUND_HALF_UP, Decimal
 import duckdb
 import pandas as pd
 
-from twopercent import backtest, store, strategy, track
+from twopercent import backtest, intraday, store, strategy, track
 from twopercent.predict import PredictResult, predict_for
 
 _CSS = """
@@ -727,22 +727,36 @@ def _payload_num(value) -> float | None:
 def _payload_days(frame: pd.DataFrame, bases: dict, late: bool = False) -> list[dict]:
     """Per-rank frame -> ordered payload day dicts {d, base, [late,] picks}.
 
-    Each pick is [rank, oh, ol, oc, hit]: the reach view reads only rank+hit;
-    the strategy explorer replays exit rules from the oh/ol/oc outcome returns
-    (null on rows recorded before the strategy upgrade — degradation, not 0).
-    No dollar figure rides in the payload; growth is computed client/server in
-    lockstep from these raw returns."""
+    Each pick is [rank, oh, ol, oc, hit, seq]: the reach view reads only
+    rank+hit; the strategy explorer replays exit rules from the oh/ol/oc
+    outcome returns (null on rows recorded before the strategy upgrade —
+    degradation, not 0). `seq` is the intraday path verdict (#79) and is null
+    whenever the day was not resolved, which is the state every row was in
+    before intraday ingestion existed. No dollar figure rides in the payload;
+    growth is computed client/server in lockstep from these raw returns."""
     days: list[dict] = []
+    # "path", not "seq": experiment_daily.seq is the EXPERIMENT id, and a sim
+    # frame carries it — reading that column as a verdict would feed ids like
+    # 42 into pickBand.
+    has_seq = "path" in frame.columns
     for d, grp in frame.groupby("target_date"):
         day = pd.Timestamp(d).date()
         base = bases.get(day)
+        seqs = grp["path"] if has_seq else [None] * len(grp)
         entry = {
             "d": str(day),
             "base": round(float(base), 6) if base is not None else None,
             "picks": [
-                [int(rank), _payload_num(oh), _payload_num(ol), _payload_num(oc), int(hit)]
-                for rank, oh, ol, oc, hit in zip(
-                    grp["rank"], grp["oh"], grp["ol"], grp["oc"], grp["hit"], strict=True
+                [
+                    int(rank),
+                    _payload_num(oh),
+                    _payload_num(ol),
+                    _payload_num(oc),
+                    int(hit),
+                    None if seq is None or pd.isna(seq) else int(seq),
+                ]
+                for rank, oh, ol, oc, hit, seq in zip(
+                    grp["rank"], grp["oh"], grp["ol"], grp["oc"], grp["hit"], seqs, strict=True
                 )
             ],
         }
@@ -750,6 +764,41 @@ def _payload_days(frame: pd.DataFrame, bases: dict, late: bool = False) -> list[
             entry["late"] = bool(grp["late"].iloc[0])
         days.append(entry)
     return days
+
+
+def _attach_paths(con, frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+    """Merge each pick's intraday path verdict onto the frame, plus a disclosure.
+
+    Returns the frame with a `path` column (intraday.LIMIT_FIRST/STOP_FIRST or
+    NaN) and a one-line note stating how many ambiguous pick-days were resolved
+    and why the rest were not. The note is NOT optional dressing: collapsing
+    some bands and not others changes the headline number, so a reader must be
+    able to see the coverage that produced it. When nothing resolves, the frame
+    comes back exactly as it went in and every band stays open.
+
+    A frame with no `symbol` column, or with all-NULL symbols, cannot be joined
+    to intraday bars at all — that is every sim row recorded before #79, and it
+    says so rather than reporting a truthful-but-misleading "0 resolved".
+    """
+    if frame.empty or "symbol" not in frame.columns:
+        return frame, None
+    pairs = frame[["symbol", "target_date"]].rename(columns={"target_date": "date"}).dropna()
+    if pairs.empty:
+        return frame, (
+            "path resolution: unavailable — these rows predate symbol recording; "
+            "re-run `twopercent benchmark` to make them resolvable (#79)"
+        )
+    res = intraday.resolve(con, pairs)
+    if res.both_touched == 0:
+        return frame, None
+    if res.frame.empty:
+        return frame, f"path resolution: {res.summary()}"
+    merged = frame.merge(
+        res.frame.rename(columns={"date": "target_date"}),
+        on=["symbol", "target_date"],
+        how="left",
+    ).rename(columns={"seq": "path"})
+    return merged, f"path resolution: {res.summary()}"
 
 
 def _summarize_days(days: list[dict], n: int) -> dict:
@@ -1026,7 +1075,12 @@ def _strategy_card(sim_days: list[dict], live_days: list[dict], n: int, w: int) 
     )
 
 
-def _record_explorer(meta: dict | None, sim_days: list[dict], live_days: list[dict]) -> str:
+def _record_explorer(
+    meta: dict | None,
+    sim_days: list[dict],
+    live_days: list[dict],
+    path_notes: list[str] | None = None,
+) -> str:
     """Interactive basket/window/strategy explorer: amber SIM row vs green LIVE
     row, reach-rate by default with opt-in exit-rule P&L views.
 
@@ -1037,6 +1091,10 @@ def _record_explorer(meta: dict | None, sim_days: list[dict], live_days: list[di
     payload."""
     n, w = BASKET_DEFAULT, WINDOW_DEFAULT
     sim_s, live_s, notes = _explorer_state(sim_days, live_days, n, w)
+    # Path-resolution coverage rides with the other per-row disclosures: a
+    # collapsed band and an open one look identical on the page, so the count
+    # of what actually resolved has to be visible beside the number (#79).
+    notes = list(notes) + list(path_notes or [])
     basket_opts = "".join(
         f'<option value="{b}"{" selected" if b == n else ""}>Top {b}</option>'
         for b in BASKET_CHOICES
@@ -1103,12 +1161,19 @@ _JS_MATH = """
 <script>
 var tpMath = (function () {
   var LIMIT = __LIMIT__, STOP = __STOP__, EPS = __EPS__;
-  function pickBand(strat, ol, oc, filled) {
+  var SEQ_LIMIT_FIRST = __SEQ_LIMIT__, SEQ_STOP_FIRST = __SEQ_STOP__;
+  function pickBand(strat, ol, oc, filled, seq) {
     if (strat === "hold_close") return [oc, oc];
     if (strat === "limit_2pct") { var r = filled ? LIMIT : oc; return [r, r]; }
     if (strat === "limit_stop") {
       var stopped = ol <= STOP + EPS;
-      if (filled && stopped) return [STOP, LIMIT];
+      if (filled && stopped) {
+        // seq is the intraday verdict: which trigger came first. Without it a
+        // daily bar cannot tell, so the band stays open.
+        if (seq === SEQ_LIMIT_FIRST) return [LIMIT, LIMIT];
+        if (seq === SEQ_STOP_FIRST) return [STOP, STOP];
+        return [STOP, LIMIT];
+      }
       if (stopped) return [STOP, STOP];
       if (filled) return [LIMIT, LIMIT];
       return [oc, oc];
@@ -1155,7 +1220,8 @@ var tpMath = (function () {
       if (!picks.length) { corrupt += 1; continue; }
       var sumW = 0, sumB = 0, dayWinsW = 0, dayWinsB = 0, ok = true;
       for (j = 0; j < picks.length; j++) {
-        var band = pickBand(strat, picks[j][2], picks[j][3], !!picks[j][4]);
+        var band = pickBand(strat, picks[j][2], picks[j][3], !!picks[j][4],
+                            picks[j].length > 5 ? picks[j][5] : null);
         if (!isFinite(band[0]) || !isFinite(band[1])) { ok = false; break; }
         sumW += band[0]; sumB += band[1];
         if (band[0] > 0) dayWinsW += 1;
@@ -1221,6 +1287,8 @@ _JS_MATH = (
     _JS_MATH.replace("__LIMIT__", repr(strategy.LIMIT_PROFIT))
     .replace("__STOP__", repr(strategy.STOP_LEVEL))
     .replace("__EPS__", repr(strategy._STOP_EPSILON))
+    .replace("__SEQ_LIMIT__", repr(strategy.SEQ_LIMIT_FIRST))
+    .replace("__SEQ_STOP__", repr(strategy.SEQ_STOP_FIRST))
 )
 
 _JS = """
@@ -1503,20 +1571,32 @@ def build_html(
         for d in frame["target_date"]
     ]
     bases = track.daily_base_rates(con, base_dates)
-    # One payload shape for both rows ([rank, oh, ol, oc, hit] per pick): the
-    # sim frame's ret IS the pick's open-to-close return; the live frame comes
-    # straight off daily_returns with the view's column names.
-    sim_days = _payload_days(sim[1].rename(columns={"ret": "oc"}), bases) if sim is not None else []
-    live_days = (
-        _payload_days(
+    # One payload shape for both rows ([rank, oh, ol, oc, hit, path] per pick):
+    # the sim frame's ret IS the pick's open-to-close return; the live frame
+    # comes straight off daily_returns with the view's column names. `path` is
+    # each pick's intraday verdict, merged in here so BOTH rows resolve through
+    # the one code path (#79).
+    path_notes: list[str] = []
+    if sim is not None:
+        sim_frame, note = _attach_paths(con, sim[1].rename(columns={"ret": "oc"}))
+        if note:
+            path_notes.append(f"SIM {note}")
+        sim_days = _payload_days(sim_frame, bases)
+    else:
+        sim_days = []
+    if len(outcomes):
+        live_frame, note = _attach_paths(
+            con,
             outcomes.rename(columns={"high_return": "oh", "low_return": "ol", "oc_return": "oc"}),
-            bases,
-            late=True,
         )
-        if len(outcomes)
-        else []
+        if note:
+            path_notes.append(f"LIVE {note}")
+        live_days = _payload_days(live_frame, bases, late=True)
+    else:
+        live_days = []
+    explorer = _record_explorer(
+        sim[0] if sim is not None else None, sim_days, live_days, path_notes
     )
-    explorer = _record_explorer(sim[0] if sim is not None else None, sim_days, live_days)
     data_tag = _embed_json({"sim": sim_days, "live": live_days})
 
     return (

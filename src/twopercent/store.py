@@ -193,6 +193,11 @@ CREATE TABLE IF NOT EXISTS experiment_daily (
 -- dashboard's strategy views degrade loudly until a re-benchmark.
 ALTER TABLE experiment_daily ADD COLUMN IF NOT EXISTS oh DOUBLE;
 ALTER TABLE experiment_daily ADD COLUMN IF NOT EXISTS ol DOUBLE;
+-- symbol is nullable BY DESIGN: rows recorded before #79 do not have it, and
+-- backfilling is impossible without re-running the benchmark. A NULL symbol
+-- means "this sim pick cannot be path-resolved", which the explorer counts and
+-- discloses rather than silently treating as unresolvable-for-lack-of-data.
+ALTER TABLE experiment_daily ADD COLUMN IF NOT EXISTS symbol TEXT;
 CREATE TABLE IF NOT EXISTS predictions (
     strategy TEXT NOT NULL,
     signal_date DATE NOT NULL,
@@ -227,6 +232,31 @@ CREATE OR REPLACE VIEW latest_universe AS
     SELECT symbol, name, market_cap, as_of, sector
     FROM universe
     WHERE as_of = (SELECT max(as_of) FROM universe);
+-- Intraday bars, OUTCOME-SIDE ONLY (#79 phase 1). They exist to answer one
+-- question daily bars cannot: on a day that touched BOTH the +2% limit and the
+-- -1% stop, which came first. They must NEVER reach features.py or a training
+-- label — see intraday.py's docstring for why that would be lookahead.
+--
+-- `ts` is the bar's START in exchange-local time (yfinance's tz-aware index,
+-- converted and stored naive); `date` is its session date, derived from that
+-- same local timestamp so a bar can never be filed under the wrong session.
+-- Prices are UNADJUSTED, unlike the daily path -- a split after the session
+-- shifts the whole scale, which intraday.session_agreement() catches.
+--
+-- Append-only and NOT reproducible: Yahoo serves ~60 trading days of 5m bars,
+-- so a dropped table cannot be rebuilt beyond that window (issue #79).
+CREATE TABLE IF NOT EXISTS intraday_prices (
+    symbol TEXT NOT NULL,
+    ts TIMESTAMP NOT NULL,
+    date DATE NOT NULL,
+    interval TEXT NOT NULL,
+    open DOUBLE,
+    high DOUBLE,
+    low DOUBLE,
+    close DOUBLE,
+    volume BIGINT,
+    PRIMARY KEY (symbol, ts, interval)
+);
 """
 
 
@@ -593,7 +623,10 @@ def record_experiment_daily(con: duckdb.DuckDBPyConnection, seq: int, rows: pd.D
             f"refusing to record experiment_daily for seq {seq}: frame carries only "
             "one of the oh/ol outcome columns — corrupt shape, record both or neither"
         )
+    has_symbol = "symbol" in rows.columns
     cols = ["target_date", "rank", "ret", "hit"] + (["oh", "ol"] if has_strategy_cols else [])
+    if has_symbol:
+        cols.append("symbol")
     daily = rows[cols].copy()
     checked = ["ret", "oh", "ol"] if has_strategy_cols else ["ret"]
     bad = int(
@@ -615,11 +648,20 @@ def record_experiment_daily(con: duckdb.DuckDBPyConnection, seq: int, rows: pd.D
     daily["target_date"] = pd.to_datetime(daily["target_date"])
     daily.insert(0, "seq", seq)
     oh_ol = "oh, ol" if has_strategy_cols else "NULL AS oh, NULL AS ol"
+    sym = "symbol" if has_symbol else "NULL AS symbol"
+    if not has_symbol:
+        logger.warning(
+            "experiment_daily rows for seq %s carry no symbol — stored as NULL; the "
+            "strategy explorer cannot path-resolve these sim picks (#79) until a "
+            "re-benchmark records them",
+            seq,
+        )
     con.register("experiment_daily_in", daily)
     con.execute(
         f"""
-        INSERT OR REPLACE INTO experiment_daily (seq, target_date, rank, ret, hit, oh, ol)
-        SELECT seq, CAST(target_date AS DATE), rank, ret, hit, {oh_ol}
+        INSERT OR REPLACE INTO experiment_daily
+               (seq, target_date, rank, ret, hit, oh, ol, symbol)
+        SELECT seq, CAST(target_date AS DATE), rank, ret, hit, {oh_ol}, {sym}
         FROM experiment_daily_in
         """
     )

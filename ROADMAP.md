@@ -9,7 +9,8 @@ requirements for the next.
 
 Every trading day, many tickers move 2%+. The system:
 
-1. **Historical processing** — per day, which tickers did +2% (open-to-close)?
+1. **Historical processing** — per day, which tickers reached +2% intraday
+   (open-to-high; open-to-close through 2026-07-24, see the decision table)?
 2. **Signal analysis** — features/signals explaining why a ticker moved.
 3. **Prediction dashboard** — before/during market hours, a ranked list of
    tickers likely to do +2% today; after close, tomorrow's candidates.

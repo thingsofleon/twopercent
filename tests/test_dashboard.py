@@ -495,19 +495,19 @@ def test_dashboard_explorer_payload_json(modeled, tmp_path):
     assert len(payload["sim"]) == 6
     day0 = payload["sim"][0]
     assert day0["d"] == "2026-01-05"
-    # Each pick is [rank, oh, ol, oc, hit, path] — raw outcome returns, the
+    # Each pick is [rank, oh, ol, oc, hit, path, fill] — raw outcome returns, the
     # guarded touch/fill flag, and the intraday path verdict; growth is DERIVED
     # in lockstep, never shipped as dollars. path is null here because no
     # intraday bars are ingested: the band must stay open, never default to a
     # resolved ordering (#79).
     # Hand-check day 0: (i + rank) % 5 == 0 at rank 5 → that one is not a reacher.
     assert day0["picks"] == [
-        [1, 0.0231, -0.0009, 0.0203, 1, None],
-        [2, 0.0231, -0.0009, 0.0203, 1, None],
-        [3, 0.0231, -0.0009, 0.0203, 1, None],
-        [4, 0.0231, -0.0009, 0.0203, 1, None],
-        [5, 0.0042, -0.0117, -0.0117, 0, None],
-        [6, 0.0231, -0.0009, 0.0203, 1, None],
+        [1, 0.0231, -0.0009, 0.0203, 1, None, None],
+        [2, 0.0231, -0.0009, 0.0203, 1, None, None],
+        [3, 0.0231, -0.0009, 0.0203, 1, None, None],
+        [4, 0.0231, -0.0009, 0.0203, 1, None, None],
+        [5, 0.0042, -0.0117, -0.0117, 0, None, None],
+        [6, 0.0231, -0.0009, 0.0203, 1, None, None],
     ]
     # Base rate on 2026-01-05: 4 runners of 8 names reached ≥2%.
     assert abs(day0["base"] - 0.5) < 1e-9
@@ -517,10 +517,10 @@ def test_dashboard_explorer_payload_json(modeled, tmp_path):
     live0 = payload["live"][0]
     assert live0["late"] is True  # backfilled save, created after the target open
     assert [p[0] for p in live0["picks"]] == sorted(p[0] for p in live0["picks"])
-    assert all(len(p) == 6 for p in live0["picks"])
+    assert all(len(p) == 7 for p in live0["picks"])
     # Nothing is path-resolved without intraday bars — every verdict stays null,
     # so every band stays open (#79).
-    assert all(p[5] is None for p in live0["picks"])
+    assert all(p[5] is None and p[6] is None for p in live0["picks"])
     assert all(p[1] is not None and p[2] is not None and p[3] is not None for p in live0["picks"])
 
 
@@ -536,12 +536,12 @@ def test_dashboard_explorer_too_few_sim_days_says_so(modeled, tmp_path):
     assert "The live record above is the clean test." in content
 
 
-def _pick(rank, hit, oh=0.021, ol=-0.002, oc=0.005, path=None):
+def _pick(rank, hit, oh=0.021, ol=-0.002, oc=0.005, path=None, fill=None):
     """A payload pick [rank, oh, ol, oc, hit, path] with harmless defaults.
 
     `path` is the intraday verdict (#79); None means unresolved, which is what
     every pick was before intraday ingestion existed."""
-    return [rank, oh, ol, oc, hit, path]
+    return [rank, oh, ol, oc, hit, path, fill]
 
 
 def test_summarize_days_first_available_substitution_and_short_days():
@@ -708,7 +708,7 @@ def test_strategy_card_framing_stamps_and_gross_labels(modeled, tmp_path):
     assert "before trading costs (not estimated)" in strat_block
     assert "daily bars carry no clock" in strat_block
     # The stop's fill-at-trigger assumption is optimistic and must say so (#86).
-    assert "not at the trigger" in strat_block
+    assert "a stop becomes a market order" in strat_block
     assert "glitch-suspect high never counts as a fill" in strat_block
 
 
@@ -845,6 +845,18 @@ def test_strategy_lockstep_python_vs_node():
         # A pre-#79 pick with only 5 elements must still parse as unresolved on
         # BOTH sides rather than raising or reading index 5 as resolved.
         {"d": "g", "base": 0.3, "picks": [[1, 0.03, -0.03, 0.01, 1]]},
+        # Measured stop exits (#86), including one WORSE than the -1% trigger --
+        # the case that made the old band's lower edge not a worst case, and the
+        # one where min(exit, LIMIT) has to keep worst <= best.
+        {
+            "d": "i",
+            "base": 0.3,
+            "picks": [
+                _pick(1, 1, ol=-0.04, oc=-0.03, fill=-0.031),
+                _pick(2, 1, ol=-0.04, oc=-0.03, path=strategy.SEQ_STOP_FIRST, fill=-0.026),
+                _pick(3, 0, ol=-0.04, oc=-0.03, fill=-0.019),
+            ],
+        },
         # 1 resolved of 8 ambiguous = 12.5%, where Python's half-even round()
         # gives 12% and JS Math.round gives 13% -- the drift class
         # dashboard._pct_half_up already exists for. Pinned here so the

@@ -417,3 +417,64 @@ def test_off_grid_bar_cannot_mask_a_missing_slot(con):
     res = _resolve_one(con)
 
     assert res.resolved == 0 and res.gappy == 1
+
+
+# --- #86: the stop books a TRIGGER, not a fill --------------------------------
+
+
+def _stop_fill(con, symbol="AAA"):
+    return intraday.stop_fills(con, pd.DataFrame({"symbol": [symbol], "date": [SESSION]}))
+
+
+def test_stop_fill_is_measured_from_the_next_bar_not_the_trigger(con):
+    """A stop becomes a market order; it executes at the next available price.
+
+    Booking it at exactly -1% made the band's lower edge the BEST outcome
+    available to a stopped pick, presented as the worst.
+    """
+    _seed_daily(con, open_=100.0, high=101.0, low=97.0, close=98.0)
+    _ingest(
+        con,
+        _bars(
+            [
+                # Reproduces the daily high (101.0) and low (97.0), so the
+                # session passes the completeness gate.
+                ("09:30", 100.0, 101.0, 98.9, 99.0),  # -1.1% low: stop triggers here
+                ("09:35", 97.5, 98.0, 97.0, 97.4),  # fill at this bar's OPEN: -2.5%
+            ]
+        ),
+    )
+    fills = _stop_fill(con)
+
+    assert len(fills) == 1
+    assert abs(float(fills.iloc[0]["fill"]) - (-0.025)) < 1e-9
+    # And it flows through the band as the exit, replacing the -1% assumption.
+    band = strategy.pick_return_band("limit_stop", -0.03, -0.02, False, None, -0.025)
+    assert band == (-0.025, -0.025)
+
+
+def test_unmeasurable_stop_keeps_the_labelled_assumption(con):
+    """A trigger in the FINAL bar has no next bar — no fill may be invented."""
+    _seed_daily(con, open_=100.0, high=101.0, low=97.0, close=98.0)
+    _ingest(con, _bars([("09:30", 100.0, 101.0, 97.0, 98.0)]))
+
+    assert _stop_fill(con).empty
+    assert strategy.pick_return_band("limit_stop", -0.03, -0.02, False, None, None) == (
+        strategy.STOP_LEVEL,
+        strategy.STOP_LEVEL,
+    )
+
+
+def test_stop_fill_requires_the_same_gates_as_ordering(con):
+    """A record that fails the daily-bar check cannot price the exit either."""
+    _seed_daily(con, open_=100.0, high=101.0, low=97.0, close=98.0)
+    _ingest(con, _bars([("09:30", 100.0, 100.5, 98.9, 99.0), ("09:35", 97.5, 98.0, 98.5, 97.4)]))
+
+    assert _stop_fill(con).empty  # intraday low never reaches the daily 97.0
+
+
+def test_a_bad_fill_cannot_invert_the_band(con):
+    """worst <= best must hold even when the measured exit is below the trigger."""
+    worst, best = strategy.pick_return_band("limit_stop", -0.05, -0.04, True, None, -0.045)
+    assert worst <= best
+    assert worst == -0.045 and best == strategy.LIMIT_PROFIT

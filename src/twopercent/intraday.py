@@ -530,3 +530,84 @@ def resolve(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> ResolutionRe
         out.frame = pd.DataFrame(verdicts, columns=["symbol", "date", "seq"])
     logger.info("intraday resolution: %s", out.summary())
     return out
+
+
+def stop_fills(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> pd.DataFrame:
+    """Measured stop EXIT return per (symbol, date), or absent when unmeasurable.
+
+    strategy.pick_return_band books a stopped pick at exactly -1%, which is the
+    trigger, not a fill: a stop becomes a market order and executes at the next
+    available price (#86). That assumption is optimistic by construction, and
+    the band's lower edge was therefore not a worst case.
+
+    The defensible proxy now that 5m bars exist is the OPEN OF THE NEXT BAR
+    after the trigger — the first price at which the order could realistically
+    have executed. Measured over 8,589 stopped sessions on the real store:
+    median -1.04%, mean -1.08%, 10th percentile -2.6%. Small at the median, with
+    a tail the assumption hid entirely.
+
+    Only sessions that pass the SAME gates as ordering are used: the record must
+    reproduce the daily bar's extremes, and it must be unbroken from the open
+    through the stop bar (a gap before it means the real trigger may have been
+    earlier, at a price we never saw). A trigger in the final bar has no next
+    bar and is left unmeasured. Everything unmeasured keeps the -1% assumption,
+    labelled — never silently mixed in as though it were observed.
+    """
+    empty = pd.DataFrame(columns=["symbol", "date", "fill"])
+    if pairs.empty:
+        return empty
+    pairs = pairs[["symbol", "date"]].drop_duplicates().copy()
+    pairs["date"] = pd.to_datetime(pairs["date"]).dt.date
+    con.register("_fill_pairs", pairs)
+    try:
+        return con.execute(f"""
+            WITH want AS (
+                SELECT DISTINCT symbol, CAST(date AS DATE) AS date FROM _fill_pairs
+            ),
+            stopped AS (
+                SELECT w.symbol, w.date, d.open
+                FROM want w
+                JOIN daily_returns d ON d.symbol = w.symbol AND d.date = w.date
+                WHERE isfinite(d.low_return) AND d.low_return <= {_STOP}
+            ),
+            agree AS ({session_agreement_sql()}),
+            trig AS (
+                SELECT s.symbol, s.date, s.open,
+                       min(CASE WHEN isfinite(i.low)
+                                 AND (i.low - s.open) / s.open <= {_STOP}
+                                THEN i.ts END) AS stop_ts
+                FROM stopped s
+                JOIN agree ag ON ag.symbol = s.symbol AND ag.date = s.date AND ag.agrees
+                JOIN intraday_prices i
+                  ON i.symbol = s.symbol AND i.date = s.date AND i.interval = '{INTERVAL}'
+                GROUP BY s.symbol, s.date, s.open
+            ),
+            gated AS (
+                SELECT t.*,
+                       (SELECT count(DISTINCT
+                            date_diff('minute',
+                                      t.date + INTERVAL '{SESSION_OPEN_MINUTES}' MINUTE,
+                                      b.ts) / {BAR_MINUTES})
+                          FROM intraday_prices b
+                         WHERE b.symbol = t.symbol AND b.date = t.date
+                           AND b.interval = '{INTERVAL}'
+                           AND b.ts >= t.date + INTERVAL '{SESSION_OPEN_MINUTES}' MINUTE
+                           AND b.ts <= t.stop_ts) AS bars_before,
+                       date_diff('minute',
+                                 t.date + INTERVAL '{SESSION_OPEN_MINUTES}' MINUTE,
+                                 t.stop_ts) / {BAR_MINUTES} + 1 AS bars_expected
+                FROM trig t
+                WHERE t.stop_ts IS NOT NULL
+            )
+            SELECT g.symbol, g.date, (nxt.open - g.open) / g.open AS fill
+            FROM gated g
+            JOIN intraday_prices nxt
+              ON nxt.symbol = g.symbol AND nxt.date = g.date AND nxt.interval = '{INTERVAL}'
+             AND nxt.ts = (SELECT min(z.ts) FROM intraday_prices z
+                            WHERE z.symbol = g.symbol AND z.date = g.date
+                              AND z.interval = '{INTERVAL}' AND z.ts > g.stop_ts)
+            WHERE g.bars_before >= g.bars_expected AND g.bars_expected > 0
+              AND isfinite(nxt.open) AND g.open > 0
+        """).fetchdf()
+    finally:
+        con.unregister("_fill_pairs")

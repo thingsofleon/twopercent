@@ -69,7 +69,12 @@ def stop_triggered(ol: float) -> bool:
 
 
 def pick_return_band(
-    strategy: str, ol: float, oc: float, filled: bool, seq: int | None = None
+    strategy: str,
+    ol: float,
+    oc: float,
+    filled: bool,
+    seq: int | None = None,
+    fill: float | None = None,
 ) -> tuple[float, float]:
     """(worst, best) day return of one pick under an exit rule, buy-at-open.
 
@@ -94,14 +99,22 @@ def pick_return_band(
         return (ret, ret)
     if strategy == "limit_stop":
         stopped = stop_triggered(ol)
+        # `fill` is the MEASURED stop exit (intraday.stop_fills): the open of
+        # the bar after the trigger, i.e. the first price the market order could
+        # realistically have got. STOP_LEVEL is the trigger, not a fill, and is
+        # optimistic by construction -- it is the fallback only where the exit
+        # could not be measured, and the page says which is which (#86).
+        exit_ret = STOP_LEVEL if fill is None else fill
         if filled and stopped:
             if seq == SEQ_LIMIT_FIRST:
                 return (LIMIT_PROFIT, LIMIT_PROFIT)
             if seq == SEQ_STOP_FIRST:
-                return (STOP_LEVEL, STOP_LEVEL)
-            return (STOP_LEVEL, LIMIT_PROFIT)
+                return (exit_ret, exit_ret)
+            # Order unknown: the worst case is the stop exit, which may be below
+            # the trigger, so min() keeps worst <= best even on a bad fill.
+            return (min(exit_ret, LIMIT_PROFIT), LIMIT_PROFIT)
         if stopped:
-            return (STOP_LEVEL, STOP_LEVEL)
+            return (exit_ret, exit_ret)
         if filled:
             return (LIMIT_PROFIT, LIMIT_PROFIT)
         return (oc, oc)
@@ -184,6 +197,7 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
             # #79, which must keep rendering as the unresolved band rather than
             # raising or silently reading as "resolved".
             seq = p[5] if len(p) > 5 else None
+            fill = p[6] if len(p) > 6 else None
             # Ambiguity/resolution tallies for the disclosure: a band is a point
             # here ONLY because the intraday replay ordered the two triggers, so
             # the page must be able to say how much of the selection that covers.
@@ -191,7 +205,7 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
                 day_amb += 1
                 if seq in (SEQ_LIMIT_FIRST, SEQ_STOP_FIRST):
                     day_res += 1
-            worst, best = pick_return_band(strategy, p[2], p[3], bool(p[4]), seq)
+            worst, best = pick_return_band(strategy, p[2], p[3], bool(p[4]), seq, fill)
             if not (math.isfinite(worst) and math.isfinite(best)):
                 ok = False
                 break

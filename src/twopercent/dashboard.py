@@ -739,10 +739,12 @@ def _payload_days(frame: pd.DataFrame, bases: dict, late: bool = False) -> list[
     # frame carries it — reading that column as a verdict would feed ids like
     # 42 into pickBand.
     has_seq = "path" in frame.columns
+    has_fill = "fill" in frame.columns
     for d, grp in frame.groupby("target_date"):
         day = pd.Timestamp(d).date()
         base = bases.get(day)
         seqs = grp["path"] if has_seq else [None] * len(grp)
+        fills = grp["fill"] if has_fill else [None] * len(grp)
         entry = {
             "d": str(day),
             "base": round(float(base), 6) if base is not None else None,
@@ -754,9 +756,17 @@ def _payload_days(frame: pd.DataFrame, bases: dict, late: bool = False) -> list[
                     _payload_num(oc),
                     int(hit),
                     None if seq is None or pd.isna(seq) else int(seq),
+                    _payload_num(fill),
                 ]
-                for rank, oh, ol, oc, hit, seq in zip(
-                    grp["rank"], grp["oh"], grp["ol"], grp["oc"], grp["hit"], seqs, strict=True
+                for rank, oh, ol, oc, hit, seq, fill in zip(
+                    grp["rank"],
+                    grp["oh"],
+                    grp["ol"],
+                    grp["oc"],
+                    grp["hit"],
+                    seqs,
+                    fills,
+                    strict=True,
                 )
             ],
         }
@@ -807,6 +817,25 @@ def _attach_paths(con, frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
         how="left",
     ).rename(columns={"seq": "path"})
     return merged, f"path resolution: {res.summary()}"
+
+
+def _attach_fills(con, frame: pd.DataFrame) -> pd.DataFrame:
+    """Merge the MEASURED stop exit onto each pick, where one could be measured.
+
+    Absent means "not measurable", and pick_return_band falls back to the -1%
+    trigger — never a silent zero, and never a fabricated fill.
+    """
+    if frame.empty or "symbol" not in frame.columns:
+        return frame
+    pairs = frame[["symbol", "target_date"]].rename(columns={"target_date": "date"}).dropna()
+    if pairs.empty:
+        return frame
+    fills = intraday.stop_fills(con, pairs)
+    if fills.empty:
+        return frame
+    return frame.merge(
+        fills.rename(columns={"date": "target_date"}), on=["symbol", "target_date"], how="left"
+    )
 
 
 def _summarize_days(days: list[dict], n: int) -> dict:
@@ -1093,13 +1122,15 @@ def _strategy_card(
         "were real, this could be a loss. The LIVE row is the honest number — real "
         "logged picks, real outcomes, survivorship-free — but a small sample.</p>"
         '<p class="sub">All returns are gross — before trading costs (not estimated). '
-        "Limit and stop fills are assumed at exactly the trigger price — for the "
-        "stop that is optimistic, since a stop fills at the next available price, "
-        "not at the trigger. A glitch-suspect high never counts as a fill. For the "
-        "limit+stop rule, when both could fill on the same day, 5-minute bars "
-        "decide which came first where the record is complete enough to prove it; "
-        "everywhere else the result stays a best case / worst case band, because "
-        "daily bars carry no clock.</p>"
+        "The +2% limit is assumed to fill at exactly its trigger. The −1% stop is "
+        "NOT: a stop becomes a market order, so where 5-minute bars allow it the "
+        "exit is measured at the next bar's open (typically a few basis points "
+        "below the trigger, occasionally far below), and only falls back to a flat "
+        "−1% where it cannot be measured. A glitch-suspect high never counts as a "
+        "fill. For the limit+stop rule, when both could fill on the same day, "
+        "5-minute bars decide which came first where the record is complete enough "
+        "to prove it; everywhere else the result stays a best case / worst case "
+        "band, because daily bars carry no clock.</p>"
         + reasons
         + f'<p class="sub" id="tp-strat-note">{html.escape(" · ".join(notes))}</p></div>'
     )
@@ -1188,19 +1219,21 @@ _JS_MATH = """
 var tpMath = (function () {
   var LIMIT = __LIMIT__, STOP = __STOP__, EPS = __EPS__;
   var SEQ_LIMIT_FIRST = __SEQ_LIMIT__, SEQ_STOP_FIRST = __SEQ_STOP__;
-  function pickBand(strat, ol, oc, filled, seq) {
+  function pickBand(strat, ol, oc, filled, seq, fill) {
     if (strat === "hold_close") return [oc, oc];
     if (strat === "limit_2pct") { var r = filled ? LIMIT : oc; return [r, r]; }
     if (strat === "limit_stop") {
       var stopped = ol <= STOP + EPS;
+      // fill is the MEASURED stop exit; STOP is only the trigger.
+      var exitRet = (fill === null || fill === undefined) ? STOP : fill;
       if (filled && stopped) {
         // seq is the intraday verdict: which trigger came first. Without it a
         // daily bar cannot tell, so the band stays open.
         if (seq === SEQ_LIMIT_FIRST) return [LIMIT, LIMIT];
-        if (seq === SEQ_STOP_FIRST) return [STOP, STOP];
-        return [STOP, LIMIT];
+        if (seq === SEQ_STOP_FIRST) return [exitRet, exitRet];
+        return [Math.min(exitRet, LIMIT), LIMIT];
       }
-      if (stopped) return [STOP, STOP];
+      if (stopped) return [exitRet, exitRet];
       if (filled) return [LIMIT, LIMIT];
       return [oc, oc];
     }
@@ -1249,6 +1282,7 @@ var tpMath = (function () {
       var dayAmb = 0, dayRes = 0;
       for (j = 0; j < picks.length; j++) {
         var pseq = picks[j].length > 5 ? picks[j][5] : null;
+        var pfill = picks[j].length > 6 ? picks[j][6] : null;
         // Ambiguous = both triggers touched, i.e. the band is only a point if
         // the intraday replay ordered them. Counted for the SELECTED basket and
         // window so the disclosure matches the number on screen.
@@ -1256,7 +1290,7 @@ var tpMath = (function () {
           dayAmb += 1;
           if (pseq === SEQ_LIMIT_FIRST || pseq === SEQ_STOP_FIRST) dayRes += 1;
         }
-        var band = pickBand(strat, picks[j][2], picks[j][3], !!picks[j][4], pseq);
+        var band = pickBand(strat, picks[j][2], picks[j][3], !!picks[j][4], pseq, pfill);
         if (!isFinite(band[0]) || !isFinite(band[1])) { ok = false; break; }
         sumW += band[0]; sumB += band[1];
         if (band[0] > 0) dayWinsW += 1;

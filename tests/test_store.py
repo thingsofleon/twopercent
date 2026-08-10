@@ -392,3 +392,34 @@ def test_experiment_daily_rejects_partial_or_nonfinite_strategy_cols(con):
     with pytest.raises(ValueError, match="non-finite ret/oh/ol"):
         store.record_experiment_daily(con, seq, nan_ol)
     assert con.execute("SELECT count(*) FROM experiment_daily").fetchone()[0] == 0
+
+
+def test_fresh_run_of_comparable_length_supersedes_a_stale_longer_one(con):
+    """#88: ranking on length alone let a stale run pin the dashboard forever.
+
+    After #79 added experiment_daily.symbol, a fresh 256-day run carrying
+    symbols lost to a three-week-old 263-day run without them, so the SIM row
+    reported "path resolution: UNAVAILABLE" no matter how many times the
+    documented post-merge benchmark was re-run.
+    """
+    long_dates = sorted(pd.bdate_range("2026-01-05", periods=20).date)
+    stale = _experiment(con)
+    store.record_experiment_daily(con, stale, _daily_frame(long_dates, {1: [0.01] * 20}))
+    fresh = _experiment(con)  # 19 of 20 days = 95%, above the floor
+    store.record_experiment_daily(con, fresh, _daily_frame(long_dates[:19], {1: [0.02] * 19}))
+
+    meta, _ = store.latest_experiment_daily(con, "s")
+    assert meta["seq"] == fresh
+
+
+def test_a_materially_shorter_run_still_cannot_displace_the_reference(con):
+    """The original hazard stays closed: a `--months 2` run or a compare must
+    never become the reference just by being newer."""
+    long_dates = sorted(pd.bdate_range("2026-01-05", periods=20).date)
+    reference = _experiment(con)
+    store.record_experiment_daily(con, reference, _daily_frame(long_dates, {1: [0.01] * 20}))
+    short = _experiment(con)  # 10 of 20 days = 50%, below the floor
+    store.record_experiment_daily(con, short, _daily_frame(long_dates[:10], {1: [0.09] * 10}))
+
+    meta, _ = store.latest_experiment_daily(con, "s")
+    assert meta["seq"] == reference

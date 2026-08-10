@@ -653,9 +653,14 @@ def test_validation_reports_agreement_and_recoverable_days(con):
     )
     v = intraday.validate_against_1m(con, _pairs_one())
 
-    assert v.resolved_only_at_1m == 1  # 5m could not order it; 1m could
+    # DECOMPOSED: this one is a genuine same-bar recovery, not a 5m capture
+    # defect. Lumping the two overstated same-bar recovery as 442/462 (96%)
+    # when the truth was 350 (76%) — and rendered a numerator against a
+    # denominator it was not a subset of.
+    assert v.recovered_same_bar == 1
+    assert v.recovered_no_5m_record == 0 and v.recovered_5m_failed_gate == 0
     assert v.disagreed == 0
-    assert "unresolvable at 5m are resolvable at 1m" in v.summary()
+    assert "1 of 1 same-5m-bar" in v.summary()
 
 
 def test_validation_says_so_when_there_is_no_1m_cover(con):
@@ -663,7 +668,7 @@ def test_validation_says_so_when_there_is_no_1m_cover(con):
     _seed_daily(con)
     v = intraday.validate_against_1m(con, _pairs_one())
     assert v.compared == 0
-    assert "UNVALIDATED" in v.summary()
+    assert "UNCHECKED" in v.summary()
 
 
 def test_unknown_interval_fails_loudly(con):
@@ -690,3 +695,31 @@ def test_layered_resolution_never_double_counts(con):
     assert best.resolved <= best.both_touched
     assert len(best.frame) == len(best.frame.drop_duplicates(subset=["symbol", "date"]))
     assert best.resolved == 1
+
+
+def test_recovery_separates_finer_resolution_from_a_defective_5m_capture(con):
+    """A 1m win over a BROKEN 5m record is not a win for finer resolution.
+
+    Reported as one lumped count, 442 sessions were presented as "of 462
+    same-5m-bar" when only 350 were: 45 had no 5m record at all and 47 had a 5m
+    record that failed its own agreement gate. Routing around bad data is a
+    different claim from resolving what 5m genuinely could not order, and only
+    the second says anything about interval choice.
+    """
+    _seed_daily(con, open_=100.0, high=103.0, low=98.0, close=101.0)
+    # 5m record that FAILS the agreement gate (never reaches the daily low).
+    _ingest_iv(con, _bars([("09:30", 100.0, 103.0, 99.9, 101.0)]), "5m")
+    # 1m record that is complete and orders the triggers.
+    _ingest_iv(
+        con,
+        _bars([("09:30", 100.0, 100.2, 98.0, 98.4), ("09:31", 98.4, 103.0, 98.2, 101.0)]),
+        "1m",
+    )
+
+    v = intraday.validate_against_1m(con, _pairs_one())
+
+    assert v.recovered_5m_failed_gate == 1
+    assert v.recovered_same_bar == 0, "a broken 5m capture must not count as same-bar recovery"
+    assert v.same_bar_at_5m == 0
+    # And the summary must never print a numerator against a zero denominator.
+    assert "0 of 0 same-5m-bar" in v.summary()

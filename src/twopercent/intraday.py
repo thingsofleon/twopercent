@@ -178,6 +178,9 @@ class ResolutionResult:
     no_intraday: int = 0
     disagreed: int = 0
     gappy: int = 0
+    # The interval these counts were computed at. Hardcoding "5m" in the text
+    # mislabelled a 1m same-bar count as a 5m one once resolution went layered.
+    interval: str = INTERVAL
 
     def summary(self) -> str:
         pct = 100 * self.resolved / self.both_touched if self.both_touched else 0.0
@@ -195,9 +198,9 @@ class ResolutionResult:
         frame fraction stays in summary() for the logs.
         """
         return (
-            f"unresolved: {self.no_intraday} no intraday, {self.same_bar} same 5m "
-            f"bar, {self.gappy} gap before the first trigger, {self.disagreed} "
-            "failed the daily-bar check"
+            f"unresolved: {self.no_intraday} no intraday, {self.same_bar} same "
+            f"{self.interval} bar, {self.gappy} gap before the first trigger, "
+            f"{self.disagreed} failed the daily-bar check"
         )
 
 
@@ -429,7 +432,6 @@ def session_agreement_sql(interval: str = INTERVAL) -> str:
     where NaN > x is TRUE, so an unguarded NaN would sail through as agreement
     (CLAUDE.md).
     """
-    bar_minutes = spec(interval)["minutes"]  # noqa: F841 — used in the f-string
     return f"""
         SELECT i.symbol, i.date,
                d.open AS daily_open,
@@ -550,7 +552,7 @@ def resolve(
     finally:
         con.unregister("_resolve_pairs")
 
-    out = ResolutionResult(frame=empty, both_touched=len(frame))
+    out = ResolutionResult(frame=empty, both_touched=len(frame), interval=interval)
     verdicts: list[dict] = []
     for row in frame.itertuples(index=False):
         if row.agrees is None or pd.isna(row.agrees):
@@ -713,49 +715,79 @@ def stop_fills(
         con.unregister("_fill_pairs")
 
 
-def picked_symbols(con: duckdb.DuckDBPyConnection, top_n: int = 20) -> list[str]:
+def picked_symbols(
+    con: duckdb.DuckDBPyConnection, top_n: int = 20, since: dt.date | None = None
+) -> list[str]:
     """Symbols the model actually picked — logged predictions and sim picks.
 
     Picks-only by design: the explorer needs the ordering of the +2% limit and
     the -1% stop on days the model traded, not the whole universe.
     """
+    # Bounded to the RETENTION WINDOW. The pick set grows ~20 names a day
+    # forever, and every symbol costs requests on a provider this project
+    # already has rate-limit issues with (#31/#34). Symbols last picked outside
+    # the window have no fetchable bars anyway, so including them buys nothing.
+    horizon = since or dt.date.today() - dt.timedelta(
+        days=max(s["lookback"] for s in _SPECS.values())
+    )
     return [
         r[0]
         for r in con.execute(
-            "SELECT DISTINCT symbol FROM predictions WHERE rank <= ? "
+            "SELECT DISTINCT symbol FROM predictions WHERE rank <= ? AND signal_date >= ? "
             "UNION SELECT DISTINCT symbol FROM experiment_daily "
-            "WHERE symbol IS NOT NULL AND rank <= ?",
-            [top_n, top_n],
+            "WHERE symbol IS NOT NULL AND rank <= ? AND target_date >= ?",
+            [top_n, horizon, top_n, horizon],
         ).fetchall()
     ]
 
 
 @dataclass
 class ValidationResult:
-    """5m verdicts checked against 1m ground truth on the sessions holding both."""
+    """5m verdicts cross-checked against the 1m record on sessions holding both.
+
+    NOT an accuracy check. See validate_against_1m for why agreement here is
+    largely forced, and for the 21% of shipped verdicts it cannot reach.
+    """
 
     compared: int = 0
     agreed: int = 0
     disagreed: int = 0
-    resolved_only_at_1m: int = 0
+    # Recovery, DECOMPOSED. The headline "unresolvable at 5m, resolvable at 1m"
+    # conflated three different things and was rendered against a denominator it
+    # was not a subset of (442 reported "of 462 same-5m-bar" when only 350 were
+    # same-bar). Finer resolution genuinely winning is a different claim from
+    # routing around a defective 5m capture, and only the first is about 1m.
+    recovered_same_bar: int = 0
+    recovered_no_5m_record: int = 0
+    recovered_5m_failed_gate: int = 0
     same_bar_at_5m: int = 0
     sessions_with_both: int = 0
+    unchecked_5m_verdicts: int = 0
+
+    @property
+    def resolved_only_at_1m(self) -> int:
+        return self.recovered_same_bar + self.recovered_no_5m_record + self.recovered_5m_failed_gate
 
     @property
     def agreement(self) -> float:
         return self.agreed / self.compared if self.compared else float("nan")
 
     def summary(self) -> str:
-        # The recovery count is reported even when nothing could be COMPARED:
-        # "0 verdicts to check" and "1m recovers no days" are different facts,
-        # and collapsing them hides the upside that motivates capturing 1m.
+        pct = (
+            f" ({100 * self.recovered_same_bar / self.same_bar_at_5m:.0f}%)"
+            if self.same_bar_at_5m
+            else ""
+        )
         recovery = (
-            f"{self.resolved_only_at_1m} day(s) unresolvable at 5m are resolvable at 1m "
-            f"(of {self.same_bar_at_5m} same-5m-bar); "
-            f"{self.sessions_with_both} session(s) hold both intervals"
+            f"1m recovers {self.resolved_only_at_1m} day(s) 5m could not order: "
+            f"{self.recovered_same_bar} of {self.same_bar_at_5m} same-5m-bar{pct}, "
+            f"{self.recovered_no_5m_record} with no 5m record, "
+            f"{self.recovered_5m_failed_gate} whose 5m record failed its gate; "
+            f"{self.unchecked_5m_verdicts} shipped 5m verdict(s) UNCHECKED "
+            f"(1m too gappy); {self.sessions_with_both} session(s) hold both"
         )
         if not self.compared:
-            return f"no 5m verdict has 1m cover yet — the 5m orderings are UNVALIDATED; {recovery}"
+            return f"no 5m verdict has 1m cover yet — the 5m orderings are UNCHECKED; {recovery}"
         return (
             f"{self.agreed}/{self.compared} 5m verdicts confirmed by 1m "
             f"({100 * self.agreement:.1f}%); {self.disagreed} INVERTED; {recovery}"
@@ -763,22 +795,38 @@ class ValidationResult:
 
 
 def validate_against_1m(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> ValidationResult:
-    """Re-resolve at 1m and diff against the 5m verdicts. GROUND TRUTH, not argument.
+    """Cross-check 5m verdicts against the 1m record. A COMPLETENESS check.
 
-    The 5m orderings are derivationally sound — the contiguity gate means no
-    missing bar could have carried the other trigger earlier — but "sound" is a
-    claim about the method, not a measurement of the answer. 1m is the only
-    finer evidence Yahoo serves, so re-resolving the same sessions at 1m and
-    counting how often the verdict flips is the one available check.
+    READ THE LIMITS BEFORE QUOTING THE NUMBER. This is not independent ground
+    truth and it is not an accuracy measurement, for two reasons that between
+    them account for almost all of the agreement it reports.
 
-    Two numbers matter and they mean different things. AGREEMENT is the error
-    rate of the 5m verdicts that ship. RESOLVED_ONLY_AT_1M is upside: sessions
-    whose triggers share a 5m bar but separate at 1m, i.e. how much of the
-    ~29% same-bar residual finer data would recover.
+    1. 5m is a server-side RESAMPLE of 1m, not a separate observation. Measured
+       on the real store, a 5m bar's high equals the max of its five constituent
+       1m bars in 99.82% of slots (low: 99.83%). Under that identity the first
+       5m bar to reach a trigger is just the 5m bucket containing the first 1m
+       bar to reach it — and resolve() only emits a verdict when the two
+       triggers land in DIFFERENT buckets, in which case the 1m ordering must
+       agree. Zero inversions is very largely forced by arithmetic, not
+       evidence that the verdicts are right.
 
-    A disagreement is not automatically a 5m failure — both verdicts pass their
-    own gates, and 1m is sparser, so a 1m record can be gappier. It is a signal
-    to investigate, which is why disagreements are counted rather than used to
+    2. The comparison excludes exactly the risky cases. A 5m verdict is only
+       checked where the 1m record is ALSO gapless to the first trigger, and on
+       the real store 649 of 3,014 shipped verdicts (21.5%) fail that — 647 of
+       them because the 1m record is gappy. Those are the illiquid sessions
+       (median $12.6M dollar volume vs $38.1M for the checked cohort), which is
+       precisely where a gap before the trigger is plausible. Agreement is a
+       result about the easy cohort.
+
+    What this DID reveal, and it is not reassuring: in the unchecked cohort a
+    typical session has 77 of 78 5m slots present but only 264 of 390 minutes
+    traded. On an illiquid name the 5m contiguity gate passes trivially, because
+    a name trading a third of the day's minutes still prints in every 5m slot.
+    The 1m data is the first evidence of how WEAK that gate is at 5m — read this
+    function as measuring the gate's coverage, never as confirming its verdicts.
+
+    A disagreement is not automatically a 5m failure — 1m is sparser, so its
+    record can be the defective one. Disagreements are counted, never used to
     silently overwrite anything.
     """
     both = con.execute(
@@ -811,11 +859,26 @@ def validate_against_1m(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> 
 
     f = _norm(five.frame, "seq_5m")
     o = _norm(one.frame, "seq_1m")
+
+    def _decompose(recovered: pd.DataFrame) -> None:
+        """Why could 5m not order these? Ask 5m directly, rather than assuming.
+
+        Reporting one lumped count against a same-bar denominator overstated the
+        same-bar recovery as 442 of 462 (96%) when the truth was 350 (76%); the
+        other 92 were sessions whose 5m CAPTURE was missing or failed its gate,
+        which is a statement about the data, not about resolution.
+        """
+        if recovered.empty:
+            return
+        back = resolve(con, recovered[key], interval="5m")
+        out.recovered_same_bar = back.same_bar
+        out.recovered_no_5m_record = back.no_intraday
+        out.recovered_5m_failed_gate = back.disagreed + back.gappy
+
     if f.empty or o.empty:
-        # Still count the upside: days 5m could not order that 1m could.
         if not o.empty:
             resolved_5m = set(map(tuple, f[key].values)) if not f.empty else set()
-            out.resolved_only_at_1m = sum(1 for r in o[key].values if tuple(r) not in resolved_5m)
+            _decompose(o[[tuple(r) not in resolved_5m for r in o[key].values]])
         return out
 
     merged = f.merge(o, on=key, how="outer")
@@ -823,15 +886,25 @@ def validate_against_1m(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> 
     out.compared = len(both_known)
     out.agreed = int((both_known["seq_5m"] == both_known["seq_1m"]).sum())
     out.disagreed = out.compared - out.agreed
-    out.resolved_only_at_1m = int(merged["seq_5m"].isna().sum())
+    # Shipped 5m verdicts the 1m record could NOT check — the cohort that
+    # carries the risk, and the one agreement says nothing about.
+    out.unchecked_5m_verdicts = int(merged["seq_1m"].isna().sum())
+    _decompose(merged[merged["seq_5m"].isna()])
     logger.info("intraday 1m validation: %s", out.summary())
     return out
 
 
-# Finest first: a 1m record orders triggers that share a 5m bar. Measured on the
-# real store, 442 of 462 same-5m-bar sessions (96%) resolve at 1m, and 1m
-# confirmed 2,365 of 2,365 5m verdicts with zero inversions -- so preferring it
-# adds coverage without trading away correctness.
+# Finest first, for ORDERING only. A 1m record separates triggers that share a
+# 5m bar: 350 of 462 same-5m-bar sessions (76%) on the real store. Each interval
+# is gated independently, so a finer verdict is not a weaker one.
+#
+# Deliberately NOT used for stop FILLS. Switching those to 1m moves a displayed
+# money number in the flattering direction (+0.145pp per stopped pick on the
+# live record) while adding almost no coverage (117 -> 117 there), because the
+# 1m proxy has a thinner left tail and pick_return_band's clamp truncates only
+# the right one. It is ~97% a re-pricing and ~3% a coverage gain, and nothing
+# measures whether the 60-second proxy is more accurate than the 5-minute one --
+# only that it is smaller. This project's standard is measured, not argued (#95).
 RESOLUTION_ORDER = ("1m", "5m")
 
 
@@ -887,6 +960,7 @@ def resolve_best(
         frame=verdicts,
         both_touched=total_touched,
         resolved=len(verdicts),
+        interval=last.interval if last else intervals[-1],
         same_bar=last.same_bar if last else 0,
         no_intraday=last.no_intraday if last else 0,
         disagreed=last.disagreed if last else 0,

@@ -25,7 +25,7 @@ uv run twopercent predict              # ranked +2% candidates (logged)
 uv run twopercent dashboard            # static dashboard.html
 uv run twopercent intraday             # 5m bars for picked symbols (exit-path resolution)
 uv run twopercent intraday --interval 1m   # 1m bars (ground truth; expires in ~30 days)
-uv run twopercent intraday-validate    # check 5m verdicts against 1m
+uv run twopercent intraday-validate    # cross-check 5m verdicts against 1m
 uv run twopercent benchmark            # walk-forward benchmark -> experiments row
 uv run twopercent routine              # pre-open daily cycle (predict mode)
 uv run twopercent routine --mode score # post-close scoring + degradation check

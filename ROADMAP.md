@@ -489,14 +489,33 @@ ambiguous days have both triggers inside ONE 5m bar, which no amount of backfill
 fixes. Phase 2 (prior-day intraday FEATURES) is NOT built — it additionally
 requires extending the lookahead canary to mutate `intraday_prices`.
 
-**Validated 2026-08-10** (1m ground truth): 5m verdicts re-resolved at 1m —
-**2,365 of 2,365 confirmed, ZERO inversions**, so the contiguity gate holds and
-the shipped orderings are correct. The upside is larger than the check: **442 of
-462 same-5m-bar sessions (96%) resolve at 1m**, so resolution now runs
-finest-first (`intraday.resolve_best`, 1m then 5m) and the live record goes from
-52% to 69% resolved with same-bar days dropping 34 -> 13. Both intervals are
-captured by the score routine daily, because 5m expires at ~60 calendar days and
-1m at ~30 — intraday_prices is the one table a re-run cannot rebuild.
+**Cross-checked 2026-08-10** (1m vs 5m) — and the check is WEAKER than it first
+appeared, so read the limits before quoting it. 5m is a server-side RESAMPLE of
+1m (a 5m high equals the max of its five 1m bars in 99.8% of slots), so a 5m
+verdict and its 1m counterpart agree by arithmetic wherever both records are
+complete; 2,365/2,365 with zero inversions is very largely forced, not evidence
+of accuracy. Worse, the comparison EXCLUDES the risky cohort: 649 of 3,014
+shipped verdicts (21.5%) could not be checked because the 1m record is gappy,
+and those are the illiquid sessions (median $12.6M vs $38.1M dollar volume) —
+exactly where a gap before the trigger is plausible.
+
+What it DID reveal is unwelcome: in that cohort a typical session has 77 of 78
+5m slots present but only 264 of 390 minutes traded. **On an illiquid name the
+5m contiguity gate passes trivially**, because a name trading a third of the
+day's minutes still prints in every 5m slot. Treat this as a measurement of the
+gate's COVERAGE, not a confirmation of its verdicts.
+
+Resolution nonetheless runs finest-first (`intraday.resolve_best`, 1m then 5m):
+**350 of 462 same-5m-bar sessions (76%)** genuinely resolve at 1m, taking the
+live record from 52% to 69% and same-bar days from 34 to 13. Stop FILLS
+deliberately stay 5m-only — switching them to 1m is ~97% a re-pricing in the
+flattering direction and ~3% coverage, and nothing measures that the 60-second
+proxy is more accurate rather than merely smaller (#95).
+
+Both intervals are captured by the score routine daily, because 5m expires at
+~60 calendar days and 1m at ~30 — intraday_prices is the one table a re-run
+cannot rebuild (though the daily full-window refetch does give ~20 trading days
+of slack, so a single missed run is not fatal).
 
 ## Status
 

@@ -860,7 +860,9 @@ def _attach_fills(con, frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
     pairs = frame[["symbol", "target_date"]].rename(columns={"target_date": "date"}).dropna()
     if pairs.empty:
         return frame, None
-    fills = intraday.stop_fills_best(con, pairs)
+    # 5m only, deliberately: see intraday.RESOLUTION_ORDER. Layered fills are a
+    # re-pricing dressed as a coverage gain and are not validated (#95).
+    fills = intraday.stop_fills(con, pairs)
     if fills.empty:
         return frame, (
             "stop exits: none measurable — every stopped pick uses the flat −1% "
@@ -874,7 +876,7 @@ def _attach_fills(con, frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
     lo = pd.Timestamp(fills["date"].min()).date()
     hi = pd.Timestamp(fills["date"].max()).date()
     return merged, (
-        f"stop exits: {len(fills)} session(s) priced from 5m bars ({lo} to {hi}); "
+        f"stop exits: {len(fills)} session(s) priced from 5-minute bars ({lo} to {hi}); "
         "stopped picks outside that range fall back to the flat −1% trigger, which "
         "is optimistic. Measured and assumed exits are mixed in one curve"
     )
@@ -1395,19 +1397,19 @@ var tpMath = (function () {
              "\u2014 every band below is the daily worst/best case";
     }
     return prefix + ": " + s.res + " of " + s.amb + " both-triggered picks (" + pct +
-           "%) ordered from 5m bars; the rest stay a worst/best band. A collapsed " +
+           "%) ordered from intraday bars; the rest stay a worst/best band. A collapsed " +
            "band is conditional on that replay, not proven from daily bars, and " +
            "resolvable days skew liquid.";
   }
   function fillNote(prefix, s) {
     if (!s || !s.stopped) return null;
     if (!s.meas) {
-      return prefix + ": 0 of " + s.stopped + " stopped picks priced from 5m bars " +
+      return prefix + ": 0 of " + s.stopped + " stopped picks priced from 5-minute bars " +
              "\u2014 all use the flat \u22121% trigger, which is optimistic";
     }
     var pct = Math.floor(100 * s.meas / s.stopped + 0.5);
     return prefix + ": " + s.meas + " of " + s.stopped + " stopped picks (" + pct +
-           "%) priced from 5m bars, capped at the trigger; the rest assume a flat " +
+           "%) priced from 5-minute bars, capped at the trigger; the rest assume a flat " +
            "\u22121%, which is optimistic";
   }
   function rowNotes(prefix, s, n) {

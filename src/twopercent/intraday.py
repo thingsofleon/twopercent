@@ -149,9 +149,21 @@ class ResolutionResult:
         pct = 100 * self.resolved / self.both_touched if self.both_touched else 0.0
         return (
             f"{self.resolved}/{self.both_touched} ambiguous pick-days resolved "
-            f"({pct:.0f}%); unresolved: {self.no_intraday} no intraday, "
-            f"{self.same_bar} same 5m bar, {self.gappy} gap before the first "
-            f"trigger, {self.disagreed} failed the daily-bar check"
+            f"({pct:.0f}%); {self.reasons()}"
+        )
+
+    def reasons(self) -> str:
+        """Only WHY days went unresolved — no coverage fraction.
+
+        This line renders beside the per-selection coverage note, and that note
+        counts a different population (the chosen basket and window). Two
+        differing fractions inches apart read as a contradiction, so the whole-
+        frame fraction stays in summary() for the logs.
+        """
+        return (
+            f"unresolved: {self.no_intraday} no intraday, {self.same_bar} same 5m "
+            f"bar, {self.gappy} gap before the first trigger, {self.disagreed} "
+            "failed the daily-bar check"
         )
 
 
@@ -447,9 +459,19 @@ def resolve(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> ResolutionRe
             span AS (
                 SELECT h.symbol, h.date, h.agrees, h.limit_ts, h.stop_ts,
                        least(h.limit_ts, h.stop_ts) AS first_ts,
-                       (SELECT count(*) FROM intraday_prices b
+                       -- DISTINCT grid slots, floored at the open: a raw row
+                       -- count let one off-grid or pre-open print mask one
+                       -- missing 5m slot and pass the gate (quant-skeptic B).
+                       -- Counting slots makes duplicates and off-grid prints
+                       -- collapse onto the slot they belong to.
+                       (SELECT count(DISTINCT
+                            date_diff('minute',
+                                      h.date + INTERVAL '{SESSION_OPEN_MINUTES}' MINUTE,
+                                      b.ts) / {BAR_MINUTES})
+                          FROM intraday_prices b
                          WHERE b.symbol = h.symbol AND b.date = h.date
                            AND b.interval = '{INTERVAL}'
+                           AND b.ts >= h.date + INTERVAL '{SESSION_OPEN_MINUTES}' MINUTE
                            AND b.ts <= least(h.limit_ts, h.stop_ts)) AS bars_before
                 FROM hits h
             )

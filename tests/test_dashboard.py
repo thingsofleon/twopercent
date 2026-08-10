@@ -845,6 +845,16 @@ def test_strategy_lockstep_python_vs_node():
         # A pre-#79 pick with only 5 elements must still parse as unresolved on
         # BOTH sides rather than raising or reading index 5 as resolved.
         {"d": "g", "base": 0.3, "picks": [[1, 0.03, -0.03, 0.01, 1]]},
+        # 1 resolved of 8 ambiguous = 12.5%, where Python's half-even round()
+        # gives 12% and JS Math.round gives 13% -- the drift class
+        # dashboard._pct_half_up already exists for. Pinned here so the
+        # coverage claim itself cannot drift, not just its rounding.
+        {
+            "d": "h",
+            "base": 0.35,
+            "picks": [_pick(1, 1, ol=-0.05, oc=-0.02, path=strategy.SEQ_STOP_FIRST)]
+            + [_pick(i, 1, ol=-0.05, oc=-0.02) for i in range(2, 9)],
+        },
     ]
     missing_days = days + [{"d": "e", "base": None, "picks": [[1, None, None, None, 0]]}]
 
@@ -859,6 +869,7 @@ for (const strat of ["hold_close", "limit_2pct", "limit_stop"]) {{
     const s = tpMath.stratSummarize(days, n, strat);
     out[strat + ":" + n] = [s.gw, s.gb, s.ww, s.wb, s.picks, s.days, s.clean,
                             s.shortDays, s.substDays, s.missing, s.corrupt,
+                            s.amb, s.res, tpMath.pathNote("SIM", s),
                             tpMath.growthText(s), tpMath.winText(s),
                             tpMath.readText(s, null)];
   }}
@@ -893,6 +904,9 @@ console.log(JSON.stringify(out));
                 s["subst"],
                 s["missing"],
                 s["corrupt"],
+                s["amb"],
+                s["res"],
+                dashboard.strategy.path_note("SIM", s),
                 dashboard._growth_text(s),
                 dashboard._win_text(s),
                 dashboard._strategy_read(s, None),

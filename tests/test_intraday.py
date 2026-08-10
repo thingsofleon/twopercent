@@ -392,3 +392,28 @@ def test_ohlc_impossible_intraday_bar_is_dropped_and_warned(con, caplog):
 
     assert result.rows == 1
     assert "OHLC-impossible" in caplog.text
+
+
+def test_off_grid_bar_cannot_mask_a_missing_slot(con):
+    """Contiguity counts DISTINCT grid slots, not rows (quant-skeptic B).
+
+    An extra off-grid 09:32 print alongside a MISSING 09:35 slot used to make a
+    raw row count reach its expected total, passing the gate and restoring the
+    inverted verdict. Slot counting collapses the stray print onto 09:30.
+    """
+    _seed_daily(con, open_=100.0, high=104.0, low=98.0, close=101.0)
+    _ingest(
+        con,
+        _bars(
+            [
+                ("09:30", 100.0, 100.5, 99.9, 100.2),
+                ("09:32", 100.2, 100.4, 100.0, 100.3),  # off-grid filler
+                # 09:35 slot MISSING — the limit actually fired here
+                ("10:00", 100.3, 100.6, 98.0, 98.4),
+                ("15:00", 98.4, 104.0, 98.1, 101.0),
+            ]
+        ),
+    )
+    res = _resolve_one(con)
+
+    assert res.resolved == 0 and res.gappy == 1

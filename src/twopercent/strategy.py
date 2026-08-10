@@ -123,7 +123,10 @@ def path_note(prefix: str, s: dict | None) -> str | None:
             f"{prefix}: 0 of {amb} both-triggered picks resolved "
             "— every band below is the daily worst/best case"
         )
-    pct = round(100 * res / amb)
+    # floor(x + 0.5), NOT round(): Python rounds half-even (1/8 -> "12%") while
+    # JS Math.round is half-up ("13%"), so the server render would flicker on the
+    # first selector change. Same drift dashboard._pct_half_up exists for.
+    pct = math.floor(100 * res / amb + 0.5)
     return (
         f"{prefix}: {res} of {amb} both-triggered picks ({pct}%) ordered from 5m "
         "bars; the rest stay a worst/best band. A collapsed band is conditional "

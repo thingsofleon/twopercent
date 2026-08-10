@@ -800,7 +800,7 @@ def _attach_paths(con, frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
     if res.both_touched == 0:
         return frame, None
     if res.frame.empty:
-        return frame, f"path resolution: {res.summary()}"
+        return frame, f"path resolution — {res.reasons()}"
     merged = frame.merge(
         res.frame.rename(columns={"date": "target_date"}),
         on=["symbol", "target_date"],

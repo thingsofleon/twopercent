@@ -832,8 +832,13 @@ def _attach_fills(con, frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
     still working". Without the date range on the page, a regime change and an
     accounting change are indistinguishable.
     """
-    if frame.empty or "symbol" not in frame.columns:
+    if frame.empty:
         return frame, None
+    if "symbol" not in frame.columns:
+        return frame, (
+            "stop exits: UNAVAILABLE — these rows carry no symbol, so every stopped "
+            "pick uses the flat −1% trigger"
+        )
     pairs = frame[["symbol", "target_date"]].rename(columns={"target_date": "date"}).dropna()
     if pairs.empty:
         return frame, None
@@ -846,7 +851,8 @@ def _attach_fills(con, frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
     merged = frame.merge(
         fills.rename(columns={"date": "target_date"}), on=["symbol", "target_date"], how="left"
     )
-    lo, hi = fills["date"].min(), fills["date"].max()
+    lo = pd.Timestamp(fills["date"].min()).date()
+    hi = pd.Timestamp(fills["date"].max()).date()
     return merged, (
         f"stop exits: {len(fills)} session(s) priced from 5m bars ({lo} to {hi}); "
         "stopped picks outside that range fall back to the flat −1% trigger, which "
@@ -1049,9 +1055,10 @@ def _strategy_state(
     # and the first client repaint say the same thing.
     if strat == "limit_stop":
         for prefix, state in (("SIM", sim_s), ("LIVE", live_s)):
-            note = strategy.path_note(prefix, state)
-            if note:
-                notes.append(note)
+            for builder in (strategy.path_note, strategy.fill_note):
+                note = builder(prefix, state)
+                if note:
+                    notes.append(note)
     return sim_s, live_s, notes
 
 
@@ -1161,8 +1168,8 @@ def _strategy_card(
         "NOT: a stop becomes a market order, so where 5-minute bars allow it the "
         "exit is priced from the next bar's open, capped at the trigger (a stop "
         "cannot fill above it), and falls back to a flat −1% where it cannot be "
-        "priced — see the coverage line below for how much of this window is "
-        "which. A glitch-suspect high never counts as a fill. For the limit+stop "
+        "priced — the coverage line below states how much of the SELECTED window "
+        "is which. A glitch-suspect high never counts as a fill. For the limit+stop "
         "rule, when both could fill on the same day, "
         "5-minute bars decide which came first where the record is complete enough "
         "to prove it; everywhere else the result stays a best case / worst case "
@@ -1302,7 +1309,7 @@ var tpMath = (function () {
   }
   function stratSummarize(days, n, strat) {
     var gw = 1, gb = 1, winsW = 0, winsB = 0, picksN = 0;
-    var ambN = 0, resN = 0;
+    var ambN = 0, resN = 0, measN = 0, stoppedN = 0;
     var shortDays = 0, substDays = 0, missing = 0, corrupt = 0;
     for (var i = 0; i < days.length; i++) {
       var picks = days[i].picks.slice(0, n);
@@ -1316,7 +1323,7 @@ var tpMath = (function () {
       if (miss) { missing += 1; continue; }
       if (!picks.length) { corrupt += 1; continue; }
       var sumW = 0, sumB = 0, dayWinsW = 0, dayWinsB = 0, ok = true;
-      var dayAmb = 0, dayRes = 0;
+      var dayAmb = 0, dayRes = 0, dayMeas = 0, dayStopped = 0;
       for (j = 0; j < picks.length; j++) {
         var pseq = picks[j].length > 5 ? picks[j][5] : null;
         var pfill = picks[j].length > 6 ? picks[j][6] : null;
@@ -1326,6 +1333,10 @@ var tpMath = (function () {
         if (!!picks[j][4] && picks[j][2] <= STOP + EPS) {
           dayAmb += 1;
           if (pseq === SEQ_LIMIT_FIRST || pseq === SEQ_STOP_FIRST) dayRes += 1;
+        }
+        if (picks[j][2] <= STOP + EPS) {
+          dayStopped += 1;
+          if (pfill !== null && pfill !== undefined) dayMeas += 1;
         }
         var band = pickBand(strat, picks[j][2], picks[j][3], !!picks[j][4], pseq, pfill);
         if (!isFinite(band[0]) || !isFinite(band[1])) { ok = false; break; }
@@ -1338,6 +1349,8 @@ var tpMath = (function () {
       winsB += dayWinsB;
       ambN += dayAmb;
       resN += dayRes;
+      measN += dayMeas;
+      stoppedN += dayStopped;
       picksN += picks.length;
       gw *= 1 + sumW / picks.length;
       gb *= 1 + sumB / picks.length;
@@ -1345,7 +1358,7 @@ var tpMath = (function () {
     var clean = days.length - missing - corrupt;
     return { gw: clean ? gw : NaN, gb: clean ? gb : NaN,
              ww: picksN ? winsW / picksN : NaN, wb: picksN ? winsB / picksN : NaN,
-             amb: ambN, res: resN,
+             amb: ambN, res: resN, meas: measN, stopped: stoppedN,
              picks: picksN, days: days.length, clean: clean,
              shortDays: shortDays, substDays: substDays, baseDays: 0,
              missing: missing, corrupt: corrupt };
@@ -1365,6 +1378,17 @@ var tpMath = (function () {
            "%) ordered from 5m bars; the rest stay a worst/best band. A collapsed " +
            "band is conditional on that replay, not proven from daily bars, and " +
            "resolvable days skew liquid.";
+  }
+  function fillNote(prefix, s) {
+    if (!s || !s.stopped) return null;
+    if (!s.meas) {
+      return prefix + ": 0 of " + s.stopped + " stopped picks priced from 5m bars " +
+             "\u2014 all use the flat \u22121% trigger, which is optimistic";
+    }
+    var pct = Math.floor(100 * s.meas / s.stopped + 0.5);
+    return prefix + ": " + s.meas + " of " + s.stopped + " stopped picks (" + pct +
+           "%) priced from 5m bars, capped at the trigger; the rest assume a flat " +
+           "\u22121%, which is optimistic";
   }
   function rowNotes(prefix, s, n) {
     var notes = [];
@@ -1403,7 +1427,8 @@ var tpMath = (function () {
     return "No strategy result to translate yet \\u2014 see the notes below.";
   }
   return { pickBand: pickBand, summarize: summarize, stratSummarize: stratSummarize,
-           rowNotes: rowNotes, pathNote: pathNote, growthText: growthText, winText: winText,
+           rowNotes: rowNotes, pathNote: pathNote, fillNote: fillNote,
+           growthText: growthText, winText: winText,
            becameText: becameText, readText: readText };
 })();
 </script>
@@ -1538,6 +1563,10 @@ _JS = """
       if (pn) notes.push(pn);
       var pl = tpMath.pathNote("LIVE", liveS);
       if (pl) notes.push(pl);
+      var fs = tpMath.fillNote("SIM", simS);
+      if (fs) notes.push(fs);
+      var fl = tpMath.fillNote("LIVE", liveS);
+      if (fl) notes.push(fl);
     }
     setStratRow("strat-sim", simS);
     setStratRow("strat-live", liveS);

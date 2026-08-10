@@ -566,16 +566,27 @@ def stop_fills(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> pd.DataFr
     the band's lower edge was therefore not a worst case.
 
     The proxy is the OPEN OF THE NEXT 5m BAR after the trigger. Measured by
-    running THIS function over every stopped session in the real store
-    (2026-08-10; 2,712 sessions survive all three gates):
+    running THIS function, on data/twopercent.duckdb as of 2026-08-10, over the
+    pairs from:
 
-        mean -1.06%   median -1.03%   p10 -3.19%
-        49% land BETTER than the trigger, 22% are outright gains
+        SELECT DISTINCT symbol, date FROM daily_returns
+        WHERE isfinite(low_return) AND low_return <= -0.01 + 1e-9
 
-    Quote those numbers only alongside the query that produced them. An earlier
-    revision of this docstring cited an UNGATED population (8,589 sessions,
-    median -1.04%) as though it were this function's output — the ungated set is
-    both larger and more alarming, which is exactly why the provenance matters.
+    -> 6,968 sessions survive all three gates:
+
+        mean -1.01%   median -1.02%   p10 -2.49%   max +16.78%
+        49.2% land BETTER than the trigger, 17.0% are outright gains
+        after the clamp in strategy.pick_return_band: mean -1.49%
+
+    Quote those numbers only with that query and that store. Two earlier
+    revisions of this docstring got the provenance wrong in two different ways:
+    the first cited an UNGATED population (8,589 sessions), the second was
+    measured against a PARTIAL copy of the store holding 126 symbols instead of
+    504 (2,712 sessions). Both were plausible and both were wrong, which is why
+    the query and the file now sit next to the figures.
+
+    The adjacency gate costs 2.0% of coverage (7,112 -> 6,968), not the large
+    share an earlier note guessed at.
 
     The next bar's open is the first price at which a market order sent at the
     trigger could plausibly print, so it is preferred over the trigger bar's

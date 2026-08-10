@@ -150,6 +150,30 @@ def path_note(prefix: str, s: dict | None) -> str | None:
     )
 
 
+def fill_note(prefix: str, s: dict | None) -> str | None:
+    """Measured-vs-assumed stop-exit coverage — mirror of JS tpMath.fillNote().
+
+    The −1% fallback is optimistic (a stop is a trigger, not a fill), so a cell
+    where most stopped picks fall back reads better than one where most are
+    priced. Every fill lives in one recent stretch, so short windows are mostly
+    measured and long ones mostly assumed — a difference a reader would
+    otherwise mistake for the recent stretch genuinely underperforming.
+    """
+    if not s or not s.get("stopped"):
+        return None
+    meas, stopped = s["meas"], s["stopped"]
+    if not meas:
+        return (
+            f"{prefix}: 0 of {stopped} stopped picks priced from 5m bars — all use "
+            "the flat −1% trigger, which is optimistic"
+        )
+    pct = math.floor(100 * meas / stopped + 0.5)
+    return (
+        f"{prefix}: {meas} of {stopped} stopped picks ({pct}%) priced from 5m bars, "
+        "capped at the trigger; the rest assume a flat −1%, which is optimistic"
+    )
+
+
 def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
     """Compounded gross growth + pick win rates of an exit rule over payload days.
 
@@ -175,6 +199,7 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
     growth_w = growth_b = 1.0
     wins_w = wins_b = n_picks = 0
     amb_n = res_n = 0
+    meas_n = stopped_n = 0
     short = subst = missing = corrupt = 0
     for day in days:
         picks = day["picks"][:n]
@@ -194,6 +219,7 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
         # (numerator without its denominator — reviewer finding, PR #77).
         day_wins_w = day_wins_b = 0
         day_amb = day_res = 0
+        day_meas = day_stopped = 0
         ok = True
         for p in picks:
             # p[5] is the intraday verdict; absent on payloads written before
@@ -208,6 +234,15 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
                 day_amb += 1
                 if seq in (SEQ_LIMIT_FIRST, SEQ_STOP_FIRST):
                     day_res += 1
+            # Measured-vs-assumed stop EXITS, for the same selection. Coverage
+            # of fills swings ~13x across the windows the user flips between
+            # (79% at 1 week, 6% at 1 year, because every fill lives in one
+            # recent 22-day stretch), so one frame-wide sentence cannot describe
+            # the cell on screen.
+            if stop_triggered(p[2]):
+                day_stopped += 1
+                if fill is not None:
+                    day_meas += 1
             worst, best = pick_return_band(strategy, p[2], p[3], bool(p[4]), seq, fill)
             if not (math.isfinite(worst) and math.isfinite(best)):
                 ok = False
@@ -225,6 +260,8 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
         wins_b += day_wins_b
         amb_n += day_amb
         res_n += day_res
+        meas_n += day_meas
+        stopped_n += day_stopped
         n_picks += len(picks)
         growth_w *= 1 + sum_w / len(picks)
         growth_b *= 1 + sum_b / len(picks)
@@ -236,6 +273,8 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
         "wb": wins_b / n_picks if n_picks else float("nan"),
         "amb": amb_n,
         "res": res_n,
+        "meas": meas_n,
+        "stopped": stopped_n,
         "picks": n_picks,
         "days": len(days),
         "clean": clean,

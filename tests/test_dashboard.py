@@ -889,7 +889,8 @@ for (const strat of ["hold_close", "limit_2pct", "limit_stop"]) {{
     const s = tpMath.stratSummarize(days, n, strat);
     out[strat + ":" + n] = [s.gw, s.gb, s.ww, s.wb, s.picks, s.days, s.clean,
                             s.shortDays, s.substDays, s.missing, s.corrupt,
-                            s.amb, s.res, tpMath.pathNote("SIM", s),
+                            s.amb, s.res, s.meas, s.stopped,
+                            tpMath.pathNote("SIM", s), tpMath.fillNote("SIM", s),
                             tpMath.growthText(s), tpMath.winText(s),
                             tpMath.readText(s, null)];
   }}
@@ -926,7 +927,10 @@ console.log(JSON.stringify(out));
                 s["corrupt"],
                 s["amb"],
                 s["res"],
+                s["meas"],
+                s["stopped"],
                 dashboard.strategy.path_note("SIM", s),
+                dashboard.strategy.fill_note("SIM", s),
                 dashboard._growth_text(s),
                 dashboard._win_text(s),
                 dashboard._strategy_read(s, None),

@@ -49,6 +49,7 @@ from twopercent import (
     dashboard,
     doctor,
     ingest,
+    intraday,
     issues,
     notify,
     scan,
@@ -447,6 +448,49 @@ def _shadow_run_step(report: RoutineReport, con, signal_date: dt.date) -> None:
     report.add("shadow", WARN if result.had_trouble else OK, result.summary())
 
 
+def _intraday_step(report: RoutineReport, con, top_n: int = 20) -> None:
+    """Capture intraday bars for the symbols this model picked. TIME-CRITICAL.
+
+    Yahoo serves ~60 calendar days of 5m bars and ~30 of 1m, then they are gone
+    for good. Unlike every other table here, intraday_prices is NOT reproducible
+    from a re-run: a session not captured inside that window can never be
+    captured, so a missed day is permanent data loss rather than a delay. That
+    is why this runs in the daily routine instead of by hand.
+
+    Both intervals are stored: 5m does the ordering work today, and 1m is the
+    only ground truth against which those 5m verdicts can be checked -- and it
+    expires more than twice as fast, so it must be captured as it happens.
+
+    Non-gating: WARN at worst. Scoring, the track record and the emailed signal
+    are already complete by this point, and a provider outage must never fail a
+    run whose real work has been done. But it warns LOUDLY, because a silent
+    failure here is invisible until the window has closed and the data is gone.
+    """
+    try:
+        symbols = intraday.picked_symbols(con, top_n=top_n)
+    except Exception as exc:
+        report.add("intraday", WARN, f"could not list picked symbols: {exc}")
+        return
+    if not symbols:
+        report.add("intraday", OK, "no picked symbols yet — nothing to capture")
+        return
+    details, worst = [], OK
+    for interval in intraday.INTERVALS:
+        limits = intraday.spec(interval)
+        end = dt.date.today() + dt.timedelta(days=1)
+        start = end - dt.timedelta(days=limits["lookback"])
+        try:
+            result = intraday.ingest(con, symbols, start, end, interval=interval)
+        except Exception as exc:
+            details.append(f"{interval} CRASHED: {exc}")
+            worst = WARN
+            continue
+        details.append(f"{interval}: {result.summary()}")
+        if not result.ok:
+            worst = WARN
+    report.add("intraday", worst, "; ".join(details))
+
+
 def _notify_step(
     report: RoutineReport,
     con,
@@ -653,6 +697,9 @@ def _run_score(
     except Exception as exc:
         report.add("dashboard", WARN, f"render failed (scoring is complete): {exc}")
     _shadow_score_step(report, con)
+    # LAST: the target day's bars are final by now, and this is the only step
+    # whose data cannot be recovered by re-running later.
+    _intraday_step(report, con, top_n=DETECTOR_TOP_N)
     return report
 
 

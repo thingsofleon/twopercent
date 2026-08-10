@@ -24,6 +24,8 @@ uv run twopercent doctor               # data-quality checks (read-only)
 uv run twopercent predict              # ranked +2% candidates (logged)
 uv run twopercent dashboard            # static dashboard.html
 uv run twopercent intraday             # 5m bars for picked symbols (exit-path resolution)
+uv run twopercent intraday --interval 1m   # 1m bars (ground truth; expires in ~30 days)
+uv run twopercent intraday-validate    # check 5m verdicts against 1m
 uv run twopercent benchmark            # walk-forward benchmark -> experiments row
 uv run twopercent routine              # pre-open daily cycle (predict mode)
 uv run twopercent routine --mode score # post-close scoring + degradation check
@@ -253,6 +255,13 @@ to `logs/routine.log`:
 | predict | `Mon..Fri 06:00 America/Denver` | 08:00 ET, pre-open | `uv run twopercent routine` |
 | score | `Mon..Fri 14:45 America/Denver` | 16:45 ET, post-close | `uv run twopercent routine --mode score` |
 | research | `daily 22:00 America/Denver` | 00:00 ET, overnight | `uv run twopercent research` |
+
+The score run also CAPTURES intraday bars (5m and 1m) for picked symbols. That
+step is time-critical and unlike every other table it is not reproducible:
+Yahoo serves ~60 calendar days of 5m and ~30 of 1m, so a session not captured
+inside that window is gone permanently. It is non-gating (WARN at worst, after
+scoring and the email are complete) but warns loudly, because a silent failure
+here is invisible until the data is already unrecoverable.
 
 (Research runs every day, weekends included — it is offline compute against
 the local store, and its own clock gate refuses anything outside 16:30–05:00

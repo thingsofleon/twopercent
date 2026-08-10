@@ -806,17 +806,35 @@ def _attach_paths(con, frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
     pairs = frame[["symbol", "target_date"]].rename(columns={"target_date": "date"}).dropna()
     if pairs.empty:
         return frame, unresolvable
-    res = intraday.resolve(con, pairs)
+    res = intraday.resolve_best(con, pairs)
     if res.both_touched == 0:
         return frame, None
     if res.frame.empty:
         return frame, f"path resolution — {res.reasons()}"
     merged = frame.merge(
-        res.frame.rename(columns={"date": "target_date"}),
+        _align_dates(res.frame.rename(columns={"date": "target_date"}), frame),
         on=["symbol", "target_date"],
         how="left",
     ).rename(columns={"seq": "path"})
     return merged, f"path resolution: {res.summary()}"
+
+
+def _align_dates(right: pd.DataFrame, left: pd.DataFrame) -> pd.DataFrame:
+    """Match `right.target_date`'s dtype to `left`'s before a merge.
+
+    DuckDB returns DATE as datetime64 and the intraday helpers normalise to
+    datetime.date for deduplication, so the two sides disagree. pandas raises on
+    a datetime64-vs-object merge — which is the GOOD outcome; the same mismatch
+    inside a set comparison silently matches nothing, which is how the layered
+    resolver came to double-count. Convert explicitly rather than relying on
+    either side's incidental dtype.
+    """
+    out = right.copy()
+    if pd.api.types.is_datetime64_any_dtype(left["target_date"]):
+        out["target_date"] = pd.to_datetime(out["target_date"])
+    else:
+        out["target_date"] = pd.to_datetime(out["target_date"]).dt.date
+    return out
 
 
 def _attach_fills(con, frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
@@ -842,14 +860,16 @@ def _attach_fills(con, frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
     pairs = frame[["symbol", "target_date"]].rename(columns={"target_date": "date"}).dropna()
     if pairs.empty:
         return frame, None
-    fills = intraday.stop_fills(con, pairs)
+    fills = intraday.stop_fills_best(con, pairs)
     if fills.empty:
         return frame, (
             "stop exits: none measurable — every stopped pick uses the flat −1% "
             "trigger, which is optimistic (a stop fills at the next available price)"
         )
     merged = frame.merge(
-        fills.rename(columns={"date": "target_date"}), on=["symbol", "target_date"], how="left"
+        _align_dates(fills.rename(columns={"date": "target_date"}), frame),
+        on=["symbol", "target_date"],
+        how="left",
     )
     lo = pd.Timestamp(fills["date"].min()).date()
     hi = pd.Timestamp(fills["date"].max()).date()

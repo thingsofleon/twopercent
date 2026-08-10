@@ -489,6 +489,15 @@ ambiguous days have both triggers inside ONE 5m bar, which no amount of backfill
 fixes. Phase 2 (prior-day intraday FEATURES) is NOT built — it additionally
 requires extending the lookahead canary to mutate `intraday_prices`.
 
+**Validated 2026-08-10** (1m ground truth): 5m verdicts re-resolved at 1m —
+**2,365 of 2,365 confirmed, ZERO inversions**, so the contiguity gate holds and
+the shipped orderings are correct. The upside is larger than the check: **442 of
+462 same-5m-bar sessions (96%) resolve at 1m**, so resolution now runs
+finest-first (`intraday.resolve_best`, 1m then 5m) and the live record goes from
+52% to 69% resolved with same-bar days dropping 34 -> 13. Both intervals are
+captured by the score routine daily, because 5m expires at ~60 calendar days and
+1m at ~30 — intraday_prices is the one table a re-run cannot rebuild.
+
 ## Status
 
 Live tracking is on GitHub: **milestones** (one per level) and **issues**

@@ -52,9 +52,13 @@ def _ingest(con, frame, symbol="AAA"):
         [symbol],
         SESSION,
         SESSION + dt.timedelta(days=1),
-        downloader=lambda syms, s, e: frame,
+        downloader=lambda syms, s, e, iv: frame,
         today=SESSION,  # these sessions are historical; the clamp is provider-relative
     )
+
+
+def _pairs_one(symbol="AAA"):
+    return pd.DataFrame({"symbol": [symbol], "date": [SESSION]})
 
 
 def _resolve_one(con, symbol="AAA"):
@@ -82,7 +86,7 @@ def test_ingest_reports_symbols_that_returned_nothing(con, caplog):
         ["AAA", "GHOST"],
         SESSION,
         SESSION + dt.timedelta(days=1),
-        downloader=lambda syms, s, e: _bars([("09:30", 100.0, 101.0, 99.5, 100.5)]),
+        downloader=lambda syms, s, e, iv: _bars([("09:30", 100.0, 101.0, 99.5, 100.5)]),
         today=SESSION,
     )
 
@@ -104,7 +108,7 @@ def test_ingest_chunks_a_span_longer_than_one_request(con):
     _seed_daily(con)
     seen: list[tuple] = []
 
-    def spy(syms, s, e):
+    def spy(syms, s, e, iv):
         seen.append((s, e))
         return _bars([("09:30", 100.0, 101.0, 99.5, 100.5)])
 
@@ -434,7 +438,7 @@ def test_ingest_clamps_a_request_beyond_yahoos_window_and_says_so(con, caplog):
     _seed_daily(con)
     seen: list[tuple] = []
 
-    def spy(syms, s, e):
+    def spy(syms, s, e, iv):
         seen.append((s, e))
         return _bars([("09:30", 100.0, 101.0, 99.5, 100.5)])
 
@@ -451,7 +455,11 @@ def test_ingest_with_nothing_left_after_clamping_is_a_noop(con, caplog):
     _seed_daily(con)
     old = dt.date.today() - dt.timedelta(days=400)
     result = intraday.ingest(
-        con, ["AAA"], old, old + dt.timedelta(days=5), downloader=lambda *a: pytest.fail("fetched")
+        con,
+        ["AAA"],
+        old,
+        old + dt.timedelta(days=5),
+        downloader=lambda *a, **k: pytest.fail("fetched"),
     )
 
     assert result.rows == 0
@@ -570,3 +578,115 @@ def test_next_bar_must_be_the_adjacent_slot(con):
     )
 
     assert _stop_fill(con).empty
+
+
+# --- 1m ground truth and layered resolution -----------------------------------
+
+
+def _ingest_iv(con, frame, interval, symbol="AAA"):
+    return intraday.ingest(
+        con,
+        [symbol],
+        SESSION,
+        SESSION + dt.timedelta(days=1),
+        downloader=lambda syms, s, e, iv: frame,
+        today=SESSION,
+        interval=interval,
+    )
+
+
+def test_finer_interval_resolves_what_a_coarser_one_cannot(con):
+    """The 29% same-5m-bar residual is mostly recoverable at 1m.
+
+    Measured on the real store: 442 of 462 same-5m-bar sessions (96%) resolve at
+    1m, and 1m confirmed 2,365 of 2,365 5m verdicts with zero inversions.
+    """
+    _seed_daily(con, open_=100.0, high=103.0, low=98.0, close=101.0)
+    # One 5m bar spans BOTH triggers — unresolvable at 5m.
+    _ingest_iv(con, _bars([("09:30", 100.0, 103.0, 98.0, 101.0)]), "5m")
+    assert intraday.resolve(con, _pairs_one(), interval="5m").same_bar == 1
+
+    # The same session at 1m separates them: stop first, then the limit.
+    _ingest_iv(
+        con,
+        _bars(
+            [
+                ("09:30", 100.0, 100.2, 98.0, 98.4),  # stop
+                ("09:31", 98.4, 103.0, 98.2, 101.0),  # limit
+            ]
+        ),
+        "1m",
+    )
+    best = intraday.resolve_best(con, _pairs_one())
+
+    assert best.resolved == 1
+    assert best.frame.iloc[0]["seq"] == intraday.STOP_FIRST
+
+
+def test_layered_resolution_falls_back_to_5m(con):
+    """No 1m record must not lose a verdict 5m could produce."""
+    _seed_daily(con, open_=100.0, high=104.0, low=98.0, close=101.0)
+    _ingest_iv(
+        con,
+        _bars(
+            [
+                ("09:30", 100.0, 100.5, 99.9, 100.2),
+                ("09:35", 100.2, 104.0, 100.0, 103.0),
+                ("09:40", 103.0, 103.5, 98.0, 98.4),
+            ]
+        ),
+        "5m",
+    )
+    best = intraday.resolve_best(con, _pairs_one())
+
+    assert best.resolved == 1
+    assert best.frame.iloc[0]["seq"] == intraday.LIMIT_FIRST
+
+
+def test_validation_reports_agreement_and_recoverable_days(con):
+    _seed_daily(con, open_=100.0, high=103.0, low=98.0, close=101.0)
+    _ingest_iv(con, _bars([("09:30", 100.0, 103.0, 98.0, 101.0)]), "5m")  # same bar
+    _ingest_iv(
+        con,
+        _bars([("09:30", 100.0, 100.2, 98.0, 98.4), ("09:31", 98.4, 103.0, 98.2, 101.0)]),
+        "1m",
+    )
+    v = intraday.validate_against_1m(con, _pairs_one())
+
+    assert v.resolved_only_at_1m == 1  # 5m could not order it; 1m could
+    assert v.disagreed == 0
+    assert "unresolvable at 5m are resolvable at 1m" in v.summary()
+
+
+def test_validation_says_so_when_there_is_no_1m_cover(con):
+    """An unvalidated verdict must never read as a validated one."""
+    _seed_daily(con)
+    v = intraday.validate_against_1m(con, _pairs_one())
+    assert v.compared == 0
+    assert "UNVALIDATED" in v.summary()
+
+
+def test_unknown_interval_fails_loudly(con):
+    with pytest.raises(ValueError, match="never a guess"):
+        intraday.spec("3m")
+
+
+def test_layered_resolution_never_double_counts(con):
+    """A coarser pass must not re-resolve what a finer one already did.
+
+    The "already resolved" filter compared DuckDB's datetime64 dates against
+    datetime.date keys, matched nothing, and let 5m re-resolve every day 1m had
+    handled — the real store reported "132/120 ambiguous pick-days resolved
+    (110%)". A resolution count above the ambiguous count is arithmetically
+    impossible and must fail loudly.
+    """
+    _seed_daily(con, open_=100.0, high=103.0, low=98.0, close=101.0)
+    both = _bars([("09:30", 100.0, 100.2, 98.0, 98.4), ("09:35", 98.4, 103.0, 98.2, 101.0)])
+    _ingest_iv(con, both, "5m")
+    _ingest_iv(con, both, "1m")
+
+    best = intraday.resolve_best(con, _pairs_one())
+
+    assert best.resolved <= best.both_touched
+    assert len(best.frame) == len(best.frame.drop_duplicates(subset=["symbol", "date"]))
+    assert best.resolved == 1

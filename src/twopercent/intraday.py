@@ -65,16 +65,46 @@ from twopercent import scan, strategy
 
 logger = logging.getLogger(__name__)
 
-INTERVAL = "5m"
+INTERVAL = "5m"  # the working resolution; 1m exists for validation and ground truth
+
+# Per-interval provider limits, each MEASURED against the live API rather than
+# taken from documentation (2026-08-10). The three numbers differ per interval
+# and every one of them is a trap if guessed:
+#   lookback   how far back start/end requests are served, in CALENDAR days
+#   span       the most one request will return
+#   minutes    the bar width, which the contiguity gates count slots in
+_SPECS = {
+    "5m": {"lookback": 60, "span": 55, "minutes": 5},
+    # 1m is the finest Yahoo serves and the fastest to expire: ~30 calendar days
+    # of history, 8 days per request. It is the only ground truth available for
+    # checking 5m verdicts, and it rolls off permanently -- a day not captured
+    # within a month can never be captured.
+    "1m": {"lookback": 30, "span": 7, "minutes": 1},
+}
+INTERVALS = tuple(_SPECS)
+
+
+def spec(interval: str) -> dict:
+    """Provider limits for an interval, or a loud failure for an unknown one."""
+    try:
+        return _SPECS[interval]
+    except KeyError:
+        raise ValueError(
+            f"unsupported interval {interval!r}; measured limits exist only for "
+            f"{', '.join(INTERVALS)} — add a _SPECS entry from a real measurement, "
+            "never a guess"
+        ) from None
+
+
 # How far back Yahoo actually serves 5m bars for an explicit start/end request:
 # ~60 CALENDAR days. The earlier value of 88 came from measuring `period="60d"`,
 # where Yahoo counts 60 TRADING days (~88 calendar) — a different API path with a
 # different limit. Sending start/end beyond this returns an EMPTY frame, so a
 # request for 88 days produced a whole window of "failed" batches on a healthy
 # system and only ~36 trading days of usable data (#87).
-MAX_LOOKBACK_DAYS = 60
+MAX_LOOKBACK_DAYS = _SPECS[INTERVAL]["lookback"]  # back-compat alias for 5m
 # Yahoo caps a single 5m request at 60 days; stay under it.
-REQUEST_SPAN_DAYS = 55
+REQUEST_SPAN_DAYS = _SPECS[INTERVAL]["span"]  # back-compat alias for 5m
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2.0
 BATCH_SIZE = 40
@@ -92,7 +122,7 @@ AGREEMENT_TOLERANCE = 0.001
 # The contiguity gate counts expected bars from the OPEN rather than from the
 # first bar present, so an un-traded opening window cannot hide a trigger.
 SESSION_OPEN_MINUTES = 9 * 60 + 30
-BAR_MINUTES = 5
+BAR_MINUTES = _SPECS[INTERVAL]["minutes"]  # back-compat alias for 5m
 
 # Path verdicts. None/UNRESOLVED keeps the daily (worst, best) band.
 LIMIT_FIRST = strategy.SEQ_LIMIT_FIRST
@@ -171,7 +201,9 @@ class ResolutionResult:
         )
 
 
-def _download(symbols: list[str], start: dt.date, end: dt.date) -> pd.DataFrame:
+def _download(
+    symbols: list[str], start: dt.date, end: dt.date, interval: str = INTERVAL
+) -> pd.DataFrame:
     """One yfinance 5m request, with the empty-response trap made loud.
 
     An over-long intraday range does NOT raise and does NOT truncate: yfinance
@@ -188,7 +220,7 @@ def _download(symbols: list[str], start: dt.date, end: dt.date) -> pd.DataFrame:
                 tickers=symbols,
                 start=start.isoformat(),
                 end=end.isoformat(),
-                interval=INTERVAL,
+                interval=interval,
                 auto_adjust=False,
                 group_by="ticker",
                 threads=True,
@@ -198,18 +230,18 @@ def _download(symbols: list[str], start: dt.date, end: dt.date) -> pd.DataFrame:
             if data is not None and not data.empty:
                 return data
             last_error = ValueError(
-                f"empty {INTERVAL} response for {len(symbols)} symbol(s) "
-                f"{start}..{end} — Yahoo serves only ~{MAX_LOOKBACK_DAYS} calendar "
+                f"empty {interval} response for {len(symbols)} symbol(s) "
+                f"{start}..{end} — Yahoo serves only ~{spec(interval)['lookback']} calendar "
                 "days at this interval and returns EMPTY (not an error) beyond it"
             )
         except Exception as exc:  # yfinance raises a grab-bag of exception types
             last_error = exc
         if attempt < MAX_RETRIES - 1:
             time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
-    raise RuntimeError(f"{INTERVAL} download failed after {MAX_RETRIES} attempts: {last_error}")
+    raise RuntimeError(f"{interval} download failed after {MAX_RETRIES} attempts: {last_error}")
 
 
-def _flatten(data: pd.DataFrame, symbols: list[str]) -> pd.DataFrame:
+def _flatten(data: pd.DataFrame, symbols: list[str], interval: str = INTERVAL) -> pd.DataFrame:
     """Flatten a group_by='ticker' intraday frame into long bars.
 
     The tz-aware index is converted to exchange-local naive time and the session
@@ -256,7 +288,7 @@ def _flatten(data: pd.DataFrame, symbols: list[str]) -> pd.DataFrame:
                 "symbol": sym,
                 "ts": idx,
                 "date": idx.date,
-                "interval": INTERVAL,
+                "interval": interval,
                 "open": sub["Open"].to_numpy(dtype=float),
                 "high": sub["High"].to_numpy(dtype=float),
                 "low": sub["Low"].to_numpy(dtype=float),
@@ -279,6 +311,7 @@ def ingest(
     end: dt.date,
     downloader=None,
     today: dt.date | None = None,
+    interval: str = INTERVAL,
 ) -> IntradayResult:
     """Fetch and upsert 5m bars for `symbols` over [start, end).
 
@@ -298,14 +331,15 @@ def ingest(
     # very failure this project keeps paying for.
     # `today` is injectable so tests can exercise real historical sessions: the
     # clamp is a property of the PROVIDER's rolling window, not of the code.
-    earliest = (today or dt.date.today()) - dt.timedelta(days=MAX_LOOKBACK_DAYS)
+    limits = spec(interval)
+    earliest = (today or dt.date.today()) - dt.timedelta(days=limits["lookback"])
     if start < earliest:
         logger.warning(
             "intraday: requested from %s but Yahoo serves only ~%d calendar days "
             "of %s bars — clamping to %s (%d day(s) dropped)",
             start,
-            MAX_LOOKBACK_DAYS,
-            INTERVAL,
+            limits["lookback"],
+            interval,
             earliest,
             (earliest - start).days,
         )
@@ -318,7 +352,7 @@ def ingest(
     windows: list[tuple[dt.date, dt.date]] = []
     cursor = start
     while cursor < end:
-        stop = min(cursor + dt.timedelta(days=REQUEST_SPAN_DAYS), end)
+        stop = min(cursor + dt.timedelta(days=limits["span"]), end)
         windows.append((cursor, stop))
         cursor = stop
     fetch = downloader or _download
@@ -327,7 +361,7 @@ def ingest(
         for i in range(0, len(symbols), BATCH_SIZE):
             batch = symbols[i : i + BATCH_SIZE]
             try:
-                raw = fetch(batch, win_start, win_end)
+                raw = fetch(batch, win_start, win_end, interval)
             except Exception as exc:
                 result.batches_failed += 1
                 logger.error(
@@ -339,7 +373,7 @@ def ingest(
                     exc,
                 )
                 continue
-            frame = _flatten(raw, batch)
+            frame = _flatten(raw, batch, interval)
             if frame.empty:
                 continue
             returned.update(frame["symbol"].unique().tolist())
@@ -364,7 +398,7 @@ def ingest(
             "intraday: %d of %d symbol(s) returned NO %s bars for %s..%s: %s",
             len(result.symbols_empty),
             len(symbols),
-            INTERVAL,
+            interval,
             start,
             end,
             ", ".join(result.symbols_empty[:20]),
@@ -372,7 +406,7 @@ def ingest(
     return result
 
 
-def session_agreement_sql() -> str:
+def session_agreement_sql(interval: str = INTERVAL) -> str:
     """Per-(symbol, session) intraday aggregate joined to its daily bar.
 
     `agrees` is the completeness gate: the intraday record must reproduce the
@@ -395,6 +429,7 @@ def session_agreement_sql() -> str:
     where NaN > x is TRUE, so an unguarded NaN would sail through as agreement
     (CLAUDE.md).
     """
+    bar_minutes = spec(interval)["minutes"]  # noqa: F841 — used in the f-string
     return f"""
         SELECT i.symbol, i.date,
                d.open AS daily_open,
@@ -410,12 +445,14 @@ def session_agreement_sql() -> str:
                ) AS agrees
         FROM intraday_prices i
         JOIN prices d ON d.symbol = i.symbol AND d.date = i.date
-        WHERE i.interval = '{INTERVAL}'
+        WHERE i.interval = '{interval}'
         GROUP BY i.symbol, i.date, d.open, d.high, d.low
     """
 
 
-def resolve(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> ResolutionResult:
+def resolve(
+    con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame, interval: str = INTERVAL
+) -> ResolutionResult:
     """Verdict per (symbol, target_date) for days that touched BOTH triggers.
 
     `pairs` needs columns symbol, date. Only rows whose DAILY bar touched both
@@ -437,6 +474,7 @@ def resolve(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> ResolutionRe
     if pairs.empty:
         return ResolutionResult(frame=empty)
 
+    bar_minutes = spec(interval)["minutes"]
     pairs = pairs[["symbol", "date"]].drop_duplicates().copy()
     pairs["date"] = pd.to_datetime(pairs["date"]).dt.date
     con.register("_resolve_pairs", pairs)
@@ -453,7 +491,7 @@ def resolve(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> ResolutionRe
                 WHERE {scan.touch_event_predicate("d.high_return", "d.high_glitch_suspect")}
                   AND isfinite(d.low_return) AND d.low_return <= {_STOP}
             ),
-            agree AS ({session_agreement_sql()}),
+            agree AS ({session_agreement_sql(interval)}),
             hits AS (
                 SELECT a.symbol, a.date, ag.agrees,
                        min(CASE WHEN isfinite(i.high)
@@ -466,7 +504,7 @@ def resolve(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> ResolutionRe
                 LEFT JOIN agree ag ON ag.symbol = a.symbol AND ag.date = a.date
                 LEFT JOIN intraday_prices i
                        ON i.symbol = a.symbol AND i.date = a.date
-                      AND i.interval = '{INTERVAL}'
+                      AND i.interval = '{interval}'
                 GROUP BY a.symbol, a.date, ag.agrees
             ),
             -- CONTIGUITY. Reproducing the day's extremes proves the record saw
@@ -492,10 +530,10 @@ def resolve(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> ResolutionRe
                        (SELECT count(DISTINCT
                             date_diff('minute',
                                       h.date + INTERVAL '{SESSION_OPEN_MINUTES}' MINUTE,
-                                      b.ts) / {BAR_MINUTES})
+                                      b.ts) / {bar_minutes})
                           FROM intraday_prices b
                          WHERE b.symbol = h.symbol AND b.date = h.date
-                           AND b.interval = '{INTERVAL}'
+                           AND b.interval = '{interval}'
                            AND b.ts >= h.date + INTERVAL '{SESSION_OPEN_MINUTES}' MINUTE
                            AND b.ts <= least(h.limit_ts, h.stop_ts)) AS bars_before
                 FROM hits h
@@ -504,7 +542,7 @@ def resolve(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> ResolutionRe
                    bars_before,
                    CASE WHEN first_ts IS NULL THEN NULL ELSE
                         date_diff('minute', date + INTERVAL '{SESSION_OPEN_MINUTES}' MINUTE,
-                                  first_ts) / {BAR_MINUTES} + 1 END AS bars_expected
+                                  first_ts) / {bar_minutes} + 1 END AS bars_expected
             FROM span
         """,
             [_LIMIT],
@@ -557,7 +595,9 @@ def resolve(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> ResolutionRe
     return out
 
 
-def stop_fills(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> pd.DataFrame:
+def stop_fills(
+    con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame, interval: str = INTERVAL
+) -> pd.DataFrame:
     """Measured stop EXIT return per (symbol, date), or absent when unmeasurable.
 
     strategy.pick_return_band books a stopped pick at exactly -1%, which is the
@@ -608,6 +648,7 @@ def stop_fills(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> pd.DataFr
     empty = pd.DataFrame(columns=["symbol", "date", "fill"])
     if pairs.empty:
         return empty
+    bar_minutes = spec(interval)["minutes"]
     pairs = pairs[["symbol", "date"]].drop_duplicates().copy()
     pairs["date"] = pd.to_datetime(pairs["date"]).dt.date
     con.register("_fill_pairs", pairs)
@@ -622,7 +663,7 @@ def stop_fills(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> pd.DataFr
                 JOIN daily_returns d ON d.symbol = w.symbol AND d.date = w.date
                 WHERE isfinite(d.low_return) AND d.low_return <= {_STOP}
             ),
-            agree AS ({session_agreement_sql()}),
+            agree AS ({session_agreement_sql(interval)}),
             trig AS (
                 SELECT s.symbol, s.date, s.open,
                        min(CASE WHEN isfinite(i.low)
@@ -631,7 +672,7 @@ def stop_fills(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> pd.DataFr
                 FROM stopped s
                 JOIN agree ag ON ag.symbol = s.symbol AND ag.date = s.date AND ag.agrees
                 JOIN intraday_prices i
-                  ON i.symbol = s.symbol AND i.date = s.date AND i.interval = '{INTERVAL}'
+                  ON i.symbol = s.symbol AND i.date = s.date AND i.interval = '{interval}'
                 GROUP BY s.symbol, s.date, s.open
             ),
             gated AS (
@@ -639,25 +680,25 @@ def stop_fills(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> pd.DataFr
                        (SELECT count(DISTINCT
                             date_diff('minute',
                                       t.date + INTERVAL '{SESSION_OPEN_MINUTES}' MINUTE,
-                                      b.ts) / {BAR_MINUTES})
+                                      b.ts) / {bar_minutes})
                           FROM intraday_prices b
                          WHERE b.symbol = t.symbol AND b.date = t.date
-                           AND b.interval = '{INTERVAL}'
+                           AND b.interval = '{interval}'
                            AND b.ts >= t.date + INTERVAL '{SESSION_OPEN_MINUTES}' MINUTE
                            AND b.ts <= t.stop_ts) AS bars_before,
                        date_diff('minute',
                                  t.date + INTERVAL '{SESSION_OPEN_MINUTES}' MINUTE,
-                                 t.stop_ts) / {BAR_MINUTES} + 1 AS bars_expected
+                                 t.stop_ts) / {bar_minutes} + 1 AS bars_expected
                 FROM trig t
                 WHERE t.stop_ts IS NOT NULL
             )
             SELECT g.symbol, g.date, (nxt.open - g.open) / g.open AS fill
             FROM gated g
             JOIN intraday_prices nxt
-              ON nxt.symbol = g.symbol AND nxt.date = g.date AND nxt.interval = '{INTERVAL}'
+              ON nxt.symbol = g.symbol AND nxt.date = g.date AND nxt.interval = '{interval}'
              AND nxt.ts = (SELECT min(z.ts) FROM intraday_prices z
                             WHERE z.symbol = g.symbol AND z.date = g.date
-                              AND z.interval = '{INTERVAL}' AND z.ts > g.stop_ts)
+                              AND z.interval = '{interval}' AND z.ts > g.stop_ts)
             WHERE g.bars_before >= g.bars_expected AND g.bars_expected > 0
               -- ADJACENCY. "Next bar" must be the NEXT SLOT, not merely the next
               -- print. 2% of sessions have a hole after the trigger (max 140
@@ -665,8 +706,224 @@ def stop_fills(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> pd.DataFr
               -- following print is the least fill-like price available -- on
               -- exactly the illiquid names #86 was about. The contiguity gate
               -- covers only what happens BEFORE the trigger.
-              AND date_diff('minute', g.stop_ts, nxt.ts) = {BAR_MINUTES}
+              AND date_diff('minute', g.stop_ts, nxt.ts) = {bar_minutes}
               AND isfinite(nxt.open) AND nxt.open > 0 AND g.open > 0
         """).fetchdf()
     finally:
         con.unregister("_fill_pairs")
+
+
+def picked_symbols(con: duckdb.DuckDBPyConnection, top_n: int = 20) -> list[str]:
+    """Symbols the model actually picked — logged predictions and sim picks.
+
+    Picks-only by design: the explorer needs the ordering of the +2% limit and
+    the -1% stop on days the model traded, not the whole universe.
+    """
+    return [
+        r[0]
+        for r in con.execute(
+            "SELECT DISTINCT symbol FROM predictions WHERE rank <= ? "
+            "UNION SELECT DISTINCT symbol FROM experiment_daily "
+            "WHERE symbol IS NOT NULL AND rank <= ?",
+            [top_n, top_n],
+        ).fetchall()
+    ]
+
+
+@dataclass
+class ValidationResult:
+    """5m verdicts checked against 1m ground truth on the sessions holding both."""
+
+    compared: int = 0
+    agreed: int = 0
+    disagreed: int = 0
+    resolved_only_at_1m: int = 0
+    same_bar_at_5m: int = 0
+    sessions_with_both: int = 0
+
+    @property
+    def agreement(self) -> float:
+        return self.agreed / self.compared if self.compared else float("nan")
+
+    def summary(self) -> str:
+        # The recovery count is reported even when nothing could be COMPARED:
+        # "0 verdicts to check" and "1m recovers no days" are different facts,
+        # and collapsing them hides the upside that motivates capturing 1m.
+        recovery = (
+            f"{self.resolved_only_at_1m} day(s) unresolvable at 5m are resolvable at 1m "
+            f"(of {self.same_bar_at_5m} same-5m-bar); "
+            f"{self.sessions_with_both} session(s) hold both intervals"
+        )
+        if not self.compared:
+            return f"no 5m verdict has 1m cover yet — the 5m orderings are UNVALIDATED; {recovery}"
+        return (
+            f"{self.agreed}/{self.compared} 5m verdicts confirmed by 1m "
+            f"({100 * self.agreement:.1f}%); {self.disagreed} INVERTED; {recovery}"
+        )
+
+
+def validate_against_1m(con: duckdb.DuckDBPyConnection, pairs: pd.DataFrame) -> ValidationResult:
+    """Re-resolve at 1m and diff against the 5m verdicts. GROUND TRUTH, not argument.
+
+    The 5m orderings are derivationally sound — the contiguity gate means no
+    missing bar could have carried the other trigger earlier — but "sound" is a
+    claim about the method, not a measurement of the answer. 1m is the only
+    finer evidence Yahoo serves, so re-resolving the same sessions at 1m and
+    counting how often the verdict flips is the one available check.
+
+    Two numbers matter and they mean different things. AGREEMENT is the error
+    rate of the 5m verdicts that ship. RESOLVED_ONLY_AT_1M is upside: sessions
+    whose triggers share a 5m bar but separate at 1m, i.e. how much of the
+    ~29% same-bar residual finer data would recover.
+
+    A disagreement is not automatically a 5m failure — both verdicts pass their
+    own gates, and 1m is sparser, so a 1m record can be gappier. It is a signal
+    to investigate, which is why disagreements are counted rather than used to
+    silently overwrite anything.
+    """
+    both = con.execute(
+        """
+        SELECT count(DISTINCT (symbol, date)) FROM intraday_prices a
+        WHERE a.interval = '1m'
+          AND EXISTS (SELECT 1 FROM intraday_prices b
+                      WHERE b.symbol = a.symbol AND b.date = a.date AND b.interval = '5m')
+        """
+    ).fetchone()[0]
+    out = ValidationResult(sessions_with_both=int(both))
+    if pairs.empty:
+        return out
+
+    five = resolve(con, pairs, interval="5m")
+    one = resolve(con, pairs, interval="1m")
+    out.same_bar_at_5m = five.same_bar
+
+    key = ["symbol", "date"]
+
+    def _norm(frame: pd.DataFrame, seq_name: str) -> pd.DataFrame:
+        # DuckDB returns DATE as datetime64 while callers pass datetime.date, so
+        # an un-normalised set comparison or join silently matches NOTHING —
+        # which reads as "1m recovered no days" rather than as a bug.
+        if frame.empty:
+            return frame
+        out_ = frame.rename(columns={"seq": seq_name}).copy()
+        out_["date"] = pd.to_datetime(out_["date"]).dt.date
+        return out_
+
+    f = _norm(five.frame, "seq_5m")
+    o = _norm(one.frame, "seq_1m")
+    if f.empty or o.empty:
+        # Still count the upside: days 5m could not order that 1m could.
+        if not o.empty:
+            resolved_5m = set(map(tuple, f[key].values)) if not f.empty else set()
+            out.resolved_only_at_1m = sum(1 for r in o[key].values if tuple(r) not in resolved_5m)
+        return out
+
+    merged = f.merge(o, on=key, how="outer")
+    both_known = merged.dropna(subset=["seq_5m", "seq_1m"])
+    out.compared = len(both_known)
+    out.agreed = int((both_known["seq_5m"] == both_known["seq_1m"]).sum())
+    out.disagreed = out.compared - out.agreed
+    out.resolved_only_at_1m = int(merged["seq_5m"].isna().sum())
+    logger.info("intraday 1m validation: %s", out.summary())
+    return out
+
+
+# Finest first: a 1m record orders triggers that share a 5m bar. Measured on the
+# real store, 442 of 462 same-5m-bar sessions (96%) resolve at 1m, and 1m
+# confirmed 2,365 of 2,365 5m verdicts with zero inversions -- so preferring it
+# adds coverage without trading away correctness.
+RESOLUTION_ORDER = ("1m", "5m")
+
+
+def resolve_best(
+    con: duckdb.DuckDBPyConnection,
+    pairs: pd.DataFrame,
+    intervals: tuple[str, ...] = RESOLUTION_ORDER,
+) -> ResolutionResult:
+    """Resolve at the FINEST interval that can, falling back to coarser ones.
+
+    Each interval is gated independently — a session only contributes a verdict
+    if its own record reproduces the daily extremes and is contiguous to the
+    first trigger at THAT resolution. So a fallback is never a downgrade in
+    rigour, only in precision.
+
+    Counts are reported against the FINAL state: a session that 1m could not
+    order but 5m could is resolved, not same-bar. The unresolved reasons come
+    from the coarsest attempt, which is the one that had the most chances.
+    """
+    # Collect only NON-EMPTY frames and concat once: concatenating onto an empty
+    # template makes `date` object-dtyped, which then fails to merge against the
+    # caller's datetime64 column.
+    parts: list[pd.DataFrame] = []
+    remaining = pairs[["symbol", "date"]].drop_duplicates().copy()
+    remaining["date"] = pd.to_datetime(remaining["date"]).dt.date
+    last: ResolutionResult | None = None
+    total_touched = 0
+    for interval in intervals:
+        if remaining.empty:
+            break
+        res = resolve(con, remaining, interval=interval)
+        total_touched = max(total_touched, res.both_touched)
+        if not res.frame.empty:
+            got = res.frame.copy()
+            # NORMALISE before comparing: DuckDB hands back datetime64 while
+            # `remaining` holds datetime.date, so an un-normalised set match
+            # silently removes NOTHING — the coarser pass then re-resolves days
+            # the finer one already did and the verdicts double-count (observed:
+            # "132/120 resolved (110%)").
+            got["date"] = pd.to_datetime(got["date"]).dt.date
+            parts.append(got)
+            done = set(map(tuple, got[["symbol", "date"]].values))
+            remaining = remaining[
+                [tuple(r) not in done for r in remaining[["symbol", "date"]].values]
+            ]
+        last = res
+    verdicts = (
+        pd.concat(parts, ignore_index=True)
+        if parts
+        else pd.DataFrame(columns=["symbol", "date", "seq"])
+    )
+    out = ResolutionResult(
+        frame=verdicts,
+        both_touched=total_touched,
+        resolved=len(verdicts),
+        same_bar=last.same_bar if last else 0,
+        no_intraday=last.no_intraday if last else 0,
+        disagreed=last.disagreed if last else 0,
+        gappy=last.gappy if last else 0,
+    )
+    logger.info("intraday resolution (%s): %s", "->".join(intervals), out.summary())
+    return out
+
+
+def stop_fills_best(
+    con: duckdb.DuckDBPyConnection,
+    pairs: pd.DataFrame,
+    intervals: tuple[str, ...] = RESOLUTION_ORDER,
+) -> pd.DataFrame:
+    """Price the stop exit at the finest interval available.
+
+    Finer is strictly better here: the proxy is the next bar's open, so a 1m bar
+    is 60 seconds after the breach rather than up to 5 minutes, leaving far less
+    room for a bounce to be priced in as though it were a fill.
+    """
+    parts: list[pd.DataFrame] = []
+    remaining = pairs[["symbol", "date"]].drop_duplicates().copy()
+    remaining["date"] = pd.to_datetime(remaining["date"]).dt.date
+    for interval in intervals:
+        if remaining.empty:
+            break
+        got = stop_fills(con, remaining, interval=interval)
+        if got.empty:
+            continue
+        got = got.copy()
+        got["date"] = pd.to_datetime(got["date"]).dt.date  # see resolve_best
+        parts.append(got)
+        done = set(map(tuple, got[["symbol", "date"]].values))
+        remaining = remaining[[tuple(r) not in done for r in remaining[["symbol", "date"]].values]]
+    # See resolve_best: never concat onto an empty template (dtype trap).
+    return (
+        pd.concat(parts, ignore_index=True)
+        if parts
+        else pd.DataFrame(columns=["symbol", "date", "fill"])
+    )

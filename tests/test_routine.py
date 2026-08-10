@@ -4,12 +4,15 @@ import io
 import json
 import smtplib
 import urllib.error
+from pathlib import Path
 
 import pandas as pd
 import pytest
+from typer.testing import CliRunner
 
 from tests.conftest import seed_history, seed_planted
 from twopercent import ingest, notify, routine, store
+from twopercent.cli import app
 
 CLOSED = dt.datetime(2026, 7, 17, 7, 0, tzinfo=routine._EASTERN)  # Friday pre-open
 
@@ -571,8 +574,14 @@ def test_run_requires_an_explicit_out_path():
 def test_run_writes_only_where_told(ready, tmp_path):
     """The dashboard lands at out_path and nowhere else.
 
-    Guards the regression directly: a stray "dashboard.html" beside the CWD
-    means something is still resolving a bare relative default.
+    This passes on the pre-fix code too — `test_run_requires_an_explicit_out_path`
+    is what actually guards #81. This one catches the NEXT version of it: any
+    step that grows its own bare-relative output would drop a file in the CWD.
+
+    Asserted against Path.cwd(), not tmp_path: the isolate_cwd fixture happens
+    to chdir into this test's tmp_path today, and hard-coding that coupling
+    would make these assertions vacuously true if the fixture ever moved to a
+    subdirectory.
     """
     target = tmp_path / "elsewhere" / "dash.html"
     target.parent.mkdir()
@@ -581,5 +590,33 @@ def test_run_writes_only_where_told(ready, tmp_path):
 
     assert report.status in ("ok", "warn")
     assert target.exists() and target.stat().st_size > 0
-    assert not (tmp_path / "dashboard.html").exists()
-    assert not list(tmp_path.glob("dashboard.htm*"))
+    assert not list(Path.cwd().glob("dashboard.htm*"))
+
+
+def test_cli_routine_forwards_the_out_path(tmp_path, monkeypatch):
+    """The one production caller keeps passing out_path.
+
+    `cli.py` is the only non-test caller of routine.run, and nothing exercised
+    it — the keyword-only conversion was verified by inspection alone. A
+    regression here surfaces as a 06:00 TypeError and no signal email, so the
+    test belongs exactly where the bug lived.
+    """
+    seen = {}
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+        report = routine.RoutineReport()
+        report.add("stub", "ok", "routine.run stubbed")
+        return report
+
+    monkeypatch.setattr(routine, "run", spy)
+    target = tmp_path / "cli-dash.html"
+
+    result = CliRunner().invoke(
+        app,
+        ["routine", "--db", str(tmp_path / "x.duckdb"), "--out", str(target), "--mode", "score"],
+    )
+
+    assert result.exit_code == 0, result.output  # also proves exit_code propagates
+    assert seen["out_path"] == str(target)
+    assert seen["mode"] == "score"

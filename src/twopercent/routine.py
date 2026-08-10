@@ -161,6 +161,10 @@ def run(
     the CALLER's working directory — so `pytest` from the repo root silently
     replaced the live dashboard with fixture output and still reported green
     (#81). Only the CLI decides where the dashboard lands.
+
+    Note `db_path` above is still CWD-relative (store.DEFAULT_DB_PATH), and
+    store.connect mkdirs it, so a wrong CWD creates an empty store rather than
+    failing. The systemd units all set WorkingDirectory; #83 tracks closing it.
     """
     if mode not in ("predict", "score"):
         raise ValueError(f"unknown routine mode {mode!r} (expected 'predict' or 'score')")

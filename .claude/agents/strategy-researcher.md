@@ -22,8 +22,9 @@ Method for a research assignment:
    record the citation. Note each paper's reported effect size AND its
    out-of-sample rigor — an in-sample-only result is a lead, not evidence.
    Prefer replicated effects over single papers.
-2. **Map to this system.** The prediction target is fixed: +2% open-to-close,
-   next trading day, ranked cross-sectionally. Every candidate feature must be
+2. **Map to this system.** The prediction target is fixed: the +2% intraday
+   touch (open-to-high, NOT open-to-close), next trading day, ranked
+   cross-sectionally. Every candidate feature must be
    computable from data available at the signal day's close — build the
    feature-timing table required by the skill. State exactly what data the
    approach needs: free daily OHLCV (buildable now) vs pre-market / intraday /

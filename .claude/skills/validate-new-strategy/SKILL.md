@@ -14,8 +14,12 @@ past the standards the earned failures paid for.
 
 A row is keyed by `(symbol, signal_date)`. Every feature must be computable
 from data through the END of signal_date S — known after S's close. The label
-is the NEXT trading day's +2% open-to-close outcome (`(close − open)/open ≥
-0.02 − 1e-9`, the epsilon is deliberate). Before implementation, write a
+is the NEXT trading day's +2% intraday TOUCH — open-to-high, not open-to-close
+(`(high − open)/open ≥ 0.02 − 1e-9` AND NOT `high_glitch_suspect`; the epsilon
+is deliberate, the glitch guard is the M2 isolated-high check). Build it from
+`scan.touch_event_predicate` rather than inlining the comparison — the label,
+`cnt_2pct_20d`, the scanner, and the referee all embed that one predicate so
+they can never disagree. Before implementation, write a
 feature-timing table: each proposed feature, its data source, and the moment
 it becomes known. For the current daily-bar pipeline, anything not strictly
 ≤ S's close is lookahead — including "tomorrow's open" (unknown at the

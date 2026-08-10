@@ -1,6 +1,6 @@
 # twopercent
 
-Stock scanner + ML predictor for tickers likely to move +2% open-to-close.
+Stock scanner + ML predictor for tickers likely to reach +2% intraday.
 Built deliberately through the levels of AI adoption (assisted → parallel →
 supervised autonomy → AI-native).
 
@@ -12,7 +12,12 @@ supervised autonomy → AI-native).
   invalidates part of the plan, or a session/level completes, update the
   relevant section and the status checklist in the same piece of work.
 - All model evaluation must be walk-forward — no lookahead. The 2% target is
-  open-to-close: `(close − open) / open ≥ 2%`.
+  the intraday TOUCH (open-to-high), not open-to-close: a bar is a reach iff
+  `(high − open) / open ≥ 2% − 1e-9` AND it is not a high-spike glitch
+  (`high_glitch_suspect`). Never inline that test — every consumer embeds the
+  one predicate, `scan.touch_event_predicate`, so they cannot disagree. It
+  changed from open-to-close in #69; `oc_return` survives only as the exit-rule
+  what-if magnitude and must never become a feature.
 - Push to GitHub (`origin main`) after committing — the remote is the source
   of truth, and local-only commits defeat cloud/scheduled agents at levels 3–4.
 

@@ -1,7 +1,8 @@
 # twopercent
 
-Stock scanner + ML predictor for US tickers likely to move **+2% open-to-close**
-(`(close − open) / open ≥ 2%`). DuckDB store, walk-forward-validated gradient
+Stock scanner + ML predictor for US tickers likely to **reach +2% intraday**
+(`(high − open) / open ≥ 2%`, the open-to-high touch). DuckDB store,
+walk-forward-validated gradient
 boosting, static HTML dashboard. See ROADMAP.md for scope and locked decisions;
 CLAUDE.md for project standards.
 

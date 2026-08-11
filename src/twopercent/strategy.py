@@ -51,16 +51,18 @@ SEQ_LIMIT_FIRST = 1
 SEQ_STOP_FIRST = 2
 
 # (key, dropdown label, enabled). `reach` is the DEFAULT prediction-quality
-# view (not an exit rule); the trailing stop is listed but disabled because
-# daily bars cannot replay it — do not "approximate" it into existence.
+# view (not an exit rule). The trailing stop is ENABLED as of the intraday work:
+# daily bars still cannot replay it — it is path-dependent for the whole session
+# — but intraday bars can, and it is computed from them rather than approximated.
+# A day without a gapless intraday record is EXCLUDED and counted, never guessed.
 STRATEGY_CHOICES = [
     ("reach", "Reach rate (prediction quality)", True),
     ("hold_close", "Buy open → sell close", True),
     ("limit_2pct", "Buy open → +2% limit, else close", True),
     ("limit_stop", "+2% limit + −1% stop (best/worst case)", True),
-    ("trailing", "Trailing stop (needs intraday data)", False),
+    ("trailing", "Trailing stop (−1% from the high, intraday)", True),
 ]
-PNL_STRATEGIES = ("hold_close", "limit_2pct", "limit_stop")
+PNL_STRATEGIES = ("hold_close", "limit_2pct", "limit_stop", "trailing")
 
 
 def stop_triggered(ol: float) -> bool:
@@ -75,6 +77,7 @@ def pick_return_band(
     filled: bool,
     seq: int | None = None,
     fill: float | None = None,
+    trail: float | None = None,
 ) -> tuple[float, float]:
     """(worst, best) day return of one pick under an exit rule, buy-at-open.
 
@@ -97,6 +100,14 @@ def pick_return_band(
     if strategy == "limit_2pct":
         ret = LIMIT_PROFIT if filled else oc
         return (ret, ret)
+    if strategy == "trailing":
+        # Replayed bar by bar from intraday data (intraday.trailing_exits), so
+        # unlike every other rule here it is not a function of the daily bar at
+        # all. `trail` is None when the session had no gapless record; the
+        # caller EXCLUDES that day rather than substituting anything.
+        if trail is None:
+            raise ValueError("trailing exit unavailable for this pick — day must be excluded")
+        return (trail, trail)
     if strategy == "limit_stop":
         stopped = stop_triggered(ol)
         # `fill` is the MEASURED stop exit (intraday.stop_fills). CLAMPED at the
@@ -200,7 +211,7 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
     wins_w = wins_b = n_picks = 0
     amb_n = res_n = 0
     meas_n = stopped_n = 0
-    short = subst = missing = corrupt = 0
+    short = subst = missing = corrupt = excluded = 0
     for day in days:
         picks = day["picks"][:n]
         if len(picks) < n:
@@ -209,6 +220,14 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
             subst += 1
         if any(p[1] is None or p[2] is None or p[3] is None for p in picks):
             missing += 1
+            continue
+        # The trailing rule needs a gapless intraday record for EVERY pick in
+        # the basket — it is path-dependent, so one un-replayable name makes the
+        # day's basket return unknowable. Such days are EXCLUDED and counted,
+        # not filled in: the alternative is a growth curve silently computed
+        # over a different, easier set of days than the one on screen.
+        if strategy == "trailing" and any(len(p) < 8 or p[7] is None for p in picks):
+            excluded += 1
             continue
         if not picks:
             corrupt += 1
@@ -227,6 +246,7 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
             # raising or silently reading as "resolved".
             seq = p[5] if len(p) > 5 else None
             fill = p[6] if len(p) > 6 else None
+            trail = p[7] if len(p) > 7 else None
             # Ambiguity/resolution tallies for the disclosure: a band is a point
             # here ONLY because the intraday replay ordered the two triggers, so
             # the page must be able to say how much of the selection that covers.
@@ -243,7 +263,7 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
                 day_stopped += 1
                 if fill is not None:
                     day_meas += 1
-            worst, best = pick_return_band(strategy, p[2], p[3], bool(p[4]), seq, fill)
+            worst, best = pick_return_band(strategy, p[2], p[3], bool(p[4]), seq, fill, trail)
             if not (math.isfinite(worst) and math.isfinite(best)):
                 ok = False
                 break
@@ -265,7 +285,7 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
         n_picks += len(picks)
         growth_w *= 1 + sum_w / len(picks)
         growth_b *= 1 + sum_b / len(picks)
-    clean = len(days) - missing - corrupt
+    clean = len(days) - missing - corrupt - excluded
     return {
         "gw": growth_w if clean else float("nan"),
         "gb": growth_b if clean else float("nan"),
@@ -283,4 +303,5 @@ def summarize_strategy_days(days: list[dict], n: int, strategy: str) -> dict:
         "base_days": 0,
         "missing": missing,
         "corrupt": corrupt,
+        "excluded": excluded,
     }

@@ -740,11 +740,13 @@ def _payload_days(frame: pd.DataFrame, bases: dict, late: bool = False) -> list[
     # 42 into pickBand.
     has_seq = "path" in frame.columns
     has_fill = "fill" in frame.columns
+    has_trail = "trail" in frame.columns
     for d, grp in frame.groupby("target_date"):
         day = pd.Timestamp(d).date()
         base = bases.get(day)
         seqs = grp["path"] if has_seq else [None] * len(grp)
         fills = grp["fill"] if has_fill else [None] * len(grp)
+        trails = grp["trail"] if has_trail else [None] * len(grp)
         entry = {
             "d": str(day),
             "base": round(float(base), 6) if base is not None else None,
@@ -757,8 +759,9 @@ def _payload_days(frame: pd.DataFrame, bases: dict, late: bool = False) -> list[
                     int(hit),
                     None if seq is None or pd.isna(seq) else int(seq),
                     _payload_num(fill),
+                    _payload_num(trail),
                 ]
-                for rank, oh, ol, oc, hit, seq, fill in zip(
+                for rank, oh, ol, oc, hit, seq, fill, trail in zip(
                     grp["rank"],
                     grp["oh"],
                     grp["ol"],
@@ -766,6 +769,7 @@ def _payload_days(frame: pd.DataFrame, bases: dict, late: bool = False) -> list[
                     grp["hit"],
                     seqs,
                     fills,
+                    trails,
                     strict=True,
                 )
             ],
@@ -835,6 +839,37 @@ def _align_dates(right: pd.DataFrame, left: pd.DataFrame) -> pd.DataFrame:
     else:
         out["target_date"] = pd.to_datetime(out["target_date"]).dt.date
     return out
+
+
+def _attach_trailing(con, frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+    """Merge the replayed trailing-stop exit onto each pick, plus its coverage.
+
+    Absent means the session had no gapless intraday record, and the caller
+    EXCLUDES that day from the trailing view entirely — a path-dependent rule
+    cannot be evaluated on a path with holes in it.
+    """
+    if frame.empty or "symbol" not in frame.columns:
+        return frame, None
+    pairs = frame[["symbol", "target_date"]].rename(columns={"target_date": "date"}).dropna()
+    if pairs.empty:
+        return frame, None
+    trails = intraday.trailing_exits(con, pairs)
+    n_want = len(pairs.drop_duplicates())
+    if trails.empty:
+        return frame, (
+            f"trailing stop: 0 of {n_want} pick-session(s) replayable — no gapless "
+            "intraday record, so the trailing view has nothing to show"
+        )
+    merged = frame.merge(
+        _align_dates(trails.rename(columns={"date": "target_date"}), frame),
+        on=["symbol", "target_date"],
+        how="left",
+    )
+    return merged, (
+        f"trailing stop: {len(trails)} of {n_want} pick-session(s) replayed from "
+        "intraday bars; days where any basket pick could not be replayed are "
+        "EXCLUDED from that view, not filled in"
+    )
 
 
 def _attach_fills(con, frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
@@ -1284,8 +1319,12 @@ _JS_MATH = """
 var tpMath = (function () {
   var LIMIT = __LIMIT__, STOP = __STOP__, EPS = __EPS__;
   var SEQ_LIMIT_FIRST = __SEQ_LIMIT__, SEQ_STOP_FIRST = __SEQ_STOP__;
-  function pickBand(strat, ol, oc, filled, seq, fill) {
+  function pickBand(strat, ol, oc, filled, seq, fill, trail) {
     if (strat === "hold_close") return [oc, oc];
+    if (strat === "trailing") {
+      if (trail === null || trail === undefined) throw new Error("trailing exit unavailable");
+      return [trail, trail];
+    }
     if (strat === "limit_2pct") { var r = filled ? LIMIT : oc; return [r, r]; }
     if (strat === "limit_stop") {
       var stopped = ol <= STOP + EPS;
@@ -1332,7 +1371,7 @@ var tpMath = (function () {
   function stratSummarize(days, n, strat) {
     var gw = 1, gb = 1, winsW = 0, winsB = 0, picksN = 0;
     var ambN = 0, resN = 0, measN = 0, stoppedN = 0;
-    var shortDays = 0, substDays = 0, missing = 0, corrupt = 0;
+    var shortDays = 0, substDays = 0, missing = 0, corrupt = 0, excluded = 0;
     for (var i = 0; i < days.length; i++) {
       var picks = days[i].picks.slice(0, n);
       if (picks.length < n) shortDays += 1;
@@ -1343,12 +1382,19 @@ var tpMath = (function () {
       }
       if (sub) substDays += 1;
       if (miss) { missing += 1; continue; }
+      var noTrail = false;
+      for (j = 0; j < picks.length; j++) {
+        var t = picks[j].length > 7 ? picks[j][7] : null;
+        if (t === null || t === undefined) noTrail = true;
+      }
+      if (strat === "trailing" && noTrail) { excluded += 1; continue; }
       if (!picks.length) { corrupt += 1; continue; }
       var sumW = 0, sumB = 0, dayWinsW = 0, dayWinsB = 0, ok = true;
       var dayAmb = 0, dayRes = 0, dayMeas = 0, dayStopped = 0;
       for (j = 0; j < picks.length; j++) {
         var pseq = picks[j].length > 5 ? picks[j][5] : null;
         var pfill = picks[j].length > 6 ? picks[j][6] : null;
+        var ptrail = picks[j].length > 7 ? picks[j][7] : null;
         // Ambiguous = both triggers touched, i.e. the band is only a point if
         // the intraday replay ordered them. Counted for the SELECTED basket and
         // window so the disclosure matches the number on screen.
@@ -1360,7 +1406,7 @@ var tpMath = (function () {
           dayStopped += 1;
           if (pfill !== null && pfill !== undefined) dayMeas += 1;
         }
-        var band = pickBand(strat, picks[j][2], picks[j][3], !!picks[j][4], pseq, pfill);
+        var band = pickBand(strat, picks[j][2], picks[j][3], !!picks[j][4], pseq, pfill, ptrail);
         if (!isFinite(band[0]) || !isFinite(band[1])) { ok = false; break; }
         sumW += band[0]; sumB += band[1];
         if (band[0] > 0) dayWinsW += 1;
@@ -1377,13 +1423,13 @@ var tpMath = (function () {
       gw *= 1 + sumW / picks.length;
       gb *= 1 + sumB / picks.length;
     }
-    var clean = days.length - missing - corrupt;
+    var clean = days.length - missing - corrupt - excluded;
     return { gw: clean ? gw : NaN, gb: clean ? gb : NaN,
              ww: picksN ? winsW / picksN : NaN, wb: picksN ? winsB / picksN : NaN,
              amb: ambN, res: resN, meas: measN, stopped: stoppedN,
              picks: picksN, days: days.length, clean: clean,
              shortDays: shortDays, substDays: substDays, baseDays: 0,
-             missing: missing, corrupt: corrupt };
+             missing: missing, corrupt: corrupt, excluded: excluded };
   }
   function pathNote(prefix, s) {
     // The band collapses only where the ordering was resolved, so the reader
@@ -1763,8 +1809,11 @@ def build_html(
         if note:
             path_notes.append(f"SIM {note}")
         sim_frame, fill_note = _attach_fills(con, sim_frame)
+        sim_frame, trail_note = _attach_trailing(con, sim_frame)
         if fill_note:
             path_notes.append(f"SIM {fill_note}")
+        if trail_note:
+            path_notes.append(f"SIM {trail_note}")
         sim_days = _payload_days(sim_frame, bases)
     else:
         sim_days = []
@@ -1776,8 +1825,11 @@ def build_html(
         if note:
             path_notes.append(f"LIVE {note}")
         live_frame, fill_note = _attach_fills(con, live_frame)
+        live_frame, trail_note = _attach_trailing(con, live_frame)
         if fill_note:
             path_notes.append(f"LIVE {fill_note}")
+        if trail_note:
+            path_notes.append(f"LIVE {trail_note}")
         live_days = _payload_days(live_frame, bases, late=True)
     else:
         live_days = []

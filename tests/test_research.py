@@ -73,17 +73,6 @@ def _seed_champion_experiment(con, lift=2.0, test_end=dt.date(2026, 6, 30), dail
 
 
 @pytest.fixture(autouse=True)
-def no_real_gh(monkeypatch):
-    """No research test may ever reach the real gh CLI: any subprocess call not
-    intercepted by an explicit _gh_spy is a test bug and must blow up."""
-
-    def forbidden(args, **kw):
-        raise AssertionError(f"test reached real subprocess: {args}")
-
-    monkeypatch.setattr(issues.subprocess, "run", forbidden)
-
-
-@pytest.fixture(autouse=True)
 def no_autogen(monkeypatch):
     """Disable the auto-search generator by default: the curated-queue tests
     below exercise budget/window/dedup/promotion mechanics and must not have

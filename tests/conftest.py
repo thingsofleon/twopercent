@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from twopercent import store
+from twopercent import issues, store
 
 
 @pytest.fixture(autouse=True)
@@ -22,6 +22,36 @@ def isolate_cwd(tmp_path, monkeypatch):
     CWD-relative path (see routine.run).
     """
     monkeypatch.chdir(tmp_path)
+
+
+@pytest.fixture(autouse=True)
+def no_real_gh(monkeypatch):
+    """No test may reach the real `gh` CLI. Applies to the WHOLE suite.
+
+    This guard existed, but only inside tests/test_research.py — so every other
+    module could shell out for real. It did: a routine-score fixture drove the
+    degradation detector into its issue-filing branch and pytest FILED #70
+    against the live repo, with a title and numbers that then read as a genuine
+    model-decay alert. The same accident produced #43/#44, and the fix for those
+    was scoped to one file, which is why it happened again.
+
+    Any subprocess call not intercepted by an explicit spy is a test bug and
+    must blow up rather than reach the network (#99).
+    """
+
+    real_run = issues.subprocess.run
+
+    def guard(args, **kw):
+        # Targeted at `gh` ONLY. issues.subprocess IS the global module, so
+        # blocking every call would also break the node-executed lockstep test
+        # and joblib's cpu probe — and a guard that breaks unrelated tests gets
+        # weakened or removed, which is how this hole reopened last time.
+        argv = args if isinstance(args, (list, tuple)) else [args]
+        if argv and str(argv[0]) == "gh":
+            raise AssertionError(f"test reached the real gh CLI: {list(argv)}")
+        return real_run(args, **kw)
+
+    monkeypatch.setattr(issues.subprocess, "run", guard)
 
 
 @pytest.fixture

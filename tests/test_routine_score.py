@@ -181,21 +181,44 @@ def test_score_mode_zero_new_days_warns(ready, monkeypatch):
 # --- degradation -> issue filing ----------------------------------------------
 
 
-def _degraded_record(n_live: int = 5, lift: float = 0.5) -> track.TrackRecord:
+def _live_record(
+    n_live: int = 5, hits: int = 1, n_scored: int = 20, base_rate: float = 0.10
+) -> track.TrackRecord:
+    """A live record whose columns are SELF-CONSISTENT.
+
+    `lift` used to be a free parameter, decoupled from precision and base_rate,
+    so a caller could pass lift=1.5 onto rows whose precision (5%) was HALF
+    their base rate (10%) and believe it had built a healthy day. Since #69 the
+    detector reads pooled EXCESS, ignoring the lift column entirely — so that
+    "healthy" fixture was degraded, drove the detector into its issue-filing
+    branch, and pytest filed #70 against the live repo (#99/#100). Deriving
+    lift removes the possibility of the two disagreeing.
+    """
     dates = pd.bdate_range("2026-07-06", periods=n_live)
+    precision = hits / n_scored
     scored = pd.DataFrame(
         {
             "signal_date": dates - pd.tseries.offsets.BDay(1),
             "target_date": dates,
-            "hits": [1] * n_live,
-            "n_scored": [20] * n_live,
-            "precision": [0.05] * n_live,
-            "base_rate": [0.10] * n_live,
-            "lift": [lift] * n_live,
+            "hits": [hits] * n_live,
+            "n_scored": [n_scored] * n_live,
+            "precision": [precision] * n_live,
+            "base_rate": [base_rate] * n_live,
+            "lift": [precision / base_rate] * n_live,
             "late": [False] * n_live,
         }
     )
     return track.TrackRecord(scored=scored, pending=[])
+
+
+def _degraded_record(n_live: int = 5) -> track.TrackRecord:
+    """Precision BELOW base rate — the detector must fire."""
+    return _live_record(n_live=n_live, hits=1, n_scored=20, base_rate=0.10)
+
+
+def _healthy_record(n_live: int = 5) -> track.TrackRecord:
+    """Precision ABOVE base rate — the detector must NOT fire."""
+    return _live_record(n_live=n_live, hits=6, n_scored=20, base_rate=0.10)
 
 
 def test_issue_body_benchmark_section_is_touch_only(con):
@@ -387,7 +410,9 @@ def test_pre_ingest_snapshot_failure_reports_unknown_new_days(ready, monkeypatch
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("pre-ingest boom")
-        return _degraded_record(lift=1.5)  # healthy: detector must not fire
+        # Genuinely healthy: 30% precision against a 10% base rate. The old
+        # form passed lift=1.5 onto DEGRADED rows and fired the detector.
+        return _healthy_record()
 
     monkeypatch.setattr(routine.track, "score_predictions", flaky_scores)
     monkeypatch.setattr(
@@ -471,3 +496,23 @@ def test_issue_body_quotes_default_config_benchmark_not_variant(degraded, monkey
     body = create_kw["input"]
     assert '"lift": 2.0' in body  # the champion's own benchmark
     assert "9.9" not in body  # the variant must never be quoted as the champion
+
+
+def test_the_gh_backstop_covers_this_module(ready, monkeypatch):
+    """#99: the guard that would have prevented #70 existed — in one other file.
+
+    A routine-score fixture drove the degradation detector into its issue-filing
+    branch and pytest FILED a real GitHub issue, whose title and numbers then
+    read as a genuine model-decay alert against the live repo. The same accident
+    produced #43/#44 and its fix was scoped to tests/test_research.py, which is
+    why it recurred. Assert the backstop is active HERE, so a future move cannot
+    silently narrow it again.
+    """
+    import subprocess
+
+    with pytest.raises(AssertionError, match="real gh CLI"):
+        subprocess.run(["gh", "issue", "create", "--title", "should never happen"])
+
+    # Non-gh subprocesses must still work: a guard that breaks the node lockstep
+    # or joblib gets weakened or deleted, which is how this hole reopened.
+    assert subprocess.run(["true"]).returncode == 0

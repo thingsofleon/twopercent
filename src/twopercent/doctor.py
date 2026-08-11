@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import duckdb
 import pandas as pd
 
-from twopercent import scan
+from twopercent import intraday, scan
 from twopercent.ingest import _SPLIT_EPSILON, SPLIT_ARTIFACT_OC, SPLIT_ARTIFACT_SCALE
 from twopercent.store import _HIGH_GLITCH_MULTIPLE, _HIGH_GLITCH_VOL_WINDOW
 from twopercent.track import (
@@ -361,9 +361,16 @@ class DoctorReport:
     incomplete: pd.DataFrame
     universe_missing_prices: list[str]
     prices_missing_meta: list[str]
+    intraday: pd.DataFrame
 
     @property
     def problem_count(self) -> int:
+        # Intraday coverage is REPORTED but deliberately NOT counted here.
+        # problem_count drives the routine's pre/post recheck gate, which exists
+        # to abort on corruption introduced by TODAY'S PRICE INGEST. A truncated
+        # intraday capture is a different failure with a different fix, and
+        # folding it in would let a provider cutting the 5m feed abort a run
+        # whose price data is perfectly sound.
         return (
             len(self.gaps)
             + len(self.stale)
@@ -397,6 +404,7 @@ def run(con: duckdb.DuckDBPyConnection, stale_days: int = DEFAULT_STALE_DAYS) ->
         incomplete=incomplete_days(con),
         universe_missing_prices=universe_symbols_without_prices(con),
         prices_missing_meta=price_symbols_without_meta(con),
+        intraday=intraday.coverage_problems(con),
     )
 
 
@@ -407,6 +415,30 @@ def _mark(problems: int) -> str:
 def _overflow(lines: list[str], total: int, examples: int) -> None:
     if total > examples:
         lines.append(f"    ... and {total - examples} more")
+
+
+def _intraday_lines(report: DoctorReport, examples: int) -> list[str]:
+    """Intraday capture health — its own section, since it is not a price fault.
+
+    intraday_prices is the one table a re-run cannot rebuild (Yahoo serves ~60
+    calendar days of 5m and ~30 of 1m), so a defective capture has a deadline
+    for noticing it. Reported even though it does not count toward
+    problem_count.
+    """
+    bad = report.intraday
+    lines = [f"{_mark(len(bad))} intraday: {len(bad)} session(s) with a coverage fault"]
+    if bad.empty:
+        return lines
+    for row in bad.head(examples).itertuples():
+        why = "TRUNCATED" if row.truncated else "THIN"
+        detail = (
+            f"last bar +{int(row.last_minute)}min vs +{int(row.expected_last_minute)} expected"
+            if row.truncated
+            else f"{int(row.symbols)} symbols vs {row.trailing_median_symbols:.0f} trailing median"
+        )
+        lines.append(f"    {row.date:%Y-%m-%d} {row.interval:<3} {why:<10} {detail}")
+    _overflow(lines, len(bad), examples)
+    return lines
 
 
 def format_report(report: DoctorReport, examples: int = 10) -> list[str]:
@@ -510,4 +542,5 @@ def format_report(report: DoctorReport, examples: int = 10) -> list[str]:
         lines.append(f"    {symbol:<8} has price rows but no ingest_meta row")
     _overflow(lines, len(report.prices_missing_meta), examples)
 
+    lines.extend(_intraday_lines(report, examples))
     return lines

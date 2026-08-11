@@ -144,8 +144,8 @@ def path_note(prefix: str, s: dict | None) -> str | None:
     # first selector change. Same drift dashboard._pct_half_up exists for.
     pct = math.floor(100 * res / amb + 0.5)
     return (
-        f"{prefix}: {res} of {amb} both-triggered picks ({pct}%) ordered from 5m "
-        "bars; the rest stay a worst/best band. A collapsed band is conditional "
+        f"{prefix}: {res} of {amb} both-triggered picks ({pct}%) ordered from "
+        "intraday bars; the rest stay a worst/best band. A collapsed band is conditional "
         "on that replay, not proven from daily bars, and resolvable days skew liquid."
     )
 
@@ -164,12 +164,12 @@ def fill_note(prefix: str, s: dict | None) -> str | None:
     meas, stopped = s["meas"], s["stopped"]
     if not meas:
         return (
-            f"{prefix}: 0 of {stopped} stopped picks priced from 5m bars — all use "
+            f"{prefix}: 0 of {stopped} stopped picks priced from 5-minute bars — all use "
             "the flat −1% trigger, which is optimistic"
         )
     pct = math.floor(100 * meas / stopped + 0.5)
     return (
-        f"{prefix}: {meas} of {stopped} stopped picks ({pct}%) priced from 5m bars, "
+        f"{prefix}: {meas} of {stopped} stopped picks ({pct}%) priced from 5-minute bars, "
         "capped at the trigger; the rest assume a flat −1%, which is optimistic"
     )
 

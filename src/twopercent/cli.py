@@ -385,9 +385,12 @@ def intraday_cmd(
         help="Calendar days back to fetch (Yahoo serves ~60 at 5m; longer is clamped).",
     ),
     top: int = typer.Option(20, "--top", help="Pick ranks whose symbols to fetch."),
+    interval: str = typer.Option(
+        intraday_mod.INTERVAL, "--interval", help="Bar interval: 5m or 1m."
+    ),
     db: Path = DbOption,
 ) -> None:
-    """Fetch 5m bars for the symbols this model actually picked, for path resolution.
+    """Fetch intraday bars for the symbols this model actually picked.
 
     Picks-only by design: the explorer needs the ordering of the +2% limit and
     the -1% stop on days the model traded, not the whole universe. Exit codes:
@@ -397,15 +400,7 @@ def intraday_cmd(
     con = store.connect(db)
     end = dt.date.today() + dt.timedelta(days=1)
     start = end - dt.timedelta(days=days)  # ingest clamps and says so
-    symbols = [
-        r[0]
-        for r in con.execute(
-            "SELECT DISTINCT symbol FROM predictions WHERE rank <= ? "
-            "UNION SELECT DISTINCT symbol FROM experiment_daily "
-            "WHERE symbol IS NOT NULL AND rank <= ?",
-            [top, top],
-        ).fetchall()
-    ]
+    symbols = intraday_mod.picked_symbols(con, top_n=top)
     if not symbols:
         typer.echo("No picked symbols found — run `twopercent predict` or `benchmark` first.")
         raise typer.Exit(2)
@@ -413,8 +408,30 @@ def intraday_cmd(
         f"Fetching {intraday_mod.INTERVAL} bars for {len(symbols)} picked symbol(s), "
         f"{start} .. {end}"
     )
-    result = intraday_mod.ingest(con, symbols, start, end)
+    result = intraday_mod.ingest(con, symbols, start, end, interval=interval)
     typer.echo(result.summary())
     if result.batches_failed:
         raise typer.Exit(2)
     raise typer.Exit(0 if result.ok else 1)
+
+
+@app.command("intraday-validate")
+def intraday_validate_cmd(
+    db: Path = DbOption,
+) -> None:
+    """Check 5m exit-path verdicts against 1m ground truth.
+
+    The 5m orderings are derivationally sound — the contiguity gate means no
+    missing bar could have carried the other trigger earlier — but that is a
+    claim about the method, not a measurement. 1m is the only finer evidence
+    Yahoo serves, and it expires in ~30 days, so this is worth running while
+    the cover exists. Exit 1 if any verdict is inverted.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    con = store.connect(db)
+    pairs = con.execute(
+        "SELECT DISTINCT symbol, date FROM intraday_prices WHERE interval = '1m'"
+    ).df()
+    result = intraday_mod.validate_against_1m(con, pairs)
+    typer.echo(result.summary())
+    raise typer.Exit(1 if result.disagreed else 0)

@@ -495,19 +495,19 @@ def test_dashboard_explorer_payload_json(modeled, tmp_path):
     assert len(payload["sim"]) == 6
     day0 = payload["sim"][0]
     assert day0["d"] == "2026-01-05"
-    # Each pick is [rank, oh, ol, oc, hit, path, fill] — raw outcome returns, the
+    # Each pick is [rank, oh, ol, oc, hit, path, fill, trail] — raw returns, the
     # guarded touch/fill flag, and the intraday path verdict; growth is DERIVED
     # in lockstep, never shipped as dollars. path is null here because no
     # intraday bars are ingested: the band must stay open, never default to a
     # resolved ordering (#79).
     # Hand-check day 0: (i + rank) % 5 == 0 at rank 5 → that one is not a reacher.
     assert day0["picks"] == [
-        [1, 0.0231, -0.0009, 0.0203, 1, None, None],
-        [2, 0.0231, -0.0009, 0.0203, 1, None, None],
-        [3, 0.0231, -0.0009, 0.0203, 1, None, None],
-        [4, 0.0231, -0.0009, 0.0203, 1, None, None],
-        [5, 0.0042, -0.0117, -0.0117, 0, None, None],
-        [6, 0.0231, -0.0009, 0.0203, 1, None, None],
+        [1, 0.0231, -0.0009, 0.0203, 1, None, None, None],
+        [2, 0.0231, -0.0009, 0.0203, 1, None, None, None],
+        [3, 0.0231, -0.0009, 0.0203, 1, None, None, None],
+        [4, 0.0231, -0.0009, 0.0203, 1, None, None, None],
+        [5, 0.0042, -0.0117, -0.0117, 0, None, None, None],
+        [6, 0.0231, -0.0009, 0.0203, 1, None, None, None],
     ]
     # Base rate on 2026-01-05: 4 runners of 8 names reached ≥2%.
     assert abs(day0["base"] - 0.5) < 1e-9
@@ -517,10 +517,10 @@ def test_dashboard_explorer_payload_json(modeled, tmp_path):
     live0 = payload["live"][0]
     assert live0["late"] is True  # backfilled save, created after the target open
     assert [p[0] for p in live0["picks"]] == sorted(p[0] for p in live0["picks"])
-    assert all(len(p) == 7 for p in live0["picks"])
+    assert all(len(p) == 8 for p in live0["picks"])
     # Nothing is path-resolved without intraday bars — every verdict stays null,
     # so every band stays open (#79).
-    assert all(p[5] is None and p[6] is None for p in live0["picks"])
+    assert all(p[5] is None and p[6] is None and p[7] is None for p in live0["picks"])
     assert all(p[1] is not None and p[2] is not None and p[3] is not None for p in live0["picks"])
 
 
@@ -536,12 +536,12 @@ def test_dashboard_explorer_too_few_sim_days_says_so(modeled, tmp_path):
     assert "The live record above is the clean test." in content
 
 
-def _pick(rank, hit, oh=0.021, ol=-0.002, oc=0.005, path=None, fill=None):
+def _pick(rank, hit, oh=0.021, ol=-0.002, oc=0.005, path=None, fill=None, trail=None):
     """A payload pick [rank, oh, ol, oc, hit, path, fill] with harmless defaults.
 
     `path` is the intraday verdict (#79); None means unresolved, which is what
     every pick was before intraday ingestion existed."""
-    return [rank, oh, ol, oc, hit, path, fill]
+    return [rank, oh, ol, oc, hit, path, fill, trail]
 
 
 def test_summarize_days_first_available_substitution_and_short_days():
@@ -672,17 +672,18 @@ def test_explorer_state_live_short_window_disclosures():
 # --- strategy explorer (exit-rule what-if) ------------------------------------
 
 
-def test_strategy_dropdown_defaults_to_reach_and_disables_trailing(modeled, tmp_path):
+def test_strategy_dropdown_defaults_to_reach_and_offers_trailing(modeled, tmp_path):
     # Reach rate (prediction quality) is the DEFAULT view; the P&L card exists
-    # but is hidden until an exit rule is chosen; the trailing stop is listed
-    # DISABLED with its reason (daily bars cannot replay it) — never simulated.
+    # but is hidden until an exit rule is chosen. The trailing stop is now
+    # ENABLED — replayed from intraday bars, never approximated from daily ones.
     _record_sim(modeled, n_days=130)
     out = tmp_path / "dash.html"
     dashboard.render(modeled, "baseline_gbm_v1", str(out), top=5)
     content = out.read_text()
 
     assert '<option value="reach" selected>Reach rate (prediction quality)</option>' in content
-    assert '<option value="trailing" disabled>Trailing stop (needs intraday data)' in content
+    assert "disabled>Trailing stop" not in content  # no longer an impossible rule
+    assert '<option value="trailing">Trailing stop (−1% from the high, intraday)' in content
     assert 'id="tp-card-strat" hidden' in content  # opt-in, never the default
     assert "id='tp-card-reach'" in content  # the default card is the reach table
     # Selection caveat names strategies explicitly (browsing IS selection).
@@ -865,6 +866,10 @@ def test_strategy_lockstep_python_vs_node():
         },
         # The stored payload shape between #79 and #86: 6 elements, no fill.
         {"d": "j", "base": 0.3, "picks": [[1, 0.03, -0.03, 0.01, 1, None]]},
+        # Trailing exits: one replayable day and one that is not, so the
+        # EXCLUDED path is exercised identically in both languages.
+        {"d": "k", "base": 0.3, "picks": [_pick(1, 1, ol=-0.02, oc=0.01, trail=-0.004)]},
+        {"d": "l", "base": 0.3, "picks": [_pick(1, 1, ol=-0.02, oc=0.01, trail=0.017)]},
         # 1 resolved of 8 ambiguous = 12.5%, where Python's half-even round()
         # gives 12% and JS Math.round gives 13% -- the drift class
         # dashboard._pct_half_up already exists for. Pinned here so the
@@ -884,11 +889,11 @@ def test_strategy_lockstep_python_vs_node():
 const days = {json.dumps(days)};
 const missingDays = {json.dumps(missing_days)};
 const out = {{}};
-for (const strat of ["hold_close", "limit_2pct", "limit_stop"]) {{
+for (const strat of ["hold_close", "limit_2pct", "limit_stop", "trailing"]) {{
   for (const n of [1, 2, 5]) {{
     const s = tpMath.stratSummarize(days, n, strat);
     out[strat + ":" + n] = [s.gw, s.gb, s.ww, s.wb, s.picks, s.days, s.clean,
-                            s.shortDays, s.substDays, s.missing, s.corrupt,
+                            s.shortDays, s.substDays, s.missing, s.corrupt, s.excluded,
                             s.amb, s.res, s.meas, s.stopped,
                             tpMath.pathNote("SIM", s), tpMath.fillNote("SIM", s),
                             tpMath.growthText(s), tpMath.winText(s),
@@ -910,7 +915,7 @@ console.log(JSON.stringify(out));
 
         return None if isinstance(x, float) and math.isnan(x) else x
 
-    for strat in ("hold_close", "limit_2pct", "limit_stop"):
+    for strat in ("hold_close", "limit_2pct", "limit_stop", "trailing"):
         for n in (1, 2, 5):
             s = dashboard.strategy.summarize_strategy_days(days, n, strat)
             expected = [
@@ -925,6 +930,7 @@ console.log(JSON.stringify(out));
                 s["subst"],
                 s["missing"],
                 s["corrupt"],
+                s["excluded"],
                 s["amb"],
                 s["res"],
                 s["meas"],

@@ -1001,3 +1001,110 @@ def stop_fills_best(
         if parts
         else pd.DataFrame(columns=["symbol", "date", "fill"])
     )
+
+
+# A trailing stop exits when price falls this far below its running high-water
+# mark, measured from the entry (the day's open). Matches the fixed stop's 1%
+# so the two rules are comparable on the explorer.
+TRAILING_DROP = 0.01
+
+
+def trailing_exits(
+    con: duckdb.DuckDBPyConnection,
+    pairs: pd.DataFrame,
+    drop: float = TRAILING_DROP,
+    intervals: tuple[str, ...] = RESOLUTION_ORDER,
+) -> pd.DataFrame:
+    """Replay a trailing stop bar by bar. Returns per-session exit returns.
+
+    This is the rule the dropdown has been advertising as impossible: daily bars
+    genuinely cannot replay it, because a trailing stop depends on the ORDER of
+    every move, not just the extremes.
+
+    A STRICTER gate than ordering. resolve() needs the record intact only up to
+    the FIRST trigger — nothing after it can change which came first. A trailing
+    stop is path-dependent for the whole session: a missing bar can hide the
+    high that would have raised the stop, or the dip that would have hit it. So
+    this demands contiguity from the open through the CLOSE, and sessions that
+    fall short are simply absent (the caller shows no number rather than a
+    number built on gaps).
+
+    INTRA-BAR ASSUMPTION, stated because it is not neutral: within one bar we
+    do not know whether the high or the low came first, and we assume the HIGH
+    did. That raises the high-water mark before testing the low, so the stop
+    triggers sooner — for a long position that means exiting earlier and
+    capturing less upside. The assumption is therefore CONSERVATIVE; it
+    understates the rule rather than flattering it. Its cost shrinks with the
+    bar width, which is why the finest interval available is used first.
+
+    Fills follow the same discipline as the fixed stop (#86): the exit is the
+    next bar's open, capped at the trigger price, because a stop-market order
+    cannot execute above its trigger. A trigger in the final bar has no next
+    bar and uses that bar's close, capped the same way.
+    """
+    empty = pd.DataFrame(columns=["symbol", "date", "trail"])
+    if pairs.empty:
+        return empty
+    want = pairs[["symbol", "date"]].drop_duplicates().copy()
+    want["date"] = pd.to_datetime(want["date"]).dt.date
+
+    out_rows: list[dict] = []
+    done: set[tuple] = set()
+    for interval in intervals:
+        remaining = want[[tuple(r) not in done for r in want[["symbol", "date"]].values]]
+        if remaining.empty:
+            break
+        bar_minutes = spec(interval)["minutes"]
+        con.register("_trail_pairs", remaining)
+        try:
+            bars = con.execute(f"""
+                WITH want AS (
+                    SELECT DISTINCT symbol, CAST(date AS DATE) AS date FROM _trail_pairs
+                ),
+                agree AS ({session_agreement_sql(interval)}),
+                gated AS (
+                    SELECT w.symbol, w.date, d.open
+                    FROM want w
+                    JOIN prices d ON d.symbol = w.symbol AND d.date = w.date
+                    JOIN agree ag ON ag.symbol = w.symbol AND ag.date = w.date AND ag.agrees
+                    WHERE d.open > 0 AND isfinite(d.open)
+                )
+                SELECT g.symbol, g.date, g.open, i.ts, i.open AS bar_open,
+                       i.high, i.low, i.close,
+                       date_diff('minute',
+                                 g.date + INTERVAL '{SESSION_OPEN_MINUTES}' MINUTE,
+                                 i.ts) / {bar_minutes} AS slot
+                FROM gated g
+                JOIN intraday_prices i
+                  ON i.symbol = g.symbol AND i.date = g.date AND i.interval = '{interval}'
+                 AND i.ts >= g.date + INTERVAL '{SESSION_OPEN_MINUTES}' MINUTE
+                ORDER BY g.symbol, g.date, i.ts
+            """).fetchdf()
+        finally:
+            con.unregister("_trail_pairs")
+        if bars.empty:
+            continue
+        for (sym, day), grp in bars.groupby(["symbol", "date"], sort=False):
+            slots = grp["slot"].to_numpy()
+            # FULL-session contiguity: every slot from the open present, no holes.
+            if slots[0] != 0 or len(set(slots)) != int(slots[-1]) + 1:
+                continue
+            open_px = float(grp["open"].iloc[0])
+            highs = grp["high"].to_numpy(dtype=float)
+            lows = grp["low"].to_numpy(dtype=float)
+            closes = grp["close"].to_numpy(dtype=float)
+            bar_opens = grp["bar_open"].to_numpy(dtype=float)
+            hwm = open_px
+            exit_px = None
+            for k in range(len(highs)):
+                hwm = max(hwm, highs[k])  # conservative: high before low
+                trigger = hwm * (1.0 - drop)
+                if lows[k] <= trigger:
+                    nxt = bar_opens[k + 1] if k + 1 < len(bar_opens) else closes[k]
+                    exit_px = min(float(nxt), trigger)  # cannot fill above the trigger
+                    break
+            if exit_px is None:
+                exit_px = float(closes[-1])  # never stopped out: exit at the close
+            out_rows.append({"symbol": sym, "date": day, "trail": (exit_px - open_px) / open_px})
+            done.add((sym, day))
+    return pd.DataFrame(out_rows, columns=["symbol", "date", "trail"]) if out_rows else empty

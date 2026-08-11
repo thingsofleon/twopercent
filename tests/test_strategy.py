@@ -51,21 +51,40 @@ def test_limit_stop_band_cases():
 def test_band_worst_never_exceeds_best_across_a_value_sweep():
     ols = [-0.1, -0.015, -0.0100000001, -0.01, -0.0099, -0.0009, 0.0]
     ocs = [-0.08, -0.0117, 0.0, 0.0199, 0.02, 0.0203, 0.19]
+    trails = [None, -0.09, -0.01, 0.0, 0.02, 0.31]
     for strat in strategy.PNL_STRATEGIES:
         for ol in ols:
             for oc in ocs:
                 for filled in (False, True):
-                    worst, best = strategy.pick_return_band(strat, ol, oc, filled)
-                    assert worst <= best, (strat, ol, oc, filled)
+                    for trail in trails:
+                        if strat == "trailing" and trail is None:
+                            continue  # covered by its own must-raise test
+                        worst, best = strategy.pick_return_band(
+                            strat, ol, oc, filled, None, None, trail
+                        )
+                        assert worst <= best, (strat, ol, oc, filled, trail)
 
 
 def test_unknown_strategy_dies_loudly():
     with pytest.raises(ValueError, match="unknown exit-rule strategy"):
         strategy.pick_return_band("reach", -0.01, 0.0, True)
     with pytest.raises(ValueError, match="unknown exit-rule strategy"):
-        strategy.summarize_strategy_days(
-            [{"d": "a", "picks": [[1, 0.0, 0.0, 0.0, 0]]}], 1, "trailing"
-        )
+        strategy.pick_return_band("nonsense", -0.01, 0.0, True)
+
+
+def test_trailing_without_an_intraday_replay_refuses_rather_than_guessing():
+    """A path-dependent rule cannot be evaluated on a path with holes in it."""
+    with pytest.raises(ValueError, match="must be excluded"):
+        strategy.pick_return_band("trailing", -0.01, 0.0, True)
+
+    # And the day is EXCLUDED from the window, not silently averaged around.
+    days = [
+        {"d": "a", "picks": [[1, 0.03, -0.02, 0.01, 1, None, None, -0.004]]},
+        {"d": "b", "picks": [[1, 0.03, -0.02, 0.01, 1, None, None, None]]},
+    ]
+    s = strategy.summarize_strategy_days(days, 1, "trailing")
+    assert s["excluded"] == 1 and s["clean"] == 1
+    assert abs(s["gw"] - 0.996) < 1e-9  # only day "a" compounded
 
 
 def _bar(symbol, open_, high, low, close, volume=1_000_000, date=dt.date(2026, 1, 5)):
@@ -169,5 +188,7 @@ def test_dropdown_choices_shape():
     keys = [k for k, _label, _enabled in strategy.STRATEGY_CHOICES]
     assert keys[0] == "reach"  # prediction quality stays the default view
     disabled = {k for k, _label, enabled in strategy.STRATEGY_CHOICES if not enabled}
-    assert disabled == {"trailing"}  # not computable from daily data — never faked
-    assert set(strategy.PNL_STRATEGIES) == set(keys) - {"reach", "trailing"}
+    # Trailing is ENABLED since the intraday work: still not computable from
+    # daily bars, but replayed from intraday ones rather than approximated.
+    assert disabled == set()
+    assert set(strategy.PNL_STRATEGIES) == set(keys) - {"reach"}

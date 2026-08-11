@@ -1108,3 +1108,96 @@ def trailing_exits(
             out_rows.append({"symbol": sym, "date": day, "trail": (exit_px - open_px) / open_px})
             done.add((sym, day))
     return pd.DataFrame(out_rows, columns=["symbol", "date", "trail"]) if out_rows else empty
+
+
+# Regular session close, minutes past midnight exchange-local. The last bar of a
+# complete session STARTS one bar-width before it (15:55 at 5m, 15:59 at 1m).
+SESSION_CLOSE_MINUTES = 16 * 60
+# A session is short if its last bar starts more than this many minutes before
+# the expected final slot. One bar of slack absorbs a venue's early close on a
+# half day without hiding a real truncation.
+TRUNCATION_SLACK_MINUTES = 5
+# Coverage floor against the trailing median, mirroring the daily path's
+# completeness gate (store.complete_trading_days uses 0.9 over 20 dates).
+COVERAGE_MIN_FRACTION = 0.9
+COVERAGE_MEDIAN_WINDOW = 20
+
+
+def session_coverage(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """Per (interval, date) capture health, read from intraday_prices RAW.
+
+    Diagnostics must read raw tables, never filtered views (CLAUDE.md): the
+    agreement gate hides exactly the defective sessions a coverage check exists
+    to find, and makes a truncated capture look like a merely un-resolvable one.
+
+    Two independent failures, because they look identical downstream and need
+    different fixes:
+
+      * TRUNCATED — the session's last bar starts well before the close. A
+        provider cutting the feed at 15:10 leaves a session that passes every
+        per-bar check and is simply missing its final hour.
+      * THIN — symbol count materially below the trailing median. A batch that
+        failed silently, or a rate limit, removes names rather than minutes.
+
+    Neither is visible in row counts alone, which is why the ingest step's
+    "N bars; M/M symbols" could report success on both.
+    """
+    rows = []
+    for interval in INTERVALS:
+        minutes = spec(interval)["minutes"]
+        expected_last = SESSION_CLOSE_MINUTES - minutes
+        frame = con.execute(
+            f"""
+            WITH per_day AS (
+                SELECT date,
+                       count(*) AS bars,
+                       count(DISTINCT symbol) AS symbols,
+                       max(date_diff('minute', date, ts)) AS last_minute
+                FROM intraday_prices
+                WHERE interval = '{interval}'
+                GROUP BY date
+            )
+            SELECT date, bars, symbols, last_minute,
+                   median(symbols) OVER (
+                       ORDER BY date ROWS BETWEEN {COVERAGE_MEDIAN_WINDOW} PRECEDING
+                                              AND 1 PRECEDING
+                   ) AS trailing_median_symbols
+            FROM per_day ORDER BY date
+            """
+        ).fetchdf()
+        if frame.empty:
+            continue
+        frame.insert(0, "interval", interval)
+        frame["expected_last_minute"] = expected_last
+        frame["truncated"] = frame["last_minute"] < expected_last - TRUNCATION_SLACK_MINUTES
+        # A NULL trailing median (the first sessions ever captured) cannot be
+        # judged against a baseline, so those are NOT called thin — same rule the
+        # daily completeness gate uses, and made explicit rather than implied.
+        frame["thin"] = frame["trailing_median_symbols"].notna() & (
+            frame["symbols"] < COVERAGE_MIN_FRACTION * frame["trailing_median_symbols"]
+        )
+        rows.append(frame)
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "interval",
+                "date",
+                "bars",
+                "symbols",
+                "last_minute",
+                "trailing_median_symbols",
+                "expected_last_minute",
+                "truncated",
+                "thin",
+            ]
+        )
+    return pd.concat(rows, ignore_index=True)
+
+
+def coverage_problems(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """Only the sessions that failed a coverage check — newest first."""
+    frame = session_coverage(con)
+    if frame.empty:
+        return frame
+    bad = frame[frame["truncated"] | frame["thin"]].copy()
+    return bad.sort_values(["date", "interval"], ascending=[False, True])

@@ -5,7 +5,7 @@ import pytest
 from typer.testing import CliRunner
 
 from tests.conftest import seed_history
-from twopercent import doctor, store
+from twopercent import doctor, intraday, store
 from twopercent.cli import app
 
 START = dt.date(2026, 1, 5)  # a Monday; 15 business days end 2026-01-23
@@ -325,7 +325,7 @@ def test_clean_store_passes_every_check(clean):
     assert doctor.price_symbols_without_meta(clean) == []
     text = "\n".join(doctor.format_report(report))
     assert "[FAIL]" not in text
-    assert text.count("[ OK ]") == 7
+    assert text.count("[ OK ]") == 8  # + intraday capture coverage (#96)
 
 
 def test_missing_universe_warns_but_does_not_fail(con):
@@ -523,3 +523,77 @@ def test_cli_exits_1_on_empty_store(tmp_path):
     result = runner.invoke(app, ["doctor", "--db", str(tmp_path / "empty.duckdb")])
     assert result.exit_code == 1
     assert "no price data" in result.output
+
+
+def test_doctor_reports_a_truncated_intraday_session(con):
+    """#96: a provider cutting the feed leaves a session that passes every
+    per-bar check and is simply missing its final hour.
+
+    It looked identical to a merely un-resolvable session downstream, so it
+    surfaced as `disagreed` or inflated the 1m-recovery count — never as "the
+    capture was truncated". A real one sat in the store undetected: 2026-08-10
+    5m ended 15:10 instead of 15:55.
+    """
+    import datetime as dt
+
+    day = dt.date(2026, 1, 16)
+    seed_history(con, {"AAA": [0.01] * 10}, start="2026-01-05")
+    bars = pd.DataFrame(
+        {
+            "symbol": "AAA",
+            # Stops at 15:10 — 45 minutes short of the 15:55 final 5m slot.
+            "ts": [
+                dt.datetime.combine(day, dt.time(9, 30)) + dt.timedelta(minutes=5 * i)
+                for i in range(69)
+            ],
+            "date": day,
+            "interval": "5m",
+            "open": 100.0,
+            "high": 100.5,
+            "low": 99.5,
+            "close": 100.0,
+            "volume": 1000,
+        }
+    )
+    con.register("_trunc", bars)
+    con.execute("INSERT INTO intraday_prices SELECT * FROM _trunc")
+
+    problems = intraday.coverage_problems(con)
+    assert len(problems) == 1
+    assert bool(problems.iloc[0]["truncated"]) and not bool(problems.iloc[0]["thin"])
+
+    text = "\n".join(doctor.format_report(doctor.run(con)))
+    assert "TRUNCATED" in text
+    assert "[FAIL] intraday" in text
+
+
+def test_doctor_reports_a_thin_intraday_session(con):
+    """A silently failed batch removes SYMBOLS rather than minutes."""
+    import datetime as dt
+
+    seed_history(con, {"AAA": [0.01] * 10}, start="2026-01-05")
+    rows = []
+    for d in range(6):
+        day = dt.date(2026, 1, 5) + dt.timedelta(days=d)
+        n_syms = 20 if d < 5 else 2  # last session captures a tenth of the names
+        for k in range(n_syms):
+            rows.append(
+                {
+                    "symbol": f"S{k}",
+                    "ts": dt.datetime.combine(day, dt.time(15, 55)),
+                    "date": day,
+                    "interval": "5m",
+                    "open": 100.0,
+                    "high": 100.5,
+                    "low": 99.5,
+                    "close": 100.0,
+                    "volume": 1000,
+                }
+            )
+    con.register("_thin", pd.DataFrame(rows))
+    con.execute("INSERT INTO intraday_prices SELECT * FROM _thin")
+
+    problems = intraday.coverage_problems(con)
+    thin = problems[problems["thin"]]
+    assert len(thin) == 1
+    assert "THIN" in "\n".join(doctor.format_report(doctor.run(con)))

@@ -488,6 +488,23 @@ def _intraday_step(report: RoutineReport, con, top_n: int = 20) -> None:
         details.append(f"{interval}: {result.summary()}")
         if not result.ok:
             worst = WARN
+    # Row counts cannot see a TRUNCATED or THIN session — every bar present is
+    # valid, the session is simply missing its last hour or a batch of symbols.
+    # That is the whole failure mode this step is exposed to, so the capture is
+    # judged on coverage, not on "it returned some rows" (#96).
+    try:
+        bad = intraday.coverage_problems(con)
+    except Exception as exc:
+        report.add("intraday", WARN, f"{'; '.join(details)}; coverage check FAILED: {exc}")
+        return
+    if len(bad):
+        worst = WARN
+        worst_row = bad.iloc[0]
+        details.append(
+            f"{len(bad)} session(s) with a coverage fault, newest "
+            f"{worst_row['date']} {worst_row['interval']} "
+            f"{'TRUNCATED' if worst_row['truncated'] else 'THIN'}"
+        )
     report.add("intraday", worst, "; ".join(details))
 
 

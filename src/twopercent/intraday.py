@@ -1029,13 +1029,20 @@ def trailing_exits(
     fall short are simply absent (the caller shows no number rather than a
     number built on gaps).
 
-    INTRA-BAR ASSUMPTION, stated because it is not neutral: within one bar we
-    do not know whether the high or the low came first, and we assume the HIGH
-    did. That raises the high-water mark before testing the low, so the stop
-    triggers sooner — for a long position that means exiting earlier and
-    capturing less upside. The assumption is therefore CONSERVATIVE; it
-    understates the rule rather than flattering it. Its cost shrinks with the
-    bar width, which is why the finest interval available is used first.
+    INTRA-BAR ASSUMPTION — and the claim that it is conservative was WRONG.
+    Within one bar we do not know whether the high or the low came first, and
+    this assumes the HIGH did. The original reasoning was that ratcheting the
+    high-water mark first makes the stop fire sooner, so a long exits earlier
+    and captures less. Measured on 448 real sessions, the opposite holds: the
+    high-first ordering returns +0.62pp PER SESSION more than low-first (better
+    on 195, worse on 62), because firing sooner at a HIGHER trailing level
+    frequently beats riding the same bar down. Cross-checked the other way, a 5m
+    replay averages +0.66pp above the same sessions replayed at 1m.
+
+    So the assumption FLATTERS. It is not a conservatism; it is an unpriced
+    choice of the favourable branch, which is why the dropdown option is
+    disabled until the result can be shown as a band (low-first to high-first)
+    the way limit_stop bands an unresolvable ordering.
 
     Fills follow the same discipline as the fixed stop (#86): the exit is the
     next bar's open, capped at the trigger price, because a stop-market order
@@ -1105,6 +1112,14 @@ def trailing_exits(
                     break
             if exit_px is None:
                 exit_px = float(closes[-1])  # never stopped out: exit at the close
+            # NORMALISE before recording: `day` arrives from a DuckDB DATE as a
+            # pandas Timestamp while `want` holds datetime.date, so an
+            # un-normalised set match removes NOTHING — the coarse pass then
+            # re-replays every session the fine pass already did and BOTH rows
+            # are returned. The identical trap is documented 160 lines above and
+            # handled in resolve_best and stop_fills_best; this function shipped
+            # without it, and the duplicates corrupted every payload consumer.
+            day = pd.Timestamp(day).date()
             out_rows.append({"symbol": sym, "date": day, "trail": (exit_px - open_px) / open_px})
             done.add((sym, day))
     return pd.DataFrame(out_rows, columns=["symbol", "date", "trail"]) if out_rows else empty

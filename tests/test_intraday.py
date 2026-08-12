@@ -723,3 +723,46 @@ def test_recovery_separates_finer_resolution_from_a_defective_5m_capture(con):
     assert v.same_bar_at_5m == 0
     # And the summary must never print a numerator against a zero denominator.
     assert "0 of 0 same-5m-bar" in v.summary()
+
+
+# --- #97 post-merge: the duplicate that corrupted every view ------------------
+
+
+def test_trailing_exits_never_returns_duplicate_sessions(con):
+    """A session replayable at BOTH intervals must yield exactly one row.
+
+    `day` arrives from a DuckDB DATE as a pandas Timestamp while the pending set
+    holds datetime.date, so the un-normalised membership test removed nothing
+    and the 5m pass re-replayed every session 1m had already done. The identical
+    trap is documented in resolve_best and stop_fills_best; this function
+    shipped without it.
+
+    The blast radius was not the trailing view: `_attach_trailing` left-merges
+    into the SHARED payload, so a duplicate becomes a duplicate PICK for every
+    consumer — the default reach card and the three other exit rules all moved,
+    in the flattering direction, on numbers that were correct before.
+    """
+    _seed_daily(con, open_=100.0, high=103.0, low=98.0, close=101.0)
+    both = _bars([("09:30", 100.0, 100.2, 99.6, 100.1), ("09:35", 100.1, 103.0, 98.0, 101.0)])
+    _ingest_iv(con, both, "5m")
+    _ingest_iv(con, both, "1m")
+
+    out = intraday.trailing_exits(con, _pairs_one())
+
+    assert len(out) == len(out.drop_duplicates(subset=["symbol", "date"]))
+    assert len(out) == 1
+    # And the key is a plain date, so downstream merges cannot silently miss.
+    assert isinstance(out.iloc[0]["date"], dt.date)
+
+
+def test_trailing_exits_requires_a_gapless_session(con):
+    """Path-dependent rules cannot be evaluated on a path with holes."""
+    _seed_daily(con, open_=100.0, high=103.0, low=98.0, close=101.0)
+    _ingest_iv(
+        con,
+        # 09:35 slot missing entirely.
+        _bars([("09:30", 100.0, 100.2, 99.6, 100.1), ("09:40", 100.1, 103.0, 98.0, 101.0)]),
+        "5m",
+    )
+
+    assert intraday.trailing_exits(con, _pairs_one()).empty

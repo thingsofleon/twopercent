@@ -188,7 +188,9 @@ def test_dropdown_choices_shape():
     keys = [k for k, _label, _enabled in strategy.STRATEGY_CHOICES]
     assert keys[0] == "reach"  # prediction quality stays the default view
     disabled = {k for k, _label, enabled in strategy.STRATEGY_CHOICES if not enabled}
-    # Trailing is ENABLED since the intraday work: still not computable from
-    # daily bars, but replayed from intraday ones rather than approximated.
-    assert disabled == set()
+    # Trailing is WITHDRAWN: the replay is real but its number carries three
+    # measured, all-flattering biases (see the STRATEGY_CHOICES comment). The
+    # rule stays in PNL_STRATEGIES so its math and lockstep keep being tested;
+    # only the dropdown entry is greyed out.
+    assert disabled == {"trailing"}
     assert set(strategy.PNL_STRATEGIES) == set(keys) - {"reach"}

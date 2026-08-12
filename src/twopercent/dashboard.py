@@ -1864,7 +1864,12 @@ def render(
 ) -> str:
     """Render the dashboard; pass a precomputed PredictResult to avoid retraining."""
     if result is None:
-        result = predict_for(con, strategy_name, save=True)
+        # save=False: rendering is a DISPLAY action and must never write to the
+        # predictions log. It used to default to saving, so every evening
+        # `twopercent dashboard` re-predicted the current signal day and
+        # overwrote its logged picks (#101). The morning routine is the only
+        # thing that logs a prediction.
+        result = predict_for(con, strategy_name, save=False)
     content = build_html(con, result, top=top)
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(content)

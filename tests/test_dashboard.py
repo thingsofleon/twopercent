@@ -60,7 +60,10 @@ def test_dashboard_renders_scored_track_record(modeled, tmp_path):
     assert 'src="http' not in content and 'href="http' not in content  # self-contained
     assert '<meta charset="utf-8">' in content  # no mojibake when served header-less
     assert "<svg" in content  # chart rendered for the scored days
-    assert "Awaiting outcomes" in content  # the render-day prediction is pending
+    # "Awaiting outcomes" comes from a LOGGED prediction, not from rendering.
+    # Rendering used to save one as a side effect, which is what overwrote a
+    # live day's created_ts and dropped it from the record (#101).
+    assert "Awaiting outcomes" not in content
 
 
 def test_dashboard_info_tooltips_present(modeled, tmp_path):
@@ -1168,3 +1171,26 @@ def test_measured_stop_fill_reaches_the_payload_end_to_end(modeled, tmp_path):
     assert abs(fills[0] - (-0.025)) < 1e-6
     # And the page must disclose that exits are mixed measured/assumed.
     assert "stop exits:" in content
+
+
+def test_rendering_never_writes_to_the_predictions_log(modeled, tmp_path):
+    """#101: rendering is a DISPLAY action.
+
+    `render` defaulted to `predict_for(save=True)`, so every evening run of
+    `twopercent dashboard` re-predicted the current signal day and replaced its
+    logged picks — stamping a fresh created_ts. A creation time after the target
+    day's open marks the day `late`, so a genuine live day (2026-08-07, 18/20,
+    lift 2.34) was silently dropped from the live record by a display command.
+    """
+    dates = sorted(pd.bdate_range("2026-01-05", periods=60).date)
+    predict_for(modeled, "baseline_gbm_v1", signal_date=dates[-3], save=True)
+    before = modeled.execute(
+        "SELECT signal_date, count(*), min(created_ts) FROM predictions GROUP BY signal_date"
+    ).fetchall()
+
+    dashboard.render(modeled, "baseline_gbm_v1", str(tmp_path / "d.html"), top=5)
+
+    after = modeled.execute(
+        "SELECT signal_date, count(*), min(created_ts) FROM predictions GROUP BY signal_date"
+    ).fetchall()
+    assert after == before, "rendering must not add, remove or restamp predictions"

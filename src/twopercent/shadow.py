@@ -46,6 +46,27 @@ SHADOW_PATH = Path("research/shadow.json")
 # the compute added to every predict morning AND is the K that the shadow-gate
 # forward-margin accounting (#60) scales against — a max-over-K selection.
 MAX_SHADOW = 4
+
+
+def forward_margin_band(single_band: float, k_concurrent: int | None = None) -> float:
+    """Widen a forward-margin threshold for the max-over-K shadow selection (#60).
+
+    Promoting the best of K concurrently shadowed challengers is a multiple
+    comparison exactly as an overnight sweep is, and the shadow stage sits
+    AFTER the sweep — so a candidate that already survived the sweep's band is
+    being selected on twice. Applying research.family_correction keeps the two
+    stages accounted for on the same rule rather than by two hand-picked
+    numbers that drift apart.
+
+    At the shipped cap of MAX_SHADOW=4 the widening is ~1.27x. Defined now,
+    unused until #59 builds the shadow gate, so that gate cannot ship without
+    the accounting attached.
+    """
+    from twopercent import research
+
+    return round(single_band * research.family_correction(k_concurrent or MAX_SHADOW), 4)
+
+
 # The forward record uses the shipped top-20 basket, same as the champion's
 # degradation detector, so champion and challenger records are comparable.
 SHADOW_TOP_N = 20

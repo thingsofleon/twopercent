@@ -259,7 +259,28 @@ reading `predictions` can see shadow picks — is proven byte-for-byte in tests.
 Import cycle broken by extracting `canonical.py` (research/generate keep
 `research.canonical_params` via re-export). This tier LOGS and SCORES only; it
 promotes nothing — that is #59 (forward shadow-gate), separately quant-skeptic-
-gated, and #60 (MC accounting) scales the band/window off `MAX_SHADOW`.
+gated.
+
+**Implemented 2026-08-12** (#60, multiple-comparisons accounting): the promotion
+band is no longer a hand-picked constant. `research.promotion_band(n)` derives it
+from `research.family_size(con)` — every recorded STANDARD-window comparison in
+the touch era, counted from the LEDGER rather than the queue, because the queue
+says what was planned and the ledger says what the max-over-trials actually ran
+over. Bonferroni at alpha=0.05 on SE(delta-lift)=0.08. It REPRODUCES the 0.27 it
+replaces at the ~56-config family that value was hand-calibrated for, which is
+the evidence the parameterisation is right rather than merely plausible; at
+today's 60 recorded comparisons it is still 0.27, so the change is a no-op now
+and only bites as the family grows (~0.28 at 100, ~0.31 at 500). Floored at 0.27
+so it can never loosen below what past decisions were judged against. The family
+size and the derived band are printed on every candidate issue — a margin quoted
+without its family size is unauditable.
+
+The shadow stage is the second multiple comparison: `shadow.forward_margin_band`
+widens a forward threshold by `research.family_correction(K)` (~1.27x at
+`MAX_SHADOW=4`). That correction is deliberately SE-free — it multiplies whatever
+single-comparison threshold a stage already uses — so #59 cannot ship its gate
+without the accounting attached, and neither stage needs a guessed standard
+error.
 
 ## Reach-predictor pivot (decided 2026-07-25) — separate PREDICTION from TRADING
 

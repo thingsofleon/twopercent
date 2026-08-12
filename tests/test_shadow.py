@@ -386,3 +386,20 @@ def test_shadow_score_step_non_gating(con, monkeypatch):
     step = report.steps[-1]
     assert step.name == "shadow" and step.status == "warn"
     assert report.status != "fail"
+
+
+def test_forward_margin_widens_for_concurrent_shadowing(con):
+    """#60: promoting the best of K shadowed challengers is a max-over-K.
+
+    The shadow stage sits AFTER the overnight sweep, so a candidate reaching it
+    has been selected on twice. Both stages must be corrected on the same rule
+    rather than by two hand-picked numbers that drift apart.
+    """
+    single = 0.05
+    assert shadow.forward_margin_band(single, 1) == single  # one challenger: no correction
+    assert shadow.forward_margin_band(single, 4) > single
+    assert shadow.forward_margin_band(single, 10) > shadow.forward_margin_band(single, 4)
+    # Defaults to the shipped concurrency cap, so a caller cannot forget K.
+    assert shadow.forward_margin_band(single) == shadow.forward_margin_band(
+        single, shadow.MAX_SHADOW
+    )

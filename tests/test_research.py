@@ -651,7 +651,12 @@ def test_within_promotion_band_files_nothing(con, tmp_path, night, bench_spy, mo
     assert not any(s.name == "issue" for s in report.steps)
     assert report.exit_code == 0
     candidate = next(s for s in report.steps if s.name == "candidate")
-    assert candidate.status == "ok" and "within the promotion band (0.27)" in candidate.detail
+    # The band is now DERIVED from the recorded family (#60), so the message
+    # carries both the threshold and the family it was scaled for — a margin
+    # quoted without its family size is unauditable.
+    assert candidate.status == "ok"
+    assert "within the promotion band (0.27" in candidate.detail
+    assert "scaled for a family of" in candidate.detail
 
 
 def test_half_window_loser_files_nothing(con, tmp_path, night, bench_spy, monkeypatch):
@@ -725,3 +730,34 @@ def test_digest_reports_night_summary(con, tmp_path, night, bench_spy):
     best = next(line for line in lines if line.strip().startswith("best:"))
     assert "xgb_gbm_v1" in best and "2.4" in best  # highest lift of the night
     assert "vs champion lift 2.35" in best
+
+
+# --- #60: the promotion band scales with the family -------------------------
+
+
+def test_promotion_band_reproduces_the_hand_calibrated_value():
+    """The formula must agree with the constant it replaces at the family it
+    was hand-picked for, or the parameterisation is merely plausible rather
+    than right. 0.27 was set by hand for an assumed ~56-config family."""
+    assert abs(research.promotion_band(56) - 0.27) < 0.01
+
+
+def test_promotion_band_grows_with_the_family_and_never_shrinks():
+    """Every config added to the queue enlarges the family and erodes the
+    family-wise guarantee — that erosion is exactly what a fixed band hid."""
+    bands = [research.promotion_band(n) for n in (1, 24, 56, 100, 200, 500, 2000)]
+    assert bands == sorted(bands)
+    # Never below the value past decisions were judged against: loosening
+    # retroactively would make an already-rejected candidate look like it had
+    # cleared the bar.
+    assert min(bands) >= research.PROMOTION_BAND_FLOOR
+    assert research.promotion_band(0) >= research.PROMOTION_BAND_FLOOR
+    assert research.promotion_band(2000) > research.promotion_band(56)
+
+
+def test_family_size_counts_the_ledger_not_the_queue(con):
+    """The queue says what was PLANNED; the ledger says what was actually
+    compared, and only the second is what the max-over-trials ran over."""
+    before = research.family_size(con)
+    _seed_champion_experiment(con)  # one recorded standard-window comparison
+    assert research.family_size(con) == before + 1

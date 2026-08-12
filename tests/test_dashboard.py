@@ -675,7 +675,7 @@ def test_explorer_state_live_short_window_disclosures():
 # --- strategy explorer (exit-rule what-if) ------------------------------------
 
 
-def test_strategy_dropdown_defaults_to_reach_and_offers_trailing(modeled, tmp_path):
+def test_strategy_dropdown_defaults_to_reach_and_withdraws_trailing(modeled, tmp_path):
     # Reach rate (prediction quality) is the DEFAULT view; the P&L card exists
     # but is hidden until an exit rule is chosen. The trailing stop is now
     # ENABLED — replayed from intraday bars, never approximated from daily ones.
@@ -685,8 +685,10 @@ def test_strategy_dropdown_defaults_to_reach_and_offers_trailing(modeled, tmp_pa
     content = out.read_text()
 
     assert '<option value="reach" selected>Reach rate (prediction quality)</option>' in content
-    assert "disabled>Trailing stop" not in content  # no longer an impossible rule
-    assert '<option value="trailing">Trailing stop (−1% from the high, intraday)' in content
+    # WITHDRAWN pending an honest price: a number wrong in a known direction is
+    # worse than one absent, so the option is greyed rather than showing a
+    # figure flattered by an unpriced intra-bar ordering.
+    assert '<option value="trailing" disabled>' in content
     assert 'id="tp-card-strat" hidden' in content  # opt-in, never the default
     assert "id='tp-card-reach'" in content  # the default card is the reach table
     # Selection caveat names strategies explicitly (browsing IS selection).

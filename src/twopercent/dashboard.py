@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import math
 from decimal import ROUND_HALF_UP, Decimal
 
@@ -19,6 +20,8 @@ import pandas as pd
 
 from twopercent import backtest, intraday, store, strategy, track
 from twopercent.predict import PredictResult, predict_for
+
+logger = logging.getLogger(__name__)
 
 _CSS = """
 <style>
@@ -854,6 +857,18 @@ def _attach_trailing(con, frame: pd.DataFrame) -> tuple[pd.DataFrame, str | None
     if pairs.empty:
         return frame, None
     trails = intraday.trailing_exits(con, pairs)
+    # Defence in depth: a duplicated (symbol, date) becomes a DUPLICATED PICK in
+    # the shared payload after the left-merge, which corrupts every view built
+    # from it — the default reach card and the three other exit rules included,
+    # all of which were correct before this table joined them.
+    n_before = len(trails)
+    trails = trails.drop_duplicates(subset=["symbol", "date"])
+    if len(trails) != n_before:
+        logger.warning(
+            "trailing exits returned %d duplicate (symbol, date) row(s) — dropped; "
+            "a duplicate corrupts every payload consumer, not just the trailing view",
+            n_before - len(trails),
+        )
     n_want = len(pairs.drop_duplicates())
     if trails.empty:
         return frame, (

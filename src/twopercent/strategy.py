@@ -51,16 +51,29 @@ SEQ_LIMIT_FIRST = 1
 SEQ_STOP_FIRST = 2
 
 # (key, dropdown label, enabled). `reach` is the DEFAULT prediction-quality
-# view (not an exit rule). The trailing stop is ENABLED as of the intraday work:
-# daily bars still cannot replay it — it is path-dependent for the whole session
-# — but intraday bars can, and it is computed from them rather than approximated.
-# A day without a gapless intraday record is EXCLUDED and counted, never guessed.
+# view (not an exit rule). The trailing stop was enabled by the intraday work
+# and is DISABLED AGAIN pending an honest price. The replay itself is real, but
+# post-merge review measured three independent biases, all flattering, on a
+# number a user might act on:
+#   1. Within a bar we do not know whether the high or the low came first, and
+#      the replay assumed the high did, calling that conservative. Measured on
+#      448 real sessions it is worth +0.62pp PER SESSION versus the low-first
+#      ordering (better on 195 sessions, worse on 62) — the assumption flatters,
+#      it does not understate, and it accounts for most of the displayed gain.
+#   2. Intraday history reaches ~60 calendar days, so the number compounds ~16
+#      days while the card's Days column shows the selected window (126, 252).
+#   3. A truncated capture (2026-08-10 ends 15:05) is replayed as though its
+#      last print were the close, which on the affected picks was flattering.
+# The honest presentation is a BAND from the low-first to the high-first
+# ordering, exactly as limit_stop bands an unresolvable ordering rather than
+# picking the favourable end. Until that exists the option stays greyed out
+# (#105) — a number wrong in a known direction is worse than one absent.
 STRATEGY_CHOICES = [
     ("reach", "Reach rate (prediction quality)", True),
     ("hold_close", "Buy open → sell close", True),
     ("limit_2pct", "Buy open → +2% limit, else close", True),
     ("limit_stop", "+2% limit + −1% stop (best/worst case)", True),
-    ("trailing", "Trailing stop (−1% from the high, intraday)", True),
+    ("trailing", "Trailing stop (intraday replay — withdrawn, see notes)", False),
 ]
 PNL_STRATEGIES = ("hold_close", "limit_2pct", "limit_stop", "trailing")
 

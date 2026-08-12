@@ -452,7 +452,28 @@ def save_predictions(
     Delete-then-insert, not upsert: a re-run that scores FEWER symbols (e.g.
     the liquidity floor now excludes one) must not leave the missing symbols
     behind as phantom ranks from an earlier save.
+
+    The ORIGINAL created_ts survives that delete. It is not metadata — it is the
+    evidence that a prediction was made BEFORE its target day opened, which is
+    the whole basis of the live/late split and therefore of the live track
+    record. Stamping now() on a re-run silently converted a genuine live day
+    (2026-08-07, 18/20, lift 2.34) into a `late` one and dropped it from the
+    record, because re-running `twopercent dashboard` in the evening re-predicts
+    (#101). A later re-run may legitimately change the PICKS; it cannot change
+    when the day was first forecast.
     """
+    prior_created = con.execute(
+        "SELECT min(created_ts) FROM predictions WHERE strategy = ? AND signal_date = ?",
+        [strategy, signal_date],
+    ).fetchone()[0]
+    if prior_created is not None:
+        logger.warning(
+            "predictions for %s %s already existed — replacing the picks but KEEPING "
+            "the original created_ts %s, so a re-run cannot turn a live day late",
+            strategy,
+            signal_date,
+            prior_created,
+        )
     con.execute(
         "DELETE FROM predictions WHERE strategy = ? AND signal_date = ?",
         [strategy, signal_date],
@@ -470,9 +491,10 @@ def save_predictions(
     con.execute(
         """
         INSERT INTO predictions
-        SELECT strategy, signal_date, symbol, prob, rank, now(), ?, ? FROM predictions_in
+        SELECT strategy, signal_date, symbol, prob, rank,
+               coalesce(?, now()), ?, ? FROM predictions_in
         """,
-        [as_of, event],
+        [prior_created, as_of, event],
     )
     con.unregister("predictions_in")
     return len(rows)

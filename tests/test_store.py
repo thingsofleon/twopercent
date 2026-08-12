@@ -423,3 +423,33 @@ def test_a_materially_shorter_run_still_cannot_displace_the_reference(con):
 
     meta, _ = store.latest_experiment_daily(con, "s")
     assert meta["seq"] == reference
+
+
+def test_resaving_predictions_keeps_the_original_created_ts(con):
+    """#101: created_ts is evidence, not metadata.
+
+    It is what proves a prediction was made BEFORE its target day opened, which
+    is the entire basis of the live/late split and therefore of the live track
+    record. A re-run may legitimately change the PICKS; it cannot change when
+    the day was first forecast. Stamping now() on re-save turned a genuine live
+    day into a `late` one and dropped it from the record.
+    """
+    import datetime as dt
+
+    day = dt.date(2026, 2, 2)
+    first = pd.DataFrame({"symbol": ["AAA", "BBB"], "prob": [0.9, 0.8], "rank": [1, 2]})
+    store.save_predictions(con, "s", day, first)
+    original = con.execute(
+        "SELECT min(created_ts) FROM predictions WHERE signal_date = ?", [day]
+    ).fetchone()[0]
+
+    # A later re-run with DIFFERENT, FEWER picks.
+    store.save_predictions(
+        con, "s", day, pd.DataFrame({"symbol": ["CCC"], "prob": [0.7], "rank": [1]})
+    )
+
+    rows = con.execute(
+        "SELECT symbol, created_ts FROM predictions WHERE signal_date = ?", [day]
+    ).fetchall()
+    assert [r[0] for r in rows] == ["CCC"]  # picks replaced, no phantom ranks
+    assert rows[0][1] == original  # ...but the forecast time is preserved

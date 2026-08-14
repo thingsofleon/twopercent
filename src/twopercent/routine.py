@@ -52,6 +52,7 @@ from twopercent import (
     intraday,
     issues,
     notify,
+    paper,
     scan,
     shadow,
     store,
@@ -448,6 +449,50 @@ def _shadow_run_step(report: RoutineReport, con, signal_date: dt.date) -> None:
     report.add("shadow", WARN if result.had_trouble else OK, result.summary())
 
 
+def _paper_step(
+    report: RoutineReport, con, strategy: str, post_days, prior_days, today: dt.date
+) -> None:
+    """Record newly-scored days into the FORWARD-ONLY paper ledger.
+
+    Only days scored for the first time by THIS run are recorded, so the ledger
+    can never accumulate history retroactively — that is the whole basis of it
+    being untainted evidence rather than another backtest.
+
+    Non-gating: WARN at worst. The scoring, the track record and the email are
+    already complete; a paper-ledger failure must not fail a run whose real work
+    is done.
+    """
+    if prior_days is None:
+        report.add("paper", WARN, "cannot tell which days are new (pre-ingest scoring failed)")
+        return
+    new_days = sorted(post_days - prior_days)
+    if not new_days:
+        report.add("paper", OK, "no newly scored day to record")
+        return
+    written, refused, crashed = 0, [], []
+    for day in new_days:
+        try:
+            # today from the routine's ONE clock (ET), not the host's: a UTC
+            # host is already "tomorrow" after 20:00 ET, which would move the
+            # guard boundary.
+            written += paper.record_day(con, strategy, day, today=today)
+        except ValueError as exc:  # forward-only guard: too old, or late
+            refused.append(f"{day}: {exc}")
+        except Exception as exc:
+            # CONTINUE, never return: abandoning the remaining days would drop
+            # them from a ledger whose gaps cannot be filled later, on the
+            # strength of one degenerate day.
+            crashed.append(f"{day}: {exc}")
+    detail = f"{written} trade(s) recorded over {len(new_days)} new day(s)"
+    if crashed:
+        report.add("paper", WARN, f"{detail}; {len(crashed)} CRASHED — {crashed[0]}")
+        return
+    if refused:
+        report.add("paper", WARN, f"{detail}; REFUSED {len(refused)} — {refused[0]}")
+        return
+    report.add("paper", OK, detail)
+
+
 def _intraday_step(report: RoutineReport, con, top_n: int = 20) -> None:
     """Capture intraday bars for the symbols this model picked. TIME-CRITICAL.
 
@@ -713,6 +758,7 @@ def _run_score(
         report.add("dashboard", OK, f"refreshed {out_path} (predictions log untouched)")
     except Exception as exc:
         report.add("dashboard", WARN, f"render failed (scoring is complete): {exc}")
+    _paper_step(report, con, name, post_days, prior_days, today)
     _shadow_score_step(report, con)
     # LAST: the target day's bars are final by now, and this is the only step
     # whose data cannot be recovered by re-running later.

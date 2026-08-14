@@ -21,7 +21,15 @@ def _db(con) -> str:
 
 @pytest.fixture
 def ready(con, monkeypatch):
-    """Healthy seeded store, post-close clock, network steps stubbed out."""
+    """Healthy seeded store, post-close clock, network steps stubbed out.
+
+    That includes the intraday capture: these tests exercise the daily CYCLE,
+    not the provider. Without the stub the suite issued live yfinance downloads
+    on every run — see conftest.no_real_yfinance.
+    """
+    monkeypatch.setattr(
+        routine.intraday, "ingest", lambda *a, **kw: routine.intraday.IntradayResult()
+    )
     seed_planted(con, n_each=10)
     con.execute("UPDATE universe SET as_of = ?", [POST_CLOSE.date()])
     # Newest bar lands 3 days before the pinned clock — deterministic forever.
@@ -115,6 +123,7 @@ def test_score_mode_happy_path_no_predict_no_universe_refresh(ready, monkeypatch
         "score",
         "detector",
         "dashboard",
+        "paper",
         "shadow",
         "intraday",
     ]

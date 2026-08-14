@@ -435,3 +435,38 @@ def intraday_validate_cmd(
     result = intraday_mod.validate_against_1m(con, pairs)
     typer.echo(result.summary())
     raise typer.Exit(1 if result.disagreed else 0)
+
+
+@app.command("paper")
+def paper_cmd(
+    basket: int = typer.Option(5, "--basket", help="Equal-weight names per day."),
+    db: Path = DbOption,
+) -> None:
+    """Net P&L of the FORWARD-ONLY paper record, at several cost levels.
+
+    Shows a sensitivity grid rather than one net number: the cost model is an
+    estimate, and a single figure invites trusting it. The breakeven line is the
+    useful one — it turns "is the edge real?" into "is the edge bigger than the
+    spread?", which is a question about the market, not the model.
+    """
+    from twopercent import paper as paper_mod
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    con = store.connect(db)
+    from twopercent import champion
+
+    name = champion.get_champion()
+    table = paper_mod.report(con, name, basket=basket)
+    if table.empty:
+        typer.echo(
+            "No paper trades recorded yet. The ledger is forward-only: it fills in "
+            "as the score run completes each day."
+        )
+        raise typer.Exit(0)
+    typer.echo(f"Paper record — {paper_mod.RULE}, top-{basket}, {name}")
+    typer.echo(table.to_string(index=False))
+    be = paper_mod.breakeven_bps(con, name, basket=basket)
+    typer.echo(
+        f"\nBreakeven round-trip cost: {be} bps"
+        + ("  (gross edge is negative — no cost makes this profitable)" if be == 0 else "")
+    )

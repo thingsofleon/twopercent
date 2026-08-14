@@ -54,6 +54,29 @@ def no_real_gh(monkeypatch):
     monkeypatch.setattr(issues.subprocess, "run", guard)
 
 
+@pytest.fixture(autouse=True)
+def no_real_yfinance(monkeypatch):
+    """No test may reach the real market-data provider. Applies suite-wide.
+
+    Same shape as no_real_gh, and added for the same reason: the routine's
+    score mode gained an intraday capture step, no routine test stubbed it, and
+    the suite quietly began issuing live yfinance downloads on every run —
+    slow, flaky, dependent on the network, and hammering a provider this
+    project already has rate-limit issues with. Offline unit tests against
+    canned payloads plus `@pytest.mark.live` smoke tests is the documented
+    pattern (CLAUDE.md); this makes departing from it fail loudly.
+    """
+    import yfinance
+
+    def forbidden(*a, **kw):
+        raise AssertionError(
+            "test reached the real yfinance API — inject a downloader or stub "
+            "the ingest step; live calls belong in @pytest.mark.live smoke tests"
+        )
+
+    monkeypatch.setattr(yfinance, "download", forbidden)
+
+
 @pytest.fixture
 def con(tmp_path):
     return store.connect(tmp_path / "test.duckdb")

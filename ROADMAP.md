@@ -282,6 +282,36 @@ single-comparison threshold a stage already uses — so #59 cannot ship its gate
 without the accounting attached, and neither stage needs a guessed standard
 error.
 
+## Paper trading — is the prediction TRADEABLE? (decided 2026-08-13)
+
+The dashboard measures PREDICTION. This measures whether the prediction survives
+contact with costs, which is a different question and the one that decides
+whether any of this makes money. Locked in with #106:
+
+| Decision | Choice | Notes |
+|---|---|---|
+| Exit rule | **`limit_2pct`** — buy the open, sell +2% if touched, else sell the close | The rule the TARGET was designed around ("a pre-placed +2% limit would have filled"), so its fill assumption is one already committed to. `limit_stop` needs an ordering unresolvable ~30% of the time plus a stop fill measurement showed is not the trigger; `trailing` needs a full intraday path and is withdrawn; `hold_close` adds no assumptions but does not match a TOUCH signal. |
+| Basket | **top-20**, matching what the detector, dashboard and live record all report | Defaulted to 5 in the first draft — the smallest, highest-variance, lowest-capacity basket, and the only one whose edge survives realistic costs. `basket` is tuned over the same days being reported, so `paper.basket_sweep` prints the whole curve rather than one cell. |
+| Costs | **Applied at REPORT time, never stored**; sensitivity grid 0/10/25/50/100 bps round trip | The ledger keeps observed gross returns, so a corrected cost model never rewrites history. Charged round trip on full notional EVERY day — the rule closes daily, so there is no holding period to amortise them over. |
+| Forward-only | **`late` days refused**, plus a 5-day age cap | `late` is the project's definition of forward (created before the target day's open). The first draft checked calendar age only, which would have recorded 2026-08-10 — picks re-saved at 20:01 that evening — as forward. |
+
+**First measurement (13 live days, top-20, 2026-08-13).** Breakeven round-trip
+cost **20 bps**; growth 1.027 gross, 0.994 at 25bps, 0.962 at 50bps; gross
+t-stat **0.70** — indistinguishable from zero. Picks are median $12.79 with a
+bottom quartile near $2M/day, where one tick round trip is ~8bps median and
+~36bps at p90. **On the evidence so far the edge does not clearly survive
+costs.** Breakeven by basket: 1 → 200bps, 5 → 72, 10 → 25, 20 → 20.
+
+That is the first honest read on tradeability and it points somewhere specific:
+the edge must get bigger, or the names more liquid. A higher liquidity floor
+would cut costs AND cut the universe the model picks from — that tradeoff is
+the next thing worth testing, not another exit rule.
+
+Open follow-up: costs are a flat bps on notional, which understates the cheap
+tail structurally (the same flat charge on a $206 name and a $1.44 one). A
+per-name tick/price floor is computable from data already in the store and would
+put basket-20 breakeven nearer 4bps.
+
 ## Reach-predictor pivot (decided 2026-07-25) — separate PREDICTION from TRADING
 
 Locked-in reframing (supersedes the original open-to-close target and the

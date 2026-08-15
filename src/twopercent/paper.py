@@ -61,6 +61,12 @@ MAX_BACKFILL_DAYS = 5
 # grid deliberately spans "free" to "expensive" and the reader picks.
 COST_GRID_BPS = (0, 10, 25, 50, 100)
 
+# Days of forward record below which growth and breakeven are NOT a result.
+# One trading month. A single day with a 100% win rate produces "growth 1.02,
+# breakeven 200bps", which reads as a finding and is noise — and this ledger is
+# deliberately slow to fill, so the misleading window is weeks long, not hours.
+MIN_REPORT_DAYS = 20
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS paper_trades (
     strategy TEXT NOT NULL,

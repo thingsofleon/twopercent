@@ -228,3 +228,45 @@ def test_empty_ledger_reports_nothing_rather_than_zero(con):
     """An empty forward record must not render as a result."""
     assert paper.report(con, "baseline_gbm_v1").empty
     assert paper.breakeven_bps(con, "baseline_gbm_v1") is None
+
+
+def test_growth_and_breakeven_are_withheld_below_the_day_floor(traded):
+    """A single day with a 100% win rate produces "growth 1.02, breakeven
+    200bps", which reads as a finding and is noise.
+
+    The ledger is forward-only and fills one trading day per day, so the
+    misleading window is weeks long — long enough for someone to act on it.
+    """
+    from typer.testing import CliRunner
+
+    from twopercent.cli import app
+
+    con, target = traded
+    paper.record_day(con, "baseline_gbm_v1", target, today=target)
+    db = con.execute("PRAGMA database_list").fetchone()[2]
+    con.close()
+
+    out = CliRunner().invoke(app, ["paper", "--db", db]).output
+
+    assert "below the 20-day floor" in out
+    assert "Breakeven round-trip cost" not in out
+    # The record itself is still shown — withholding the interpretation is not
+    # the same as hiding the data.
+    assert "cost_bps" in out
+
+
+def test_cli_reports_the_recorded_basket_by_default(traded):
+    """The library default was fixed to top-20 and this surface kept 5 — the
+    one the user actually reads, and the corner where the same record shows a
+    72bps breakeven against 20bps at the basket the detector reports."""
+    from typer.testing import CliRunner
+
+    from twopercent.cli import app
+
+    con, target = traded
+    paper.record_day(con, "baseline_gbm_v1", target, today=target)
+    db = con.execute("PRAGMA database_list").fetchone()[2]
+    con.close()
+
+    out = CliRunner().invoke(app, ["paper", "--db", db]).output
+    assert f"top-{paper.PAPER_TOP_N}" in out

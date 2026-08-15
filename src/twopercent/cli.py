@@ -439,7 +439,9 @@ def intraday_validate_cmd(
 
 @app.command("paper")
 def paper_cmd(
-    basket: int = typer.Option(5, "--basket", help="Equal-weight names per day."),
+    basket: int = typer.Option(
+        0, "--basket", help="Equal-weight names per day (default: the recorded top-20)."
+    ),
     db: Path = DbOption,
 ) -> None:
     """Net P&L of the FORWARD-ONLY paper record, at several cost levels.
@@ -456,6 +458,11 @@ def paper_cmd(
     from twopercent import champion
 
     name = champion.get_champion()
+    # Default to what is RECORDED, not to the flattering corner. The library
+    # default was fixed to PAPER_TOP_N; this surface kept 5, which is the one
+    # the user actually reads — and at basket 5 the same record shows a
+    # breakeven of 72bps against 20bps at the basket the detector reports.
+    basket = basket or paper_mod.PAPER_TOP_N
     table = paper_mod.report(con, name, basket=basket)
     if table.empty:
         typer.echo(
@@ -465,8 +472,19 @@ def paper_cmd(
         raise typer.Exit(0)
     typer.echo(f"Paper record — {paper_mod.RULE}, top-{basket}, {name}")
     typer.echo(table.to_string(index=False))
+    days = int(table["days"].iloc[0])
+    if days < paper_mod.MIN_REPORT_DAYS:
+        typer.echo(
+            f"\n{days} day(s) recorded — below the {paper_mod.MIN_REPORT_DAYS}-day floor. "
+            "Growth and breakeven are NOT reported yet: on a handful of days they read "
+            "as a finding and are noise. The ledger is forward-only, so this fills at "
+            "one trading day per day."
+        )
+        raise typer.Exit(0)
     be = paper_mod.breakeven_bps(con, name, basket=basket)
     typer.echo(
         f"\nBreakeven round-trip cost: {be} bps"
         + ("  (gross edge is negative — no cost makes this profitable)" if be == 0 else "")
     )
+    typer.echo("\nBreakeven by basket (the basket is a free parameter — see the whole curve):")
+    typer.echo(paper_mod.basket_sweep(con, name).to_string(index=False))

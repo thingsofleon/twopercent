@@ -75,11 +75,19 @@ INTERVAL = "5m"  # the working resolution; 1m exists for validation and ground t
 #   minutes    the bar width, which the contiguity gates count slots in
 _SPECS = {
     "5m": {"lookback": 60, "span": 55, "minutes": 5},
-    # 1m is the finest Yahoo serves and the fastest to expire: ~30 calendar days
-    # of history, 8 days per request. It is the only ground truth available for
-    # checking 5m verdicts, and it rolls off permanently -- a day not captured
-    # within a month can never be captured.
-    "1m": {"lookback": 30, "span": 7, "minutes": 1},
+    # 1m is the finest Yahoo serves and the fastest to expire. Its documented
+    # limit is "within the last 30 days" and that bound is EXCLUSIVE and
+    # measured at request time: probing 2026-08-18, start=-30d returns EMPTY
+    # with that exact error while -25d returns bars. A lookback of 30 therefore
+    # aimed the first chunk AT the boundary, which failed on every single run --
+    # 7 failed batches a night, 3 retries with backoff each, reported as ERROR
+    # on a completely healthy system. That is the alarm-fatigue trap #87 fixed
+    # for 5m and this reintroduced for 1m.
+    #
+    # 25 keeps a 5-day margin so the oldest chunk stays comfortably inside the
+    # window even as it slides during a run. The cost is nil: the daily capture
+    # means nothing older than a few days is ever missing anyway.
+    "1m": {"lookback": 25, "span": 7, "minutes": 1},
 }
 INTERVALS = tuple(_SPECS)
 
@@ -1135,7 +1143,20 @@ TRUNCATION_SLACK_MINUTES = 5
 # Coverage floor against the trailing median, mirroring the daily path's
 # completeness gate (store.complete_trading_days uses 0.9 over 20 dates).
 COVERAGE_MIN_FRACTION = 0.9
-COVERAGE_MEDIAN_WINDOW = 20
+# SHORT window, deliberately. The check exists to catch a session that silently
+# lost symbols — a failed batch, a rate limit. It is not meant to flag a
+# sustained, intentional change in how many symbols we capture.
+#
+# It did exactly that: #94 bounded picked_symbols to the retention window, the
+# nightly count dropped ~522 -> ~215 on 2026-08-11, and against a 20-session
+# median every subsequent session read THIN for eleven sessions running. A check
+# that cries wolf for a fortnight teaches the operator to ignore it, which is
+# the same alarm-fatigue trap as the 1m boundary above.
+#
+# Five sessions absorbs a level shift within a week while leaving a one-day
+# dropout just as loud: a session at 25% of its neighbours still fires
+# immediately, because its neighbours are the comparison.
+COVERAGE_MEDIAN_WINDOW = 5
 
 
 def session_coverage(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:

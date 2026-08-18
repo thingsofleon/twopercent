@@ -597,3 +597,68 @@ def test_doctor_reports_a_thin_intraday_session(con):
     thin = problems[problems["thin"]]
     assert len(thin) == 1
     assert "THIN" in "\n".join(doctor.format_report(doctor.run(con)))
+
+
+def test_a_sustained_level_shift_stops_firing_but_a_dropout_does_not(con):
+    """A deliberate change in how many symbols we capture is not a fault.
+
+    #94 bounded the captured symbol set to the retention window, the nightly
+    count dropped ~522 to ~215, and against a 20-session median every session
+    afterwards read THIN for eleven sessions running. A check that cries wolf
+    for a fortnight teaches the operator to ignore it — the same alarm-fatigue
+    trap as a lookback aimed at a provider boundary.
+    """
+    import datetime as dt
+
+    seed_history(con, {"AAA": [0.01] * 10}, start="2026-01-05")
+    rows = []
+    # Five sessions at the OLD level, then five at a sustained NEW level.
+    for d in range(10):
+        day = dt.date(2026, 1, 5) + dt.timedelta(days=d)
+        for k in range(50 if d < 5 else 20):
+            rows.append(
+                {
+                    "symbol": f"S{k}",
+                    "ts": dt.datetime.combine(day, dt.time(15, 55)),
+                    "date": day,
+                    "interval": "5m",
+                    "open": 100.0,
+                    "high": 100.5,
+                    "low": 99.5,
+                    "close": 100.0,
+                    "volume": 1000,
+                }
+            )
+    con.register("_shift", pd.DataFrame(rows))
+    con.execute("INSERT INTO intraday_prices SELECT * FROM _shift")
+
+    thin_dates = set(intraday.coverage_problems(con).query("thin")["date"])
+    # Flagged once AT the shift, then quiet — the new level becomes the norm.
+    assert dt.date(2026, 1, 10) in {pd.Timestamp(d).date() for d in thin_dates}
+    assert dt.date(2026, 1, 14) not in {pd.Timestamp(d).date() for d in thin_dates}
+
+    # A genuine one-day dropout against the SETTLED level still fires loudly.
+    drop_day = dt.date(2026, 1, 15)
+    con.register(
+        "_drop",
+        pd.DataFrame(
+            [
+                {
+                    "symbol": f"S{k}",
+                    "ts": dt.datetime.combine(drop_day, dt.time(15, 55)),
+                    "date": drop_day,
+                    "interval": "5m",
+                    "open": 100.0,
+                    "high": 100.5,
+                    "low": 99.5,
+                    "close": 100.0,
+                    "volume": 1000,
+                }
+                for k in range(4)  # 4 of ~20 = a real collapse
+            ]
+        ),
+    )
+    con.execute("INSERT INTO intraday_prices SELECT * FROM _drop")
+
+    after = {pd.Timestamp(d).date() for d in intraday.coverage_problems(con).query("thin")["date"]}
+    assert drop_day in after

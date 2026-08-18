@@ -766,3 +766,35 @@ def test_trailing_exits_requires_a_gapless_session(con):
     )
 
     assert intraday.trailing_exits(con, _pairs_one()).empty
+
+
+def test_every_lookback_keeps_a_margin_inside_the_provider_limit():
+    """A lookback aimed AT the provider's boundary fails on every single run.
+
+    Yahoo's 1m bound is "within the last 30 days", EXCLUSIVE and measured at
+    request time: probing 2026-08-18, start=-30d returned EMPTY with that exact
+    error while -25d returned bars. A lookback of 30 therefore made the oldest
+    chunk fail nightly — 7 failed batches, 3 retries with backoff each, reported
+    as ERROR on a healthy system. That is the alarm-fatigue trap #87 fixed for
+    5m and which was reintroduced for 1m.
+
+    Documented provider limits, so the margin is asserted rather than trusted.
+    """
+    documented = {"5m": 60, "1m": 30}
+    for interval, limit in documented.items():
+        lookback = intraday.spec(interval)["lookback"]
+        assert lookback <= limit, f"{interval} lookback {lookback} exceeds the {limit}d limit"
+        if interval == "1m":
+            # The 1m window slides fastest and is the one that bit; require real
+            # daylight, not merely "not over".
+            assert lookback <= limit - 5, (
+                f"1m lookback {lookback} sits within 5 days of the {limit}d boundary"
+            )
+
+
+def test_a_span_never_exceeds_its_interval_request_cap():
+    """Chunking must respect the per-interval request cap, not the 5m alias."""
+    for interval in intraday.INTERVALS:
+        limits = intraday.spec(interval)
+        assert limits["span"] <= limits["lookback"]
+        assert limits["span"] > 0 and limits["minutes"] > 0

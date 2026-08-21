@@ -20,6 +20,7 @@ refreshes — reproduce a logged experiment only against the same snapshot.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import logging
 
 import duckdb
@@ -43,6 +44,14 @@ FEATURE_COLUMNS = [
     "log_mcap",
     "sector_breadth",
     "sector_excess",
+    # #110: six price-derived additions. The first two close the range gap --
+    # the label is a range event and nothing measured range.
+    "range_20d",
+    "high_return_mean_20d",
+    "gap_prior",
+    "days_since_2pct",
+    "volume_accel",
+    "dist_52w_high",
 ]
 
 # Metadata, NOT a feature: trailing median volume over the last 20 bars
@@ -60,10 +69,23 @@ METADATA_COLUMNS = ["median_vol_20"]
 # test_features.py pins their absence.
 
 _SQL = f"""
-WITH per_symbol AS (
+WITH marked AS (
+    -- Bar index and touch-flagged index, computed BEFORE per_symbol so
+    -- days_since_2pct can take max() over them: DuckDB forbids nesting a
+    -- window call inside another (row_number inside max would be nested).
+    SELECT *,
+           row_number() OVER (PARTITION BY symbol ORDER BY date) AS rn
+    FROM daily_returns
+),
+touched AS (
+    SELECT *,
+           CASE WHEN {touch_event_predicate()} THEN rn END AS touch_rn
+    FROM marked
+),
+per_symbol AS (
     SELECT
         symbol, date, oc_return, volume,
-        row_number() OVER w AS history_days,
+        rn AS history_days,
         close / nullif(LAG(close, 5) OVER w, 0) - 1 AS ret_5d,
         stddev_samp(oc_return) OVER w20 AS vol_20d,
         volume / nullif(avg(volume) OVER w20, 0) AS volume_ratio,
@@ -78,11 +100,37 @@ WITH per_symbol AS (
         LEAD(high_return) OVER w AS next_high_return,
         LEAD(high_glitch_suspect) OVER w AS next_high_glitch_suspect,
         -- LEAD of the open-to-low move: outcome-side stop-rule input, label-only.
-        LEAD(low_return) OVER w AS next_low_return
-    FROM daily_returns
+        LEAD(low_return) OVER w AS next_low_return,
+        -- #110. The label is an intraday RANGE event -- did the high reach +2%
+        -- above the open -- and nothing measured range. vol_20d is close-to-close
+        -- dispersion, a different quantity: a name can have quiet closes and wide
+        -- days. Every window below ends at the CURRENT bar inclusive, so all of
+        -- these are known at signal_date's close; none reads the target day.
+        avg((high - low) / nullif(open, 0)) OVER w20 AS range_20d,
+        -- The label's own quantity, lagged. cnt_2pct_20d counts crossings and
+        -- discards magnitude, so a name averaging 1.9% open-to-high and one
+        -- averaging 0.3% look identical when neither crossed.
+        avg(high_return) OVER w20 AS high_return_mean_20d,
+        -- The SIGNAL day's gap. Deliberately open-vs-PRIOR-close: the target
+        -- day's open is unknown at the pre-open prediction moment and is the
+        -- classic lookahead trap here.
+        (open - LAG(close) OVER w) / nullif(LAG(close) OVER w, 0) AS gap_prior,
+        -- Recency, which a 20-day count cannot express: five touches last week
+        -- and five touches three weeks ago score the same today.
+        rn - max(touch_rn) OVER w_all AS days_since_2pct,
+        -- Building interest vs a one-day spike, which volume_ratio conflates.
+        avg(volume) OVER w5 / nullif(avg(volume) OVER w20, 0) AS volume_accel,
+        -- Position in the annual range: the standard breakout/momentum axis,
+        -- entirely absent until now.
+        close / nullif(max(close) OVER w252, 0) AS dist_52w_high
+    FROM touched
     WINDOW
         w AS (PARTITION BY symbol ORDER BY date),
-        w20 AS (PARTITION BY symbol ORDER BY date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)
+        w20 AS (PARTITION BY symbol ORDER BY date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW),
+        w5 AS (PARTITION BY symbol ORDER BY date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW),
+        w252 AS (PARTITION BY symbol ORDER BY date ROWS BETWEEN 251 PRECEDING AND CURRENT ROW),
+        w_all AS (PARTITION BY symbol ORDER BY date
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
 ),
 market AS (
     SELECT
@@ -132,6 +180,12 @@ SELECT
     ln(u.market_cap) AS log_mcap,
     sd.sector_breadth,
     s.oc_return - sd.sector_mean_oc AS sector_excess,
+    s.range_20d,
+    s.high_return_mean_20d,
+    s.gap_prior,
+    s.days_since_2pct,
+    s.volume_accel,
+    s.dist_52w_high,
     s.median_vol_20,
     s.history_days
 FROM per_symbol s
@@ -141,6 +195,25 @@ LEFT JOIN sector_day sd ON sd.date = s.date AND sd.sector = u.sector
 WHERE s.date >= ? AND s.date <= ?
 ORDER BY s.date, s.symbol
 """
+
+
+def feature_set_version() -> str:
+    """Short fingerprint of the active feature set, for experiment identity.
+
+    A recorded benchmark is only comparable to another run over the SAME
+    features. The research loop's done-ledger keyed on (strategy, params) alone,
+    so adding features left every past config still counted "done" and the
+    overnight loop kept no-op'ing on results that no longer described the model
+    (#78/#110). The event filter in research.recorded_configs already does this
+    for a LABEL change; this is the same idea for a FEATURE change.
+
+    LIMIT, stated because it is not obvious: this hashes NAMES, not semantics.
+    Redefining what an existing column MEANS without renaming it will not
+    invalidate the ledger. Rename the column, or purge the affected rows by hand.
+    Sorted, so reordering the list alone does not trigger a pointless re-sweep.
+    """
+    joined = ",".join(sorted(FEATURE_COLUMNS))
+    return hashlib.sha256(joined.encode()).hexdigest()[:12]
 
 
 def feature_frame(
@@ -154,7 +227,9 @@ def feature_frame(
     rolling features are unstable and would teach the model IPO artifacts.
     """
     threshold = DEFAULT_THRESHOLD - _THRESHOLD_EPSILON
-    df = con.execute(_SQL, [threshold, threshold, threshold, start, end]).df()
+    # Four epsilon-guarded thresholds, in SQL order: cnt_2pct_20d,
+    # days_since_2pct (#110), market_heat, and the label predicate.
+    df = con.execute(_SQL, [threshold, threshold, threshold, threshold, start, end]).df()
     thin = df["history_days"] < MIN_HISTORY_DAYS
     if thin.any():
         logger.warning(

@@ -16,7 +16,7 @@ import duckdb
 import pandas as pd
 from sklearn.metrics import brier_score_loss, roc_auc_score
 
-from twopercent import calibration, scan, store, strategies
+from twopercent import calibration, features, scan, store, strategies
 from twopercent.features import feature_frame
 from twopercent.predict import LIQUIDITY_MIN_MEDIAN_VOLUME
 
@@ -255,6 +255,12 @@ def run_benchmark(
             "selection": "liquidity_floor_100k",
             "dropped_columns": dropped_columns,
             "strategy_params": strategy_params or {},
+            # A recorded benchmark is only comparable to another over the SAME
+            # features, so the feature set is part of the run's identity (#110).
+            # Without it the research done-ledger counted every past config
+            # "done" after a feature change and the loop no-op'd on results that
+            # no longer described the model (#78).
+            "feature_set": features.feature_set_version(),
         }
         # Which device actually trained (strategies expose resolved_device
         # when it matters, e.g. xgb's CUDA probe). A sibling of

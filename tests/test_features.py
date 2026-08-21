@@ -47,8 +47,21 @@ def test_lookahead_canary(con):
     # cnt_2pct_20d are TOUCH events (open-to-high): a refactor that dropped `high`
     # from this UPDATE would stop exercising the touch path and the canary would
     # pass blind. Keep `high` here, and assert the touch feature is future-invariant.
+    # `open` and `low` are mutated too as of #110: range_20d reads low, and
+    # gap_prior reads open. Without them a leak through EITHER column would pass
+    # this canary VACUOUSLY -- the check would run, go green, and prove nothing
+    # about the two newest features. Any future feature reading a column absent
+    # from this UPDATE must add it here in the same change.
+    # DISTINCT multipliers, deliberately. Scaling open and high by the SAME
+    # factor leaves (high - open) / open unchanged, so the touch event -- and
+    # therefore the label -- would be invariant and the "label must change"
+    # assertion below would fail; scaling them differently perturbs every ratio
+    # these features read. The factors keep OHLC ordering valid (2*open <= 3*high
+    # and 1.5*low <= 2*open for any valid bar), so daily_returns does not filter
+    # the mutated rows out and leave the canary comparing nothing.
     con.execute(
-        "UPDATE prices SET close = close * 3, high = high * 3, volume = volume * 7 WHERE date > ?",
+        "UPDATE prices SET open = open * 2, high = high * 3, low = low * 1.5, "
+        "close = close * 3, volume = volume * 7 WHERE date > ?",
         [cutoff],
     )
     after = feature_frame(con)
@@ -58,6 +71,10 @@ def test_lookahead_canary(con):
     # Explicit: the touch-count feature at the cutoff row uses only bars through
     # the cutoff, so tripling every future high must not move it (no lookahead).
     assert vec_before["cnt_2pct_20d"].equals(vec_after["cnt_2pct_20d"])
+    # Explicit for the columns this UPDATE newly covers: tripling every future
+    # open and low must not move the features that read them (#110).
+    for col in ("range_20d", "gap_prior", "high_return_mean_20d", "days_since_2pct"):
+        assert vec_before[col].equals(vec_after[col]), col
     # ...while the label DID change (it is the future, explicitly):
     lbl_b = before[before["signal_date"] == cutoff].set_index("symbol")["did_2pct_next"]
     lbl_a = after[after["signal_date"] == cutoff].set_index("symbol")["did_2pct_next"]
@@ -199,3 +216,49 @@ def test_thin_history_dropped_loudly(con, caplog):
     frame = feature_frame(con)
     assert frame.empty
     assert "dropped" in caplog.text
+
+
+def test_new_features_are_trailing_only_at_an_adversarial_boundary(con):
+    """#110. gap_prior is the lookahead trap in this batch.
+
+    It must read the SIGNAL day's open against the PRIOR close — never the
+    TARGET day's open, which is unknown at the pre-open prediction moment and
+    is precisely what a careless "gap" feature reaches for.
+    """
+    seed_history(con, {"AAA": _varied(40, 1), "BBB": _varied(40, 2)})
+    _seed_universe(con, {"AAA": "Technology", "BBB": "Technology"})
+    frame = feature_frame(con)
+    mine = frame[frame["symbol"] == "AAA"].reset_index(drop=True)
+    row = mine.iloc[len(mine) // 2]  # middle row: a next bar is guaranteed
+    day = row["signal_date"]
+
+    bars = con.execute("SELECT date, open, close FROM prices WHERE symbol='AAA' ORDER BY date").df()
+    bars["date"] = pd.to_datetime(bars["date"])
+    i = int(bars.index[bars["date"] == pd.Timestamp(day)][0])
+    assert 0 < i < len(bars) - 1
+    expected = (bars.loc[i, "open"] - bars.loc[i - 1, "close"]) / bars.loc[i - 1, "close"]
+
+    assert abs(row["gap_prior"] - expected) < 1e-12
+    # The target day's open would give a DIFFERENT number — proving the test
+    # discriminates rather than passing on a coincidence.
+    wrong = (bars.loc[i + 1, "open"] - bars.loc[i, "close"]) / bars.loc[i, "close"]
+    assert abs(expected - wrong) > 1e-9
+
+
+def test_feature_set_version_changes_with_the_columns():
+    """A recorded benchmark is only comparable to another over the SAME
+    features; the research done-ledger keys on this (#78)."""
+    import twopercent.features as F
+
+    base = F.feature_set_version()
+    assert base == F.feature_set_version()  # stable
+
+    original = F.FEATURE_COLUMNS
+    try:
+        F.FEATURE_COLUMNS = [*original, "a_new_feature"]
+        assert F.feature_set_version() != base
+        # Reordering alone must NOT trigger a pointless full re-sweep.
+        F.FEATURE_COLUMNS = list(reversed(original))
+        assert F.feature_set_version() == base
+    finally:
+        F.FEATURE_COLUMNS = original

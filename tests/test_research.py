@@ -11,7 +11,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from twopercent import champion, issues, research, store
+from twopercent import champion, features, issues, research, store
 
 IN_WINDOW = dt.datetime(2026, 7, 17, 22, 0, tzinfo=research._DENVER)  # Friday 22:00 Denver
 
@@ -62,7 +62,13 @@ def _seed_champion_experiment(con, lift=2.0, test_end=dt.date(2026, 6, 30), dail
     seq = store.record_experiment(
         con,
         strategy=champion.get_champion(),
-        params={"months": 12, "top_n": 20, "dropped_columns": [], "strategy_params": {}},
+        params={
+            "months": 12,
+            "top_n": 20,
+            "dropped_columns": [],
+            "strategy_params": {},
+            "feature_set": features.feature_set_version(),
+        },
         train_start=dt.date(2021, 7, 1),
         test_start=dt.date(2025, 7, 1),
         test_end=test_end,
@@ -100,7 +106,15 @@ def bench_spy(monkeypatch):
             raise RuntimeError("synthetic benchmark crash")
         metrics = {**METRICS, "lift": state["lifts"].get(key, METRICS["lift"])}
         if record:
-            params = {"months": months, "top_n": top_n, "strategy_params": strategy_params or {}}
+            # Mirrors backtest.run_benchmark: the feature set is part of a run's
+            # identity, so a fake referee that omitted it would never count as
+            # done and every dedupe test would vacuously "skip nothing" (#110).
+            params = {
+                "months": months,
+                "top_n": top_n,
+                "strategy_params": strategy_params or {},
+                "feature_set": features.feature_set_version(),
+            }
             if state["device"] is not None:
                 params["device"] = state["device"]
             seq = store.record_experiment(
@@ -262,7 +276,12 @@ def test_all_recorded_queue_files_refill_issue(con, tmp_path, night, bench_spy, 
         store.record_experiment(
             con,
             strategy=cfg["strategy"],
-            params={"months": 12, "top_n": 20, "strategy_params": cfg["params"]},
+            params={
+                "months": 12,
+                "top_n": 20,
+                "strategy_params": cfg["params"],
+                "feature_set": features.feature_set_version(),
+            },
             train_start=dt.date(2021, 7, 1),
             test_start=dt.date(2025, 7, 1),
             test_end=dt.date(2026, 6, 30),
@@ -322,7 +341,12 @@ def _seed_recorded(con, strategy, params):
     store.record_experiment(
         con,
         strategy=strategy,
-        params={"months": 12, "top_n": 20, "strategy_params": params},
+        params={
+            "months": 12,
+            "top_n": 20,
+            "strategy_params": params,
+            "feature_set": features.feature_set_version(),
+        },
         train_start=dt.date(2021, 7, 1),
         test_start=dt.date(2025, 7, 1),
         test_end=dt.date(2026, 6, 30),
@@ -454,7 +478,12 @@ def test_already_recorded_config_skipped_via_ledger(con, tmp_path, night, bench_
     store.record_experiment(
         con,
         strategy="xgb_gbm_v1",
-        params={"months": 12, "top_n": 20, "strategy_params": {"max_depth": 4}},
+        params={
+            "months": 12,
+            "top_n": 20,
+            "strategy_params": {"max_depth": 4},
+            "feature_set": features.feature_set_version(),
+        },
         train_start=dt.date(2021, 7, 1),
         test_start=dt.date(2025, 7, 1),
         test_end=dt.date(2026, 6, 30),
@@ -485,7 +514,12 @@ def test_done_matching_canonicalizes_int_vs_float(con, tmp_path, night, bench_sp
     store.record_experiment(
         con,
         strategy="xgb_gbm_v1",
-        params={"months": 12, "top_n": 20, "strategy_params": {"n_estimators": 200.0}},
+        params={
+            "months": 12,
+            "top_n": 20,
+            "strategy_params": {"n_estimators": 200.0},
+            "feature_set": features.feature_set_version(),
+        },
         train_start=dt.date(2021, 7, 1),
         test_start=dt.date(2025, 7, 1),
         test_end=dt.date(2026, 6, 30),
@@ -550,7 +584,12 @@ def test_champion_reference_ignores_parameterized_variants(con):
     champ_id = store.record_experiment(  # pre-research row: no strategy_params key at all
         con,
         strategy="baseline_gbm_v1",
-        params={"months": 12, "top_n": 20, "dropped_columns": []},
+        params={
+            "months": 12,
+            "top_n": 20,
+            "dropped_columns": [],
+            "feature_set": features.feature_set_version(),
+        },
         train_start=dt.date(2021, 7, 1),
         test_start=dt.date(2025, 7, 1),
         test_end=dt.date(2026, 6, 30),
@@ -559,7 +598,12 @@ def test_champion_reference_ignores_parameterized_variants(con):
     store.record_experiment(  # newer variant with a flattering lift
         con,
         strategy="baseline_gbm_v1",
-        params={"months": 12, "top_n": 20, "strategy_params": {"max_iter": 300}},
+        params={
+            "months": 12,
+            "top_n": 20,
+            "strategy_params": {"max_iter": 300},
+            "feature_set": features.feature_set_version(),
+        },
         train_start=dt.date(2021, 7, 1),
         test_start=dt.date(2025, 7, 1),
         test_end=dt.date(2026, 6, 30),

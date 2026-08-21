@@ -57,7 +57,7 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 
-from twopercent import backtest, champion, generate, issues, scan, store
+from twopercent import backtest, champion, features, generate, issues, scan, store
 from twopercent.canonical import _canonical, canonical_params  # noqa: F401  (re-export)
 from twopercent.compare import compare_verdict, lift_winner
 from twopercent.routine import _RANK, FAIL, OK, WARN, Step, _market_is_open
@@ -310,8 +310,14 @@ def recorded_configs(con: duckdb.DuckDBPyConnection) -> set[tuple[str, str]]:
 
     Touch era ONLY (M1): filters event = TOUCH_EVENT, so a config recorded only in
     the close era is NOT counted done and IS re-run under touch — the forced
-    champion/queue re-benchmark after the cutover."""
+    champion/queue re-benchmark after the cutover.
+
+    Current FEATURE SET only (#110): a run over different features described a
+    different model, so it does not satisfy a config either. This is what makes
+    a feature change re-open the queue instead of leaving the overnight loop
+    no-op'ing on stale results (#78)."""
     keys: set[tuple[str, str]] = set()
+    current_features = features.feature_set_version()
     for strategy, params_json in con.execute(
         "SELECT strategy, params FROM experiments WHERE event = ?", [scan.TOUCH_EVENT]
     ).fetchall():
@@ -321,6 +327,13 @@ def recorded_configs(con: duckdb.DuckDBPyConnection) -> set[tuple[str, str]]:
             logger.warning("experiments row for %s has unparseable params — ignored", strategy)
             continue
         if params.get("months") != STANDARD_MONTHS or params.get("top_n") != STANDARD_TOP_N:
+            continue
+        # A run over a DIFFERENT feature set does not satisfy a config now: its
+        # numbers describe a different model. Rows predating the fingerprint
+        # (feature_set absent) are likewise not done, exactly as the event
+        # filter above treats close-era rows -- both are forced re-benchmarks
+        # after a change to what the model actually sees (#110).
+        if params.get("feature_set") != current_features:
             continue
         keys.add((strategy, canonical_params(params.get("strategy_params") or {})))
     return keys

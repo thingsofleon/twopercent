@@ -270,3 +270,38 @@ def test_cli_reports_the_recorded_basket_by_default(traded):
 
     out = CliRunner().invoke(app, ["paper", "--db", db]).output
     assert f"top-{paper.PAPER_TOP_N}" in out
+
+
+def test_records_every_eligible_day_not_just_newly_scored_ones(traded):
+    """The step keyed on "newly scored by THIS run" and silently lost days.
+
+    Scoring also happens in the PREDICT routine, so a day first scored there
+    was invisible to the ledger forever; an aborted score run (a real +50%
+    biotech move tripped the corruption gate on 2026-08-19) or a day held back
+    as incomplete (2026-08-18) lost its day the same way. Three of five days
+    went missing in the one table that is supposed to be the record.
+
+    Asking what is ELIGIBLE AND ABSENT is self-healing: a missed run costs
+    nothing while the day is still inside the forward window.
+    """
+    con, target = traded
+
+    assert paper.pending_days(con, "baseline_gbm_v1", today=target) == [target]
+
+    paper.record_day(con, "baseline_gbm_v1", target, today=target)
+    # Already recorded: never offered twice, so a re-run cannot double-count.
+    assert paper.pending_days(con, "baseline_gbm_v1", today=target) == []
+
+
+def test_pending_never_offers_a_day_the_guards_would_refuse(traded):
+    """Completeness must not be bought by loosening forward-only."""
+    con, target = traded
+    stale = target + dt.timedelta(days=paper.MAX_BACKFILL_DAYS + 1)
+    assert paper.pending_days(con, "baseline_gbm_v1", today=stale) == []
+
+    # And a late day is never offered, however recent.
+    con.execute(
+        "UPDATE predictions SET created_ts = ?",
+        [dt.datetime.combine(target, dt.time(20, 1))],
+    )
+    assert paper.pending_days(con, "baseline_gbm_v1", today=target) == []

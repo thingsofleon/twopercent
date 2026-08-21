@@ -449,25 +449,27 @@ def _shadow_run_step(report: RoutineReport, con, signal_date: dt.date) -> None:
     report.add("shadow", WARN if result.had_trouble else OK, result.summary())
 
 
-def _paper_step(
-    report: RoutineReport, con, strategy: str, post_days, prior_days, today: dt.date
-) -> None:
-    """Record newly-scored days into the FORWARD-ONLY paper ledger.
+def _paper_step(report: RoutineReport, con, strategy: str, today: dt.date) -> None:
+    """Record every ELIGIBLE scored day into the FORWARD-ONLY paper ledger.
 
-    Only days scored for the first time by THIS run are recorded, so the ledger
-    can never accumulate history retroactively — that is the whole basis of it
-    being untainted evidence rather than another backtest.
+    Eligible = scored, not late, within the forward window, and not already
+    recorded. Keying on "newly scored by THIS run" silently lost days: the
+    predict routine scores too, so a day first scored there was never seen; and
+    an aborted or incomplete score run lost its day permanently. Asking what is
+    absent instead is self-healing, and record_day's guards (late, age) are
+    unchanged, so nothing retroactive can enter.
 
     Non-gating: WARN at worst. The scoring, the track record and the email are
     already complete; a paper-ledger failure must not fail a run whose real work
     is done.
     """
-    if prior_days is None:
-        report.add("paper", WARN, "cannot tell which days are new (pre-ingest scoring failed)")
+    try:
+        new_days = paper.pending_days(con, strategy, today=today)
+    except Exception as exc:
+        report.add("paper", WARN, f"could not list eligible days: {exc}")
         return
-    new_days = sorted(post_days - prior_days)
     if not new_days:
-        report.add("paper", OK, "no newly scored day to record")
+        report.add("paper", OK, "no eligible day left to record")
         return
     written, refused, crashed = 0, [], []
     for day in new_days:
@@ -758,7 +760,7 @@ def _run_score(
         report.add("dashboard", OK, f"refreshed {out_path} (predictions log untouched)")
     except Exception as exc:
         report.add("dashboard", WARN, f"render failed (scoring is complete): {exc}")
-    _paper_step(report, con, name, post_days, prior_days, today)
+    _paper_step(report, con, name, today)
     _shadow_score_step(report, con)
     # LAST: the target day's bars are final by now, and this is the only step
     # whose data cannot be recovered by re-running later.

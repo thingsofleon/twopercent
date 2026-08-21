@@ -205,6 +205,47 @@ def record_day(
     return len(rows)
 
 
+def pending_days(
+    con: duckdb.DuckDBPyConnection, strategy: str, today: dt.date | None = None
+) -> list[dt.date]:
+    """Scored days still eligible for the ledger and not yet in it.
+
+    The step used to record only days scored by THAT run, which silently lost
+    days: scoring also happens in the PREDICT routine, so any day first scored
+    there was invisible to the ledger forever. It also lost days whenever a
+    score run aborted (a real +50% biotech move tripped the corruption gate on
+    2026-08-19) or was held back as incomplete (2026-08-18). Three of five days
+    went missing that way, in the one table that is supposed to be the record.
+
+    Asking "what is eligible and absent?" instead is SELF-HEALING: a missed run
+    costs nothing as long as the day is still inside the forward window. The
+    guards are unchanged — record_day still refuses anything late or older than
+    MAX_BACKFILL_DAYS — so completeness is bought without loosening the
+    forward-only property that makes the ledger evidence.
+    """
+    today = today or dt.date.today()
+    ensure_schema(con)
+    scored = track.score_predictions(con, strategy, top_n=PAPER_TOP_N).scored
+    if scored.empty:
+        return []
+    have = {
+        r[0]
+        for r in con.execute(
+            "SELECT DISTINCT target_date FROM paper_trades WHERE strategy = ? AND rule = ?",
+            [strategy, RULE],
+        ).fetchall()
+    }
+    out = []
+    for row in scored.itertuples():
+        day = pd.Timestamp(row.target_date).date()
+        if day in have or bool(row.late):
+            continue
+        if (today - day).days > MAX_BACKFILL_DAYS:
+            continue
+        out.append(day)
+    return sorted(out)
+
+
 def report(
     con: duckdb.DuckDBPyConnection, strategy: str, basket: int = PAPER_TOP_N
 ) -> pd.DataFrame:

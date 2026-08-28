@@ -164,6 +164,7 @@ def test_benchmark_tiles_populated_render_walk_forward_values():
         {"auc": 0.72, "lift": 2.15, "precision_at_n": 0.74, "base_rate": 0.34, "top_n": 20},
         None,
         None,
+        None,  # feature_set: rides along so a cross-feature-set compare can be named
     )
     tiles = dashboard._benchmark_tiles(benchmark, top=20)
     assert "Walk-forward AUC" in tiles and ">0.720<" in tiles

@@ -40,9 +40,18 @@ def latest_standard_experiment(
     strategy: str,
     months: int = DEFAULT_TEST_MONTHS,
     top_n: int = DEFAULT_TOP_N,
-) -> tuple[int, dict, dt.date | None, dt.date | None] | None:
+) -> tuple[int, dict, dt.date | None, dt.date | None, str | None] | None:
     """The strategy's newest recorded standard (`months`, `top_n`) DEFAULT-CONFIG
-    benchmark, as (id, metrics, test_start, test_end).
+    benchmark, as (id, metrics, test_start, test_end, feature_set).
+
+    The feature_set rides along RATHER than being filtered on. Filtering would
+    make the champion reference silently vanish the moment features change --
+    the caller would degrade to "no comparison" with no explanation. Returning
+    it lets the caller SAY the comparison is cross-feature-set, which is the
+    thing that must not happen quietly: recorded_configs already treats a
+    different feature set as a different model, but this path did not, so every
+    challenger was scored against a champion row built on other features. That
+    injects a SYSTEMATIC offset into a gate calibrated for noise.
 
     Rows with non-empty strategy_params are research variants recorded under
     the strategy's name — they must never be quoted as the strategy's own
@@ -70,7 +79,7 @@ def latest_standard_experiment(
         if params.get("strategy_params"):
             continue  # parameterized variant, not the strategy's own config
         if params.get("months") == months and params.get("top_n") == top_n:
-            return exp_id, metrics, test_start, test_end
+            return exp_id, metrics, test_start, test_end, params.get("feature_set")
     return None
 
 

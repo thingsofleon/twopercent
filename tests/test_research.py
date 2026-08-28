@@ -611,7 +611,7 @@ def test_champion_reference_ignores_parameterized_variants(con):
     )
     result = research._latest_standard_experiment(con, "baseline_gbm_v1")
     assert result is not None
-    exp_id, metrics, test_end = result
+    exp_id, metrics, test_end, feature_set = result
     assert exp_id == champ_id
     assert metrics["lift"] == 2.0  # never the variant's 9.9
     assert test_end == dt.date(2026, 6, 30)
@@ -805,3 +805,49 @@ def test_family_size_counts_the_ledger_not_the_queue(con):
     before = research.family_size(con)
     _seed_champion_experiment(con)  # one recorded standard-window comparison
     assert research.family_size(con) == before + 1
+
+
+def test_a_run_over_different_features_does_not_count_as_done(con):
+    """#110/#78: the filter this PR exists for had no test of its own.
+
+    Every other test change just added the CURRENT fingerprint so existing
+    fixtures kept matching — which exercises the happy path and proves nothing
+    about the filter. Mirrors tests/test_touch_event.py's close-era assertion,
+    the same idea one layer up: a run that described a different MODEL does not
+    satisfy a config.
+    """
+    for feature_set in ("deadbeef0000", None):
+        params = {"months": 12, "top_n": 20, "strategy_params": {"max_depth": 4}}
+        if feature_set is not None:
+            params["feature_set"] = feature_set
+        store.record_experiment(
+            con,
+            strategy="xgb_gbm_v1",
+            params=params,
+            train_start=dt.date(2021, 7, 1),
+            test_start=dt.date(2025, 7, 1),
+            test_end=dt.date(2026, 6, 30),
+            metrics=METRICS,
+        )
+
+    # A stale fingerprint and a MISSING one are both "not done": rows predating
+    # the field described a model built on different features just as surely.
+    assert research.recorded_configs(con) == set()
+
+    # ...and the same config recorded under the CURRENT set is done, so the
+    # assertion above is discriminating rather than trivially empty.
+    store.record_experiment(
+        con,
+        strategy="xgb_gbm_v1",
+        params={
+            "months": 12,
+            "top_n": 20,
+            "strategy_params": {"max_depth": 4},
+            "feature_set": features.feature_set_version(),
+        },
+        train_start=dt.date(2021, 7, 1),
+        test_start=dt.date(2025, 7, 1),
+        test_end=dt.date(2026, 6, 30),
+        metrics=METRICS,
+    )
+    assert len(research.recorded_configs(con)) == 1

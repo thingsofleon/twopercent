@@ -81,7 +81,7 @@ def test_latest_standard_experiment_skips_variants_and_nonstandard(con):
     _seed_benchmark(con, metrics={**METRICS, "precision_at_5": 0.888}, months=2)
     latest = backtest.latest_standard_experiment(con, "test_strat_v1")
     assert latest is not None
-    exp_id, metrics, test_start, test_end = latest
+    exp_id, metrics, test_start, test_end, feature_set = latest
     assert exp_id == wanted
     assert metrics["precision_at_5"] == 0.1234  # never the variant's 0.999
     assert (test_start, test_end) == (dt.date(2025, 7, 1), dt.date(2026, 6, 30))

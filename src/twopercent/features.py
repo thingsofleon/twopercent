@@ -227,8 +227,11 @@ def feature_frame(
     rolling features are unstable and would teach the model IPO artifacts.
     """
     threshold = DEFAULT_THRESHOLD - _THRESHOLD_EPSILON
-    # Four epsilon-guarded thresholds, in SQL order: cnt_2pct_20d,
-    # days_since_2pct (#110), market_heat, and the label predicate.
+    # Four epsilon-guarded thresholds. SQL order is days_since_2pct's predicate
+    # FIRST (it lives in the `touched` CTE, above per_symbol), then
+    # cnt_2pct_20d, then market_heat, then the label. All four bind the same
+    # value today, which is exactly why a wrong order here would go unnoticed
+    # until one of them needs a different threshold.
     df = con.execute(_SQL, [threshold, threshold, threshold, threshold, start, end]).df()
     thin = df["history_days"] < MIN_HISTORY_DAYS
     if thin.any():

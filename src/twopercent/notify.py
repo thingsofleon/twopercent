@@ -259,7 +259,9 @@ def _basket_note(n_basket: int) -> str:
     return ""
 
 
-def _benchmark_summary(benchmark: tuple[int, dict, dt.date | None, dt.date | None] | None) -> str:
+def _benchmark_summary(
+    benchmark: tuple[int, dict, dt.date | None, dt.date | None, str | None] | None,
+) -> str:
     """One sentence of honest walk-forward stats — every number from the
     ledger row, never hard-coded; missing data says so instead of guessing."""
     if benchmark is None:
@@ -267,7 +269,7 @@ def _benchmark_summary(benchmark: tuple[int, dict, dt.date | None, dt.date | Non
             "No standard walk-forward benchmark is recorded in the experiments "
             "ledger for this strategy yet, so no historical precision figures are quoted."
         )
-    _exp_id, metrics, test_start, test_end = benchmark
+    _exp_id, metrics, test_start, test_end, _feature_set = benchmark
     p5 = metrics.get("precision_at_5")
     base = metrics.get("base_rate")
     window = f"{test_start} to {test_end}"
@@ -310,7 +312,7 @@ def _system_summary_lines(strategy: str, benchmark, perf: PickPerformance) -> li
 def compose_signal_email(
     prediction: PredictResult,
     perf: PickPerformance,
-    benchmark: tuple[int, dict, dt.date | None, dt.date | None] | None,
+    benchmark: tuple[int, dict, dt.date | None, dt.date | None, str | None] | None,
     generated_at: dt.datetime,
 ) -> tuple[str, str, str]:
     """Build (subject, text_body, html_body) for the day's signal.

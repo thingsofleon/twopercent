@@ -47,11 +47,13 @@ def test_lookahead_canary(con):
     # cnt_2pct_20d are TOUCH events (open-to-high): a refactor that dropped `high`
     # from this UPDATE would stop exercising the touch path and the canary would
     # pass blind. Keep `high` here, and assert the touch feature is future-invariant.
-    # `open` and `low` are mutated too as of #110: range_20d reads low, and
-    # gap_prior reads open. Without them a leak through EITHER column would pass
-    # this canary VACUOUSLY -- the check would run, go green, and prove nothing
-    # about the two newest features. Any future feature reading a column absent
-    # from this UPDATE must add it here in the same change.
+    # EVERY price column is mutated. open/low arrived with #110 (range_20d reads
+    # low, gap_prior reads open); adj_close arrived because it was the last one
+    # left, and a feature reading LEAD(adj_close) was demonstrated to pass this
+    # canary GREEN while leaking. A column absent from this UPDATE makes the
+    # canary vacuous for anything reading it — it runs, passes, and proves
+    # nothing. Mutate the whole table, not the columns today's features happen
+    # to use.
     # DISTINCT multipliers, deliberately. Scaling open and high by the SAME
     # factor leaves (high - open) / open unchanged, so the touch event -- and
     # therefore the label -- would be invariant and the "label must change"
@@ -61,7 +63,8 @@ def test_lookahead_canary(con):
     # the mutated rows out and leave the canary comparing nothing.
     con.execute(
         "UPDATE prices SET open = open * 2, high = high * 3, low = low * 1.5, "
-        "close = close * 3, volume = volume * 7 WHERE date > ?",
+        "close = close * 3, volume = volume * 7, adj_close = adj_close * 4 "
+        "WHERE date > ?",
         [cutoff],
     )
     after = feature_frame(con)
@@ -74,6 +77,9 @@ def test_lookahead_canary(con):
     # Explicit for the columns this UPDATE newly covers: tripling every future
     # open and low must not move the features that read them (#110).
     for col in ("range_20d", "gap_prior", "high_return_mean_20d", "days_since_2pct"):
+        # Guarded like the sector features above: a column that is all-NaN would
+        # make the equality below compare nothing and pass vacuously.
+        assert vec_before[col].notna().any(), col
         assert vec_before[col].equals(vec_after[col]), col
     # ...while the label DID change (it is the future, explicitly):
     lbl_b = before[before["signal_date"] == cutoff].set_index("symbol")["did_2pct_next"]

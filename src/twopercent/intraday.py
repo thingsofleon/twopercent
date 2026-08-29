@@ -88,6 +88,13 @@ _SPECS = {
     # window even as it slides during a run. The cost is nil: the daily capture
     # means nothing older than a few days is ever missing anyway.
     "1m": {"lookback": 25, "span": 7, "minutes": 1},
+    # 1h is the only interval deep enough to TRAIN on: the referee's standard
+    # window is 12 months and the walk-forward folds need more. Measured
+    # 2026-08-28: start=-729d returns bars, -750d is EMPTY ("within the last
+    # 730 days"); a single request serves 365 days but 730 comes back empty.
+    # 700/350 keeps daylight from both boundaries -- the 1m lookback sat ON its
+    # limit and failed nightly for a week before anyone noticed.
+    "1h": {"lookback": 700, "span": 350, "minutes": 60},
 }
 INTERVALS = tuple(_SPECS)
 

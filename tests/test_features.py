@@ -3,7 +3,7 @@ import datetime as dt
 import numpy as np
 import pandas as pd
 
-from tests.conftest import seed_history
+from tests.conftest import seed_history, seed_intraday
 from twopercent import store
 from twopercent.features import FEATURE_COLUMNS, METADATA_COLUMNS, feature_frame
 
@@ -35,6 +35,13 @@ def test_lookahead_canary(con):
     watched = FEATURE_COLUMNS + METADATA_COLUMNS  # metadata must be trailing-only too
     seed_history(con, {"AAA": _varied(60, 1), "BBB": _varied(60, 2)})
     _seed_universe(con, {"AAA": "Technology", "BBB": "Technology"})
+    # Intraday bars for EVERY seeded day, or the phase-2 features are all-NaN
+    # and the equality below compares nothing — the canary would pass while
+    # proving nothing about the newest and most leak-prone columns.
+    all_days = [
+        r[0] for r in con.execute("SELECT DISTINCT date FROM prices ORDER BY date").fetchall()
+    ]
+    seed_intraday(con, ["AAA", "BBB"], all_days)
     before = feature_frame(con)
     dates = sorted(before["signal_date"].unique())
     cutoff = dates[len(dates) // 2]
@@ -67,6 +74,23 @@ def test_lookahead_canary(con):
         "WHERE date > ?",
         [cutoff],
     )
+    # intraday_prices too, as of #79 phase 2. Its own module docstring warned
+    # that a leak from this table "would pass it vacuously" because the canary
+    # mutated only `prices` — that warning is now discharged rather than
+    # restated. Distinct multipliers again, for the same reason as above: equal
+    # scaling leaves the intraday ratios these features read unchanged.
+    con.execute(
+        # Volume is scaled NON-UNIFORMLY (per bar) on purpose. A single
+        # multiplier cancels in any volume RATIO: close_volume_share is
+        # last_bar_volume / session_volume, so volume*7 leaves it identical and
+        # a leak in that column passes undetected. Measured, not assumed — a
+        # leaking close_volume_share read 0.175824 before AND after a uniform
+        # scaling. Making the factor depend on the bar breaks the invariance.
+        "UPDATE intraday_prices SET open = open * 2, high = high * 3, "
+        "low = low * 1.5, close = close * 3, "
+        "volume = volume * (3 + (EXTRACT(hour FROM ts) % 5)) WHERE date > ?",
+        [cutoff],
+    )
     after = feature_frame(con)
     vec_after = after[after["signal_date"] == cutoff].set_index("symbol")[watched]
 
@@ -76,7 +100,18 @@ def test_lookahead_canary(con):
     assert vec_before["cnt_2pct_20d"].equals(vec_after["cnt_2pct_20d"])
     # Explicit for the columns this UPDATE newly covers: tripling every future
     # open and low must not move the features that read them (#110).
-    for col in ("range_20d", "gap_prior", "high_return_mean_20d", "days_since_2pct"):
+    for col in (
+        "range_20d",
+        "gap_prior",
+        "high_return_mean_20d",
+        "days_since_2pct",
+        # Phase 2 (#79): these read intraday_prices, the table the canary did
+        # not mutate until now.
+        "close_vwap_gap",
+        "last_hour_drift",
+        "intraday_vol",
+        "close_volume_share",
+    ):
         # Guarded like the sector features above: a column that is all-NaN would
         # make the equality below compare nothing and pass vacuously.
         assert vec_before[col].notna().any(), col

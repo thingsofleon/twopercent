@@ -30,6 +30,10 @@ from twopercent.scan import _THRESHOLD_EPSILON, DEFAULT_THRESHOLD, touch_event_p
 
 logger = logging.getLogger(__name__)
 
+# A 1h session is 7 bars (09:30-16:00). Require most of them: a session with
+# one or two bars produces a VWAP and a "last hour" that describe a fragment,
+# not a day. Sessions below the floor yield NULL rather than a fabricated shape.
+MIN_INTRADAY_BARS = 5
 MIN_HISTORY_DAYS = 20
 
 FEATURE_COLUMNS = [
@@ -52,6 +56,11 @@ FEATURE_COLUMNS = [
     "days_since_2pct",
     "volume_accel",
     "dist_52w_high",
+    # #79 phase 2: the SIGNAL day's intraday shape (1h bars).
+    "close_vwap_gap",
+    "last_hour_drift",
+    "intraday_vol",
+    "close_volume_share",
 ]
 
 # Metadata, NOT a feature: trailing median volume over the last 20 bars
@@ -142,6 +151,31 @@ market AS (
     FROM daily_returns
     GROUP BY date
 ),
+intraday_day AS (
+    -- #79 phase 2. The SIGNAL day's own intraday shape, from 1h bars. Every
+    -- column below is an aggregate over bars of signal_date S ONLY, so all are
+    -- known at S's close -- the same standing as oc_return_today. The TARGET
+    -- day's intraday bars are never read; that would be the most direct
+    -- lookahead available in this codebase, which is why the lookahead canary
+    -- now mutates intraday_prices (it previously mutated only `prices`, so a
+    -- leak from here would have passed it VACUOUSLY).
+    --
+    -- 1h is the only interval deep enough to train on: the referee's standard
+    -- window is 12 months and 5m/1m reach ~53 and ~34 days.
+    SELECT
+        symbol,
+        date,
+        sum(close * volume) / nullif(sum(volume), 0) AS vwap,
+        count(*) AS bars,
+        stddev_samp((close - open) / nullif(open, 0)) AS intraday_vol,
+        last(close ORDER BY ts) AS last_close,
+        last((close - open) / nullif(open, 0) ORDER BY ts) AS last_bar_ret,
+        last(volume ORDER BY ts) AS last_bar_vol,
+        sum(volume) AS session_vol
+    FROM intraday_prices
+    WHERE interval = '1h'
+    GROUP BY symbol, date
+),
 sector_day AS (
     SELECT
         d.date,
@@ -186,12 +220,23 @@ SELECT
     s.days_since_2pct,
     s.volume_accel,
     s.dist_52w_high,
+    -- Phase-2 intraday features. NULL wherever the signal day has no 1h
+    -- record, which is most of history until the backfill completes -- the
+    -- existing dropped-column semantics already handle a column the model
+    -- cannot use, loudly.
+    CASE WHEN i.bars >= {MIN_INTRADAY_BARS}
+         THEN (i.last_close - i.vwap) / nullif(i.vwap, 0) END AS close_vwap_gap,
+    CASE WHEN i.bars >= {MIN_INTRADAY_BARS} THEN i.last_bar_ret END AS last_hour_drift,
+    CASE WHEN i.bars >= {MIN_INTRADAY_BARS} THEN i.intraday_vol END AS intraday_vol,
+    CASE WHEN i.bars >= {MIN_INTRADAY_BARS}
+         THEN i.last_bar_vol / nullif(i.session_vol, 0) END AS close_volume_share,
     s.median_vol_20,
     s.history_days
 FROM per_symbol s
 JOIN market m ON s.date = m.date
 LEFT JOIN latest_universe u USING (symbol)
 LEFT JOIN sector_day sd ON sd.date = s.date AND sd.sector = u.sector
+LEFT JOIN intraday_day i ON i.symbol = s.symbol AND i.date = s.date
 WHERE s.date >= ? AND s.date <= ?
 ORDER BY s.date, s.symbol
 """

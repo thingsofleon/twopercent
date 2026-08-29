@@ -16,7 +16,7 @@ import duckdb
 import pandas as pd
 from sklearn.metrics import brier_score_loss, roc_auc_score
 
-from twopercent import calibration, scan, store, strategies
+from twopercent import calibration, features, scan, store, strategies
 from twopercent.features import feature_frame
 from twopercent.predict import LIQUIDITY_MIN_MEDIAN_VOLUME
 
@@ -40,9 +40,18 @@ def latest_standard_experiment(
     strategy: str,
     months: int = DEFAULT_TEST_MONTHS,
     top_n: int = DEFAULT_TOP_N,
-) -> tuple[int, dict, dt.date | None, dt.date | None] | None:
+) -> tuple[int, dict, dt.date | None, dt.date | None, str | None] | None:
     """The strategy's newest recorded standard (`months`, `top_n`) DEFAULT-CONFIG
-    benchmark, as (id, metrics, test_start, test_end).
+    benchmark, as (id, metrics, test_start, test_end, feature_set).
+
+    The feature_set rides along RATHER than being filtered on. Filtering would
+    make the champion reference silently vanish the moment features change --
+    the caller would degrade to "no comparison" with no explanation. Returning
+    it lets the caller SAY the comparison is cross-feature-set, which is the
+    thing that must not happen quietly: recorded_configs already treats a
+    different feature set as a different model, but this path did not, so every
+    challenger was scored against a champion row built on other features. That
+    injects a SYSTEMATIC offset into a gate calibrated for noise.
 
     Rows with non-empty strategy_params are research variants recorded under
     the strategy's name — they must never be quoted as the strategy's own
@@ -70,7 +79,7 @@ def latest_standard_experiment(
         if params.get("strategy_params"):
             continue  # parameterized variant, not the strategy's own config
         if params.get("months") == months and params.get("top_n") == top_n:
-            return exp_id, metrics, test_start, test_end
+            return exp_id, metrics, test_start, test_end, params.get("feature_set")
     return None
 
 
@@ -255,6 +264,12 @@ def run_benchmark(
             "selection": "liquidity_floor_100k",
             "dropped_columns": dropped_columns,
             "strategy_params": strategy_params or {},
+            # A recorded benchmark is only comparable to another over the SAME
+            # features, so the feature set is part of the run's identity (#110).
+            # Without it the research done-ledger counted every past config
+            # "done" after a feature change and the loop no-op'd on results that
+            # no longer described the model (#78).
+            "feature_set": features.feature_set_version(),
         }
         # Which device actually trained (strategies expose resolved_device
         # when it matters, e.g. xgb's CUDA probe). A sibling of

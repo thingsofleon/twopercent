@@ -57,7 +57,7 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 
-from twopercent import backtest, champion, generate, issues, scan, store
+from twopercent import backtest, champion, features, generate, issues, scan, store
 from twopercent.canonical import _canonical, canonical_params  # noqa: F401  (re-export)
 from twopercent.compare import compare_verdict, lift_winner
 from twopercent.routine import _RANK, FAIL, OK, WARN, Step, _market_is_open
@@ -310,8 +310,14 @@ def recorded_configs(con: duckdb.DuckDBPyConnection) -> set[tuple[str, str]]:
 
     Touch era ONLY (M1): filters event = TOUCH_EVENT, so a config recorded only in
     the close era is NOT counted done and IS re-run under touch — the forced
-    champion/queue re-benchmark after the cutover."""
+    champion/queue re-benchmark after the cutover.
+
+    Current FEATURE SET only (#110): a run over different features described a
+    different model, so it does not satisfy a config either. This is what makes
+    a feature change re-open the queue instead of leaving the overnight loop
+    no-op'ing on stale results (#78)."""
     keys: set[tuple[str, str]] = set()
+    current_features = features.feature_set_version()
     for strategy, params_json in con.execute(
         "SELECT strategy, params FROM experiments WHERE event = ?", [scan.TOUCH_EVENT]
     ).fetchall():
@@ -322,6 +328,13 @@ def recorded_configs(con: duckdb.DuckDBPyConnection) -> set[tuple[str, str]]:
             continue
         if params.get("months") != STANDARD_MONTHS or params.get("top_n") != STANDARD_TOP_N:
             continue
+        # A run over a DIFFERENT feature set does not satisfy a config now: its
+        # numbers describe a different model. Rows predating the fingerprint
+        # (feature_set absent) are likewise not done, exactly as the event
+        # filter above treats close-era rows -- both are forced re-benchmarks
+        # after a change to what the model actually sees (#110).
+        if params.get("feature_set") != current_features:
+            continue
         keys.add((strategy, canonical_params(params.get("strategy_params") or {})))
     return keys
 
@@ -330,7 +343,7 @@ def _latest_standard_experiment(
     con: duckdb.DuckDBPyConnection, strategy: str
 ) -> tuple[int, dict, dt.date | None] | None:
     """The champion's newest recorded standard (12-month, top-20) DEFAULT-CONFIG
-    benchmark, as (id, metrics, test_end).
+    benchmark, as (id, metrics, test_end, feature_set).
 
     Thin wrapper over backtest.latest_standard_experiment (one params-free
     filter in the codebase — the signal email quotes the same row).
@@ -340,8 +353,8 @@ def _latest_standard_experiment(
     )
     if latest is None:
         return None
-    exp_id, metrics, _test_start, test_end = latest
-    return exp_id, metrics, test_end
+    exp_id, metrics, _test_start, test_end, feature_set = latest
+    return exp_id, metrics, test_end, feature_set
 
 
 def _halves_hold(
@@ -685,14 +698,31 @@ def run(
                 "are OFF tonight; run `twopercent benchmark` first",
             )
         else:
-            champ_id, champ_metrics, champ_test_end = latest
+            champ_id, champ_metrics, champ_test_end, champ_features = latest
             report.champion_lift = champ_metrics.get("lift")
             report.champion_auc = champ_metrics.get("auc")
+            # A challenger built on THESE features versus a champion row built
+            # on OTHER ones is not a comparison of models, it is a comparison of
+            # feature sets. That injects a SYSTEMATIC offset into a gate whose
+            # band is Bonferroni on noise, so a big enough feature change would
+            # file a promotion candidate that is purely an artifact. Loud, and
+            # promotion is disabled for the night rather than quietly wrong.
+            cross_feature_set = champ_features != features.feature_set_version()
             report.add(
                 "champion",
-                OK,
-                f"{champ} exp #{champ_id}: lift {report.champion_lift} auc {report.champion_auc}",
+                WARN if cross_feature_set else OK,
+                f"{champ} exp #{champ_id}: lift {report.champion_lift} auc {report.champion_auc}"
+                + (
+                    f" — recorded under feature set {champ_features or 'PRE-FINGERPRINT'}, "
+                    f"tonight's is {features.feature_set_version()}: comparisons would be "
+                    "cross-feature-set, so PROMOTION DETECTION IS OFF. Re-run "
+                    "`twopercent benchmark` to record the champion on the current features"
+                    if cross_feature_set
+                    else ""
+                ),
             )
+            if cross_feature_set:
+                champ_metrics = None  # gate off: nothing to compare against
     except Exception as exc:
         report.add(
             "champion",

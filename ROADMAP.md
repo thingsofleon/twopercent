@@ -282,6 +282,47 @@ single-comparison threshold a stage already uses — so #59 cannot ship its gate
 without the accounting attached, and neither stage needs a guessed standard
 error.
 
+## Feature set v2 and experiment identity (decided 2026-08-28)
+
+**Six price-derived features** (#110), all from `daily_returns`: `range_20d`,
+`high_return_mean_20d`, `gap_prior`, `days_since_2pct`, `volume_accel`,
+`dist_52w_high`. Motivated by a gap, not a hunch: the label is an intraday
+RANGE event and NOTHING measured range — `vol_20d` is close-to-close dispersion
+and `cnt_2pct_20d` discards magnitude.
+
+**Experiment identity now includes the FEATURE SET.**
+`features.feature_set_version()` (sorted-name hash) is recorded in every
+benchmark's params, and `research.recorded_configs` requires it to match. Same
+idea as the existing touch-era event filter, one layer up: a run over different
+features described a different model. It hashes NAMES, not semantics — redefine
+a column without renaming it and the ledger will not notice.
+
+**What the sweep actually said** (56 matched config pairs sharing 225–230 target
+dates, the same-window comparison; NOT the ad-hoc single run first reported):
+
+| measure | value |
+|---|---|
+| top-20 precision delta | **+0.0053** mean, positive in 44/56 |
+| per-config paired t | median 0.81; abs(t) > 1.96 in only 7/56 |
+| disjoint halves both positive | 34/56 |
+| excluding the two best months | +0.0012, positive 35/56 |
+| 2026-07 (most recent, closest to OOS) | **−0.021**, positive in 9/56 |
+
+So: **small, regime-concentrated and statistically weak** — not the
+"inconclusive" first claimed, and not a ceiling break. The raw `lift` column
+looks catastrophic (0/56 improved) but that is a pure base-rate artifact: the
+base rate rose 0.343 → 0.351 in 56/56 because the window slid a month. AUC
+improves in 56/56 while precision@20 improves in only 44/56, because the new
+features are collinear volatility measures (`range_20d` univariate AUC 0.730 vs
+`vol_20d` 0.714) — they sharpen the global ranking without moving the top of it.
+
+**Promotion is now DISABLED across feature sets.** `latest_standard_experiment`
+returns the champion row's feature set, and the research runner WARNs and turns
+promotion detection off when it differs from tonight's. A feature change injects
+a SYSTEMATIC offset (AUC up in 56/56 here) into a band that is Bonferroni on
+NOISE, so a larger feature effect would have filed a promotion candidate that
+was purely an artifact.
+
 ## Paper trading — is the prediction TRADEABLE? (decided 2026-08-13)
 
 The dashboard measures PREDICTION. This measures whether the prediction survives

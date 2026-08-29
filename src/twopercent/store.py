@@ -66,7 +66,10 @@ CREATE TABLE IF NOT EXISTS ingest_meta (
 --                 high_return >= threshold-eps AND NOT high_glitch_suspect.
 --   low_return  = (low   - open) / open  — the open-to-low move (always <= 0 given
 --                 the OHLC gate). OUTCOME-side input to the strategy explorer's
---                 stop rules; like high_return it must never become a feature.
+--                 stop rules. Like high_return, the TARGET day's value must never
+--                 become a feature; TRAILING means of both are legitimate and are
+--                 used (high_return_mean_20d, range_20d), exactly as cnt_2pct_20d
+--                 has always been a trailing count of the label's own event.
 --   high_glitch_suspect (M2) = TRUE only at the isolated-high / close-unconfirmed
 --                 / volume-uncorroborated intersection (see below). ONE definition
 --                 here so every consumer agrees.

@@ -330,7 +330,7 @@ def _finite(value) -> bool:
     return isinstance(value, int | float) and math.isfinite(value)
 
 
-def _benchmark_tiles(benchmark: tuple[int, dict, object, object] | None, top: int) -> str:
+def _benchmark_tiles(benchmark: tuple[int, dict, object, object, object] | None, top: int) -> str:
     """Lead tiles: the walk-forward touch-era benchmark (AUC, lift, reach-rate).
 
     AUC leads because it is base-rate-invariant; lift compresses at the high
@@ -343,7 +343,7 @@ def _benchmark_tiles(benchmark: tuple[int, dict, object, object] | None, top: in
             '<b>—</b><span class="cmp">no touch-era benchmark yet — '
             "run twopercent benchmark</span></div>"
         )
-    _exp_id, metrics, _ts, _te = benchmark
+    _exp_id, metrics, _ts, _te, _feature_set = benchmark
     auc = metrics.get("auc")
     lift = metrics.get("lift")
     reach = metrics.get("precision_at_n")

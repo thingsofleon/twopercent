@@ -257,38 +257,74 @@ def _warn_intraday_coverage(out: pd.DataFrame) -> None:
     """Say out loud how much of the frame has NO intraday features, and why.
 
     CLAUDE.md: anything that skips or filters must warn loudly about what it
-    excluded. The intraday gate excludes silently in three distinct ways, and
-    each one means something different operationally:
-      * no 1h record at all -- the backfill has not reached those dates, or the
-        capture is not running for those symbols (the dangerous one: it decays
-        forward);
-      * a record that fails the bar/closing-bar gate -- half-days and outages;
-      * whole trading days with zero coverage -- a provider gap, which is what
-        2026-01-30 and 2026-02-02 are.
-    A silent 70%-NaN column trains a model on a feature the live path will not
-    have, which is precisely the failure this project keeps re-learning.
+    excluded. But loudly is not the same as constantly, and this warning has to
+    survive the alarm-fatigue test the doctor's checks just failed twice.
+
+    So it separates two populations that mean opposite things:
+
+      * STRUCTURAL -- signal dates before the provider's 1h horizon. Daily
+        history reaches 2021-07 and Yahoo serves ~730 days of 1h, so roughly
+        63% of the frame can NEVER have these features. Nothing is wrong and
+        nothing can be done; a standing 63% WARNING on every single call would
+        train the operator to ignore the line that also carries the real news.
+        Reported once, at INFO, as a fact about the data.
+
+      * RECENT -- dates the 1h capture was supposed to cover and did not. THIS
+        is the one that decays forward: it is what a stopped capture, a
+        picks-only regression, or a provider outage looks like, and it is worth
+        a WARNING every time it appears.
     """
     if out.empty:
         return
     missing = out["close_vwap_gap"].isna()
     if not missing.any():
         return
-    share = 100.0 * missing.mean()
-    by_day = missing.groupby(out["signal_date"]).mean()
-    blank_days = by_day[by_day == 1.0]
+    signal = pd.to_datetime(out["signal_date"])
+    covered = signal[~missing]
+    if covered.empty:
+        logger.warning(
+            "intraday features are unavailable on ALL %d rows — the 1h capture has "
+            "never run, or its record does not overlap this frame (build it with "
+            "`twopercent intraday --interval 1h --days 700`)",
+            len(out),
+        )
+        return
+
+    horizon = covered.min()
+    structural = missing & (signal < horizon)
+    recent = missing & (signal >= horizon)
+    if structural.any():
+        logger.info(
+            "intraday features are structurally absent before %s on %d of %d rows "
+            "(%.0f%%): the provider serves ~730 days of 1h and daily history is "
+            "longer — expected, not a fault",
+            horizon.date(),
+            int(structural.sum()),
+            len(out),
+            100.0 * structural.mean(),
+        )
+    if not recent.any():
+        return
+
+    in_era = signal >= horizon
+    by_day = recent.groupby(signal.dt.date).sum()
+    day_totals = in_era.groupby(signal.dt.date).sum()
+    blank = by_day[(day_totals > 0) & (by_day == day_totals)]
     detail = ""
-    if len(blank_days):
-        shown = ", ".join(str(d) for d in list(blank_days.index)[:5])
+    if len(blank):
+        shown = ", ".join(str(d) for d in list(blank.index)[:5])
         detail = (
-            f"; {len(blank_days)} trading day(s) have NO usable 1h session for ANY "
-            f"symbol ({shown}{', ...' if len(blank_days) > 5 else ''})"
+            f"; {len(blank)} day(s) since {horizon.date()} have NO usable 1h session "
+            f"for ANY symbol ({shown}{', ...' if len(blank) > 5 else ''})"
         )
     logger.warning(
-        "intraday features unavailable on %d of %d rows (%.1f%%): no 1h record, or a "
-        "session failing the >=%d-bar / closing-bar gate%s",
-        int(missing.sum()),
-        len(out),
-        share,
+        "intraday features missing on %d of %d rows (%.1f%%) INSIDE the covered era "
+        "(since %s): no 1h record, or a session failing the >=%d-bar / closing-bar "
+        "gate%s",
+        int(recent.sum()),
+        int(in_era.sum()),
+        100.0 * recent.sum() / max(int(in_era.sum()), 1),
+        horizon.date(),
         MIN_INTRADAY_BARS,
         detail,
     )

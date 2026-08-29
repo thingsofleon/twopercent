@@ -1014,3 +1014,103 @@ def test_a_session_missing_its_morning_is_caught_despite_stragglers(con):
     assert intraday.coverage_verdict(row) == "LATE_OPEN"
     bad = intraday.coverage_problems(con)
     assert gap in set(pd.to_datetime(bad["date"]).dt.date)
+
+
+def test_the_early_close_threshold_sits_between_the_MEASURED_populations(con):
+    """Pin the bands the threshold was calibrated against.
+
+    My first threshold (0.9) came from a synthetic fixture that agreed
+    perfectly, and on the real store it rejected all five genuine half days —
+    reinstating the false alarms it existed to remove. Measured over 480 real
+    1h sessions: normal days median 0.917, genuine half days 0.543..0.742,
+    real outages 0.120 and 0.009. This test reproduces a half day at the WORST
+    observed agreement and an outage at the BEST observed one, so a change that
+    narrows the gap fails here rather than silently re-tuning the constant.
+    """
+    syms = [f"S{i:02d}" for i in range(100)]
+    worst_half, best_outage = dt.date(2026, 3, 3), dt.date(2026, 3, 4)
+    # 54% of names reproduce the daily high (the worst real half day); the rest
+    # have a daily high their session never printed.
+    highs = {}
+    rows = []
+    for i, sym in enumerate(syms):
+        for day, agree_share in ((worst_half, 0.54), (best_outage, 0.12)):
+            agrees = i < int(agree_share * len(syms))
+            rows.append(
+                {
+                    "symbol": sym,
+                    "date": day,
+                    "open": 100.0,
+                    "high": 101.0 if agrees else 105.0,
+                    "low": 99.0,
+                    "close": 100.5,
+                    "adj_close": 100.5,
+                    "volume": 1_000_000,
+                }
+            )
+    highs.clear()
+    store.upsert_prices(con, pd.DataFrame(rows))
+    _seed_session(con, syms, worst_half, [9, 10, 11, 12])
+    _seed_session(con, syms, best_outage, [9, 10, 11, 12])
+
+    cov = intraday.session_coverage(con)
+    by_day = dict(zip(pd.to_datetime(cov["date"]).dt.date, cov.to_dict("records"), strict=True))
+    assert by_day[worst_half]["early_close"], "the worst real half day must still pass"
+    assert not by_day[worst_half]["truncated"]
+    assert by_day[best_outage]["truncated"], "the best real outage must still fail"
+    assert not by_day[best_outage]["early_close"]
+
+
+def test_the_nightly_capture_refreshes_a_short_window_not_the_whole_retention(con, monkeypatch):
+    """The nightly run must not re-pull the full retention window.
+
+    The retention window is how far back the provider will SERVE; it is not how
+    far back a nightly run should ASK. Pulling 1h's 700 days for the whole
+    universe every night is a ~10x provider load AND silently rewrites two years
+    of feature history as the provider revises bars — so a recorded experiment
+    would stop reproducing run to run.
+
+    No test covered the routine's intraday step at all, which is how both this
+    and the symbol-scope regression stayed invisible.
+    """
+    from twopercent import routine
+
+    calls = []
+
+    def fake_ingest(_con, symbols, start, end, interval):
+        calls.append({"interval": interval, "symbols": list(symbols), "start": start, "end": end})
+        return intraday.IngestResult(interval=interval, symbols_requested=len(symbols))
+
+    monkeypatch.setattr(intraday, "ingest", fake_ingest)
+    monkeypatch.setattr(intraday, "coverage_problems", lambda _con: pd.DataFrame())
+    store.upsert_universe(
+        con,
+        pd.DataFrame({"symbol": ["AAA"], "name": ["a"], "market_cap": [1e9], "sector": ["Tech"]}),
+        as_of=dt.date.today(),
+    )
+    picks = pd.DataFrame(
+        {
+            "strategy": ["baseline_gbm_v1"],
+            "signal_date": [dt.date.today() - dt.timedelta(days=2)],
+            "symbol": ["AAA"],
+            "prob": [0.9],
+            "rank": [1],
+            "created_ts": [pd.Timestamp("2026-08-28")],
+            "universe_as_of": [dt.date.today()],
+            "event": [scan.TOUCH_EVENT],
+        }
+    )
+    con.register("_p", picks)
+    con.execute("INSERT INTO predictions BY NAME SELECT * FROM _p")
+    con.unregister("_p")
+
+    report = routine.RoutineReport()
+    routine._intraday_step(report, con)
+
+    assert {c["interval"] for c in calls} == set(intraday.INTERVALS)
+    for call in calls:
+        span = (call["end"] - call["start"]).days
+        assert span == intraday.NIGHTLY_REFRESH_DAYS, (
+            f"{call['interval']} asked for {span} days nightly — the refresh window "
+            "must not be the retention window"
+        )

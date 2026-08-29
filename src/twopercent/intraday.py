@@ -744,6 +744,22 @@ def stop_fills(
         con.unregister("_fill_pairs")
 
 
+# Nightly refresh window, deliberately much shorter than the retention window.
+# The retention window is how far back the provider will SERVE; it is not how
+# far back a nightly run should ASK. Fetching 1h's full 700 days every night
+# would mean ~3,000 symbols x 700 days on a provider three separate comments in
+# this file call rate-limiting -- and, worse, it would silently REWRITE two
+# years of feature history every night as the provider revises bars, so a
+# recorded experiment would not reproduce run to run. That is the hazard
+# features.py:12-18 already documents for universe refreshes, applied to every
+# intraday feature column.
+#
+# 5 trading days of overlap absorbs a missed run and late revisions while
+# leaving the historical record stable. The initial build is a separate,
+# explicit act: `twopercent intraday --interval 1h --days 700`.
+NIGHTLY_REFRESH_DAYS = 5
+
+
 def capture_symbols(
     con: duckdb.DuckDBPyConnection, interval: str, top_n: int = 20
 ) -> tuple[list[str], str]:
@@ -1213,7 +1229,22 @@ EARLY_CLOSE_MINUTES = 13 * 60
 # afternoon it never saw is in the daily bar. No calendar to maintain, and it
 # measures the property actually at stake (is this record complete?) rather than
 # a proxy for it. Unverifiable (no daily bar) is NOT treated as agreement.
-EARLY_CLOSE_MIN_AGREEMENT = 0.9
+#
+# The threshold is MEASURED, and my first guess was wrong in the instructive
+# direction: 0.9 was calibrated against a synthetic fixture that agreed
+# perfectly, and on the real store it rejected all five GENUINE half days --
+# reinstating the exact false alarms this exists to remove. Measured over 480
+# real 1h sessions:
+#     normal full days   median 0.917, 5th pct 0.863
+#     genuine half days  0.543 .. 0.742
+#     real outages       0.120 (2026-01-30), 0.009 (2026-02-02)
+# Half days sit below normal days because a 4-bar session gives a thin name
+# fewer chances to print the daily high and low -- not because the record is
+# defective. 0.40 sits between the two populations with wide margin either way
+# (1.36x below the worst half day, 3.3x above the worst outage), and a test
+# pins those bands so a change that narrows the gap fails instead of silently
+# re-tuning this.
+EARLY_CLOSE_MIN_AGREEMENT = 0.40
 SESSION_OPEN_MINUTES = 9 * 60 + 30
 # A session is short if its last bar starts more than this many minutes before
 # the expected final slot. One bar of slack absorbs a venue's early close on a

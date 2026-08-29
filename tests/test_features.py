@@ -408,7 +408,7 @@ def test_missing_intraday_coverage_is_reported_not_silent(con, caplog):
     seed_intraday(con, ["AAA"], days[:-3])
     with caplog.at_level("WARNING"):
         feature_frame(con)
-    assert "intraday features unavailable" in caplog.text
+    assert "intraday features missing" in caplog.text
     assert "NO usable 1h session for ANY symbol" in caplog.text
 
 
@@ -419,4 +419,27 @@ def test_full_intraday_coverage_reports_nothing(con, caplog):
     seed_intraday(con, ["AAA"], days)
     with caplog.at_level("WARNING"):
         feature_frame(con)
-    assert "intraday features unavailable" not in caplog.text
+    assert "intraday features missing" not in caplog.text
+
+
+def test_the_structural_pre_1h_era_is_not_a_standing_warning(con, caplog):
+    """Yahoo serves ~730 days of 1h while daily history reaches 2021 — roughly
+    63% of the frame can NEVER have these features.
+
+    A permanent 63% WARNING on every feature_frame() call is the same
+    alarm-fatigue trap the doctor's half-day check just cost us: it trains the
+    operator to ignore the line that also carries the real news. The structural
+    era is INFO; only gaps INSIDE the covered era are a warning.
+    """
+    seed_history(con, {"AAA": [0.01] * 40}, vary_volume=True)
+    days = [r[0] for r in con.execute("SELECT DISTINCT date FROM prices ORDER BY date").fetchall()]
+    # 1h exists only for the recent tail — exactly the real-world shape.
+    seed_intraday(con, ["AAA"], days[-10:])
+    with caplog.at_level("INFO"):
+        feature_frame(con)
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert not any("intraday features missing" in r.getMessage() for r in warnings), (
+        "a structurally impossible gap must not be a standing WARNING"
+    )
+    assert "structurally absent" in caplog.text

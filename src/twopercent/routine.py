@@ -516,12 +516,11 @@ def _intraday_step(report: RoutineReport, con, top_n: int = 20) -> None:
     details, worst = [], OK
     for interval in intraday.INTERVALS:
         end = dt.date.today() + dt.timedelta(days=1)
-        # The nightly window is the REFRESH window, not the interval's full
-        # retention window: re-pulling 1h's 700 days for ~3,000 symbols every
-        # night is a ~10x provider load AND silently rewrites two years of
-        # feature history as the provider revises bars. Backfill is an explicit
-        # one-off (`twopercent intraday --interval 1h --days 700`).
-        start = end - dt.timedelta(days=intraday.NIGHTLY_REFRESH_DAYS)
+        # The nightly window is the interval's REFRESH window, not its retention
+        # window. 5m/1m re-ask for their whole window because that is their
+        # self-healing; 1h cannot, because it is universe-wide and re-asking
+        # would rewrite two years of feature history nightly. See _SPECS.
+        start = end - dt.timedelta(days=intraday.spec(interval)["refresh"])
         # Resolved PER INTERVAL, two ways: 5m/1m fetch PICKS bounded by their own
         # retention window (1h's 700 days must never inflate them -- #94 stays
         # closed), 1h fetches the whole UNIVERSE because it feeds features.

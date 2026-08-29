@@ -906,24 +906,6 @@ def _seed_session(con, symbols, day, hours, interval="1h"):
     con.unregister("_s")
 
 
-def _seed_daily_highs(con, symbols, days, high_by_day):
-    rows = [
-        {
-            "symbol": sym,
-            "date": day,
-            "open": 100.0,
-            "high": high_by_day[day],
-            "low": 99.0,
-            "close": 100.5,
-            "adj_close": 100.5,
-            "volume": 1_000_000,
-        }
-        for sym in symbols
-        for day in days
-    ]
-    store.upsert_prices(con, pd.DataFrame(rows))
-
-
 def test_a_calendared_half_day_is_not_a_coverage_fault(con):
     """A 13:00 half day ends three hours early BY DESIGN.
 
@@ -932,8 +914,7 @@ def test_a_calendared_half_day_is_not_a_coverage_fault(con):
     it, the same alarm-fatigue trap #94 and the 1m boundary already cost us.
     """
     syms = [f"S{i:02d}" for i in range(10)]
-    full, half = dt.date(2026, 3, 2), dt.date(2026, 3, 3)
-    _seed_daily_highs(con, syms, [full, half], {full: 101.0, half: 101.0})
+    full, half = dt.date(2025, 11, 26), dt.date(2025, 11, 28)  # a REAL half day
     _seed_session(con, syms, full, [9, 10, 11, 12, 13, 14, 15])
     _seed_session(con, syms, half, [9, 10, 11, 12])  # last bar 12:30, a 13:00 close
 
@@ -953,16 +934,20 @@ def test_an_outage_that_mimics_a_half_day_is_still_a_fault(con):
     1h bars are hourly, so ANY outage beginning between 12:30 and 13:30 leaves
     12:30 as the last bar — indistinguishable from a 13:00 close by timestamp
     alone, and a full hour of onset times silently exempted on the one table a
-    re-run cannot rebuild. The timestamp only NOMINATES; the daily bar's high
-    and low CONFIRM. A real half day's short session is the whole day and
-    reproduces them; a morning-only record cannot.
+    re-run cannot rebuild.
+
+    It is equally indistinguishable from the DATA. Truncating real full sessions
+    at 12:30 gives agreement 0.315–0.534 against genuine half days at
+    0.543–0.742 — populations that touch, because the two cases contain nearly
+    the same bars and enough names print their extremes before noon. Only the
+    calendar separates them.
     """
     syms = [f"S{i:02d}" for i in range(10)]
-    half, outage = dt.date(2026, 3, 3), dt.date(2026, 3, 4)
-    # The outage day traded on to a 105 high in an afternoon the record missed.
-    _seed_daily_highs(con, syms, [half, outage], {half: 101.0, outage: 105.0})
+    half = dt.date(2025, 11, 28)  # in HALF_DAYS
+    outage = dt.date(2025, 12, 3)  # an ordinary Wednesday
+    assert outage not in intraday.HALF_DAYS
     _seed_session(con, syms, half, [9, 10, 11, 12])
-    _seed_session(con, syms, outage, [9, 10, 11, 12])  # identical timestamps
+    _seed_session(con, syms, outage, [9, 10, 11, 12])  # IDENTICAL bars
 
     cov = intraday.session_coverage(con)
     by_day = dict(zip(pd.to_datetime(cov["date"]).dt.date, cov.to_dict("records"), strict=True))
@@ -971,14 +956,18 @@ def test_an_outage_that_mimics_a_half_day_is_still_a_fault(con):
     assert outage in set(pd.to_datetime(intraday.coverage_problems(con)["date"]).dt.date)
 
 
-def test_an_unverifiable_short_session_is_not_given_the_benefit_of_the_doubt(con):
-    """No daily bar to check against means UNVERIFIED, never 'agreed'."""
+def test_a_half_day_past_the_calendar_fails_loudly_and_says_why(con, caplog):
+    """A stale calendar must degrade to a false ALARM that explains itself,
+    never to silence."""
     syms = [f"S{i:02d}" for i in range(10)]
-    day = dt.date(2026, 3, 3)
-    _seed_session(con, syms, day, [9, 10, 11, 12])  # no daily bars seeded at all
-    cov = intraday.session_coverage(con)
-    row = cov[pd.to_datetime(cov["date"]).dt.date == day].iloc[0]
+    beyond = dt.date(2029, 11, 23)
+    assert beyond > intraday.HALF_DAY_CALENDAR_THROUGH
+    _seed_session(con, syms, beyond, [9, 10, 11, 12])
+    with caplog.at_level("WARNING"):
+        cov = intraday.session_coverage(con)
+    row = cov[pd.to_datetime(cov["date"]).dt.date == beyond].iloc[0]
     assert row["truncated"] and not row["early_close"]
+    assert "extend intraday.HALF_DAYS" in caplog.text
 
 
 def test_a_feed_that_dies_mid_session_is_still_truncated(con):
@@ -1014,51 +1003,6 @@ def test_a_session_missing_its_morning_is_caught_despite_stragglers(con):
     assert intraday.coverage_verdict(row) == "LATE_OPEN"
     bad = intraday.coverage_problems(con)
     assert gap in set(pd.to_datetime(bad["date"]).dt.date)
-
-
-def test_the_early_close_threshold_sits_between_the_MEASURED_populations(con):
-    """Pin the bands the threshold was calibrated against.
-
-    My first threshold (0.9) came from a synthetic fixture that agreed
-    perfectly, and on the real store it rejected all five genuine half days —
-    reinstating the false alarms it existed to remove. Measured over 480 real
-    1h sessions: normal days median 0.917, genuine half days 0.543..0.742,
-    real outages 0.120 and 0.009. This test reproduces a half day at the WORST
-    observed agreement and an outage at the BEST observed one, so a change that
-    narrows the gap fails here rather than silently re-tuning the constant.
-    """
-    syms = [f"S{i:02d}" for i in range(100)]
-    worst_half, best_outage = dt.date(2026, 3, 3), dt.date(2026, 3, 4)
-    # 54% of names reproduce the daily high (the worst real half day); the rest
-    # have a daily high their session never printed.
-    highs = {}
-    rows = []
-    for i, sym in enumerate(syms):
-        for day, agree_share in ((worst_half, 0.54), (best_outage, 0.12)):
-            agrees = i < int(agree_share * len(syms))
-            rows.append(
-                {
-                    "symbol": sym,
-                    "date": day,
-                    "open": 100.0,
-                    "high": 101.0 if agrees else 105.0,
-                    "low": 99.0,
-                    "close": 100.5,
-                    "adj_close": 100.5,
-                    "volume": 1_000_000,
-                }
-            )
-    highs.clear()
-    store.upsert_prices(con, pd.DataFrame(rows))
-    _seed_session(con, syms, worst_half, [9, 10, 11, 12])
-    _seed_session(con, syms, best_outage, [9, 10, 11, 12])
-
-    cov = intraday.session_coverage(con)
-    by_day = dict(zip(pd.to_datetime(cov["date"]).dt.date, cov.to_dict("records"), strict=True))
-    assert by_day[worst_half]["early_close"], "the worst real half day must still pass"
-    assert not by_day[worst_half]["truncated"]
-    assert by_day[best_outage]["truncated"], "the best real outage must still fail"
-    assert not by_day[best_outage]["early_close"]
 
 
 def test_the_nightly_capture_refreshes_a_short_window_not_the_whole_retention(con, monkeypatch):
@@ -1108,9 +1052,14 @@ def test_the_nightly_capture_refreshes_a_short_window_not_the_whole_retention(co
     routine._intraday_step(report, con)
 
     assert {c["interval"] for c in calls} == set(intraday.INTERVALS)
-    for call in calls:
-        span = (call["end"] - call["start"]).days
-        assert span == intraday.NIGHTLY_REFRESH_DAYS, (
-            f"{call['interval']} asked for {span} days nightly — the refresh window "
-            "must not be the retention window"
+    by_interval = {c["interval"]: (c["end"] - c["start"]).days for c in calls}
+    # 1h is universe-wide: a nightly re-ask of its retention window would rewrite
+    # two years of feature history every night.
+    assert by_interval["1h"] == 5 < intraday.spec("1h")["lookback"]
+    # 5m/1m are picks-only, and re-asking their whole window IS their
+    # self-healing after a missed run — do not "optimise" it away.
+    for interval in ("5m", "1m"):
+        assert by_interval[interval] == intraday.spec(interval)["lookback"], (
+            f"{interval} must keep re-asking its full window; that is how a "
+            "missed run repairs itself on a table a re-run cannot rebuild"
         )

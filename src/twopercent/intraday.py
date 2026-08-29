@@ -88,7 +88,7 @@ INTERVAL = "5m"  # the working resolution; 1m exists for validation and ground t
 #   span       the most one request will return
 #   minutes    the bar width, which the contiguity gates count slots in
 _SPECS = {
-    "5m": {"lookback": 60, "span": 55, "minutes": 5},
+    "5m": {"lookback": 60, "span": 55, "minutes": 5, "refresh": 60},
     # 1m is the finest Yahoo serves and the fastest to expire. Its documented
     # limit is "within the last 30 days" and that bound is EXCLUSIVE and
     # measured at request time: probing 2026-08-18, start=-30d returns EMPTY
@@ -101,14 +101,14 @@ _SPECS = {
     # 25 keeps a 5-day margin so the oldest chunk stays comfortably inside the
     # window even as it slides during a run. The cost is nil: the daily capture
     # means nothing older than a few days is ever missing anyway.
-    "1m": {"lookback": 25, "span": 7, "minutes": 1},
+    "1m": {"lookback": 25, "span": 7, "minutes": 1, "refresh": 25},
     # 1h is the only interval deep enough to TRAIN on: the referee's standard
     # window is 12 months and the walk-forward folds need more. Measured
     # 2026-08-28: start=-729d returns bars, -750d is EMPTY ("within the last
     # 730 days"); a single request serves 365 days but 730 comes back empty.
     # 700/350 keeps daylight from both boundaries -- the 1m lookback sat ON its
     # limit and failed nightly for a week before anyone noticed.
-    "1h": {"lookback": 700, "span": 350, "minutes": 60},
+    "1h": {"lookback": 700, "span": 350, "minutes": 60, "refresh": 5},
 }
 INTERVALS = tuple(_SPECS)
 
@@ -744,20 +744,22 @@ def stop_fills(
         con.unregister("_fill_pairs")
 
 
-# Nightly refresh window, deliberately much shorter than the retention window.
-# The retention window is how far back the provider will SERVE; it is not how
-# far back a nightly run should ASK. Fetching 1h's full 700 days every night
-# would mean ~3,000 symbols x 700 days on a provider three separate comments in
-# this file call rate-limiting -- and, worse, it would silently REWRITE two
-# years of feature history every night as the provider revises bars, so a
-# recorded experiment would not reproduce run to run. That is the hazard
-# features.py:12-18 already documents for universe refreshes, applied to every
-# intraday feature column.
+# `refresh` is the NIGHTLY window; `lookback` is how far back the provider will
+# SERVE. They are different questions and only 1h needs them to differ.
 #
-# 5 trading days of overlap absorbs a missed run and late revisions while
-# leaving the historical record stable. The initial build is a separate,
-# explicit act: `twopercent intraday --interval 1h --days 700`.
-NIGHTLY_REFRESH_DAYS = 5
+# 5m/1m keep asking for their whole retention window because they are picks-only
+# (~430 symbols) and that re-ask is their SELF-HEALING: a routine outage shorter
+# than 60/25 days repairs itself on the next run, on the one table a re-run
+# cannot rebuild. Shortening them to match 1h would have quietly removed that.
+#
+# 1h cannot do the same. It is universe-wide, so a nightly 700-day re-ask is
+# ~3,000 symbols x 700 days on a provider three comments in this file call
+# rate-limiting -- and, worse, it would silently REWRITE two years of feature
+# history every night as the provider revises bars, so a recorded experiment
+# would stop reproducing run to run. That is the hazard features.py already
+# documents for universe refreshes, applied to every intraday feature column.
+# 5 days absorbs a missed run; the initial build is an explicit one-off,
+# `twopercent intraday --interval 1h --days 700`.
 
 
 def capture_symbols(
@@ -1222,29 +1224,44 @@ EARLY_CLOSE_MINUTES = 13 * 60
 # leaves 12:30 as the last bar, exactly like a real 13:00 close -- a full hour
 # of onset times, silently exempted, on the one table a re-run cannot rebuild.
 #
-# So the timestamp only NOMINATES a session. What confirms it is the same
-# completeness test the resolver already relies on: the intraday record must
-# REPRODUCE the daily bar's high and low. A real half day's short session IS the
-# whole day, so it agrees; an outage's morning-only record cannot, because the
-# afternoon it never saw is in the daily bar. No calendar to maintain, and it
-# measures the property actually at stake (is this record complete?) rather than
-# a proxy for it. Unverifiable (no daily bar) is NOT treated as agreement.
+# I then tried to confirm half days from the DATA, by requiring the record to
+# reproduce the daily bar's high and low. MEASURED, it does not work, and the
+# reason is structural rather than a bad threshold. Simulating a 12:30 outage by
+# truncating real full sessions:
 #
-# The threshold is MEASURED, and my first guess was wrong in the instructive
-# direction: 0.9 was calibrated against a synthetic fixture that agreed
-# perfectly, and on the real store it rejected all five GENUINE half days --
-# reinstating the exact false alarms this exists to remove. Measured over 480
-# real 1h sessions:
-#     normal full days   median 0.917, 5th pct 0.863
-#     genuine half days  0.543 .. 0.742
-#     real outages       0.120 (2026-01-30), 0.009 (2026-02-02)
-# Half days sit below normal days because a 4-bar session gives a thin name
-# fewer chances to print the daily high and low -- not because the record is
-# defective. 0.40 sits between the two populations with wide margin either way
-# (1.36x below the worst half day, 3.3x above the worst outage), and a test
-# pins those bands so a change that narrows the gap fails instead of silently
-# re-tuning this.
-EARLY_CLOSE_MIN_AGREEMENT = 0.40
+#     real half days       0.543  0.681  0.698  0.732  0.742
+#     12:30 outage (sim)   0.315  0.471  0.507  0.534
+#
+# The populations TOUCH. A 12:30 outage and a 13:00 close contain nearly the
+# same bars, and enough names print their daily extremes before noon that a
+# morning-only record still agrees about half the time. No cut on this
+# statistic separates them, so the "calibrated" 0.40 was quietly exempting real
+# outages -- my second false all-clear in the same check.
+#
+# What actually distinguishes them is not in the price data at all: it is the
+# CALENDAR. US half days are published years ahead and number ~3/year, so the
+# list below is small, exact, and auditable. An early-looking session on a date
+# NOT in it is a FAULT, loudly -- so the failure mode of a stale list is a false
+# alarm, never a false all-clear.
+HALF_DAYS = frozenset(
+    {
+        dt.date(2023, 7, 3),
+        dt.date(2023, 11, 24),
+        dt.date(2024, 7, 3),
+        dt.date(2024, 11, 29),
+        dt.date(2024, 12, 24),
+        dt.date(2025, 7, 3),
+        dt.date(2025, 11, 28),
+        dt.date(2025, 12, 24),
+        # 2026 has NO July early close: July 4 falls on a Saturday, so the
+        # holiday is observed Friday July 3 and the market is shut, not short.
+        dt.date(2026, 11, 27),
+        dt.date(2026, 12, 24),
+    }
+)
+# EXTEND THE LIST as years roll over. Past this, a genuine half day reads
+# TRUNCATED and says so — annoying, and deliberately the safe direction.
+HALF_DAY_CALENDAR_THROUGH = dt.date(2026, 12, 31)
 SESSION_OPEN_MINUTES = 9 * 60 + 30
 # A session is short if its last bar starts more than this many minutes before
 # the expected final slot. One bar of slack absorbs a venue's early close on a
@@ -1370,18 +1387,25 @@ def session_coverage(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
         # The half-day end is matched TIGHTLY (a window, not a floor). A floor
         # would swallow every real truncation between 13:00 and the close --
         # a feed dying at 14:00 must still be a fault.
-        # NOMINATED by the timestamp, CONFIRMED by daily-bar agreement.
+        # NOMINATED by the timestamp, CONFIRMED by the calendar. Never by the
+        # data: a 12:30 outage and a 13:00 close look the same in the bars.
         nominated = (frame["last_minute"] - early_close_last).abs() <= TRUNCATION_SLACK_MINUTES
-        agreement = con.execute(
-            f"""
-            SELECT date, avg(CASE WHEN agrees THEN 1.0 ELSE 0.0 END) AS agree_frac
-            FROM ({session_agreement_sql(interval)}) GROUP BY date
-            """
-        ).fetchdf()
-        frame = frame.merge(agreement, on="date", how="left")
-        # A day with no daily bar to check against is UNVERIFIED, not agreed.
-        frame["agree_frac"] = frame["agree_frac"].fillna(0.0)
-        half = nominated & (frame["agree_frac"] >= EARLY_CLOSE_MIN_AGREEMENT)
+        dates = pd.to_datetime(frame["date"]).dt.date
+        is_half_day = dates.isin(HALF_DAYS)
+        half = nominated & is_half_day
+        # A stale calendar produces false ALARMS, not false all-clears — but an
+        # unexplained alarm is how a check gets ignored, so it explains itself.
+        unknown = nominated & ~is_half_day & (dates > HALF_DAY_CALENDAR_THROUGH)
+        if unknown.any():
+            logger.warning(
+                "%s: %d session(s) end exactly at the 13:00 half-day bar but fall past "
+                "the half-day calendar (through %s): %s. Reported as TRUNCATED. If these "
+                "are real early closes, extend intraday.HALF_DAYS",
+                interval,
+                int(unknown.sum()),
+                HALF_DAY_CALENDAR_THROUGH,
+                ", ".join(str(d) for d in dates[unknown][:5]),
+            )
         frame["early_close"] = half & ~full
         frame["truncated"] = ~(full | half)
         # A session can also lose its FRONT, and nothing here could see it:
@@ -1407,7 +1431,6 @@ def session_coverage(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
                 "first_minute",
                 "trailing_median_symbols",
                 "expected_last_minute",
-                "agree_frac",
                 "early_close",
                 "truncated",
                 "late_open",

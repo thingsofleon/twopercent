@@ -656,7 +656,10 @@ rows, and turned "has 1h data" into "was picked before" — a cohort reaching
 
 POST-MERGE OPS, in order:
 1. `twopercent intraday --interval 1h --days 700` — the one-off backfill. The
-   nightly routine refreshes only 5 days; it will NOT build the history.
+   nightly routine refreshes only 5 days for 1h; it will NOT build the history.
+   (5m/1m keep re-asking their FULL window nightly — that re-ask is their
+   self-healing after a missed run, and shortening it to match 1h would quietly
+   remove it.)
 2. Re-benchmark the champion. `feature_set_version()` changes `24bd854eae74` →
    `67f45c5ed724`, which un-does all 56 recorded research configs (#110) and
    leaves the champion reference cross-feature-set until that re-run.
@@ -669,6 +672,19 @@ prevent — so it waits for the merge that makes the feature set real.
 And when the overnight loop re-sweeps those 56 configs on a new feature set, its
 "winner" is a best-of-56 on freshly-invalidated ground. Quote it with that
 attached, or not at all.
+
+**Half days are identified by CALENDAR, never by data.** Two failed attempts
+are recorded because both were false ALL-CLEARS, the failure this project ranks
+worst. (1) Classifying by last timestamp exempted any session ending 12:30 —
+and since 1h bars are hourly, that is every outage starting between 12:30 and
+13:30. (2) Confirming via daily-bar agreement does not work either, and not
+because the threshold was wrong: truncating real full sessions at 12:30 scores
+0.315–0.534 against genuine half days at 0.543–0.742. The populations TOUCH,
+because the two cases contain nearly the same bars and enough names print their
+extremes before noon. `intraday.HALF_DAYS` is an explicit list (~3 dates/year,
+published years ahead); a nominated session not on it is TRUNCATED and, past
+`HALF_DAY_CALENDAR_THROUGH`, says so and asks to be extended. A stale list
+therefore degrades to a false alarm, never to silence.
 
 **Coverage checks gained two states 2026-08-28.** A calendared 13:00 half day
 is `early_close`, NOT a fault: treated as a truncation it produced six

@@ -627,15 +627,26 @@ scale-invariant in price (`close*3` cancels exactly, leaving a 1.0e-13 float
 wide; measured margin on `close_vwap_gap` went 1.0e-13 → 1.3e-01. Every column
 was verified by injecting a leak into it ALONE and watching the canary fail.
 
-**MEASURED: they do not improve the picks.** Walk-forward, 12 folds, 250 test
-days, 3 seeds/arm: AUC +0.0019, lift +0.0023, p@20 +0.0009, p@5 +0.0000.
-An independent paired re-run (single process, per-fold pairing) put AUC at
-+0.0024, positive in 10/12 folds, t=3.47 p=0.005 — a real but tiny ranking
-gain that does NOT survive to the shipped metric: precision@20 day-paired
-p=0.24, precision@5 p=0.42. My first pass called this "adds nothing" off an
-unpaired seed-range comparison; that ruler is biased toward the null (the range
-of 3 draws is ~1.69σ) and the correction is recorded here rather than quietly
-fixed. LOCKED-IN: pair on folds/days and average over seeds — never compare a
+**MEASURED: a tiny ranking gain that does NOT reach the picks.** Paired
+walk-forward on the shipped code, one process, one feature frame, identical
+folds and seeds, 3 seeds averaged:
+
+| test | n | without | with | delta | positive | p |
+|---|---|---|---|---|---|---|
+| AUC, paired by FOLD | 12 | 0.72901 | 0.73124 | +0.00222 | 9/12 | 0.039 |
+| p@20, paired by DAY | 250 | 0.73560 | 0.73660 | +0.00100 | 114/250 | 0.76 |
+
+Read p=0.039 with the caution it deserves: 12 folds, two metrics examined, and
+no multiplicity correction — it is suggestive, not established. The picks metric
+is flatly null. An independent adversarial re-run agreed in direction and got a
+slightly stronger AUC result (+0.0024, 10/12 folds, p=0.005), which is the range
+of disagreement to expect between two implementations of the same test.
+
+My first pass called this "adds nothing", comparing a difference of MEANS
+against the unpaired RANGE of 3 seeds. That ruler is biased toward the null —
+the range of 3 iid draws is ~1.69σ, so a genuine ~1.5σ effect is guaranteed to
+look absent. The correction is recorded rather than quietly fixed.
+LOCKED-IN: pair on folds/days and average over seeds; never compare a
 difference of means against an unpaired range.
 
 1h is UNIVERSE-WIDE, unlike 5m/1m. Picks-only would have made the features NaN
@@ -643,11 +654,21 @@ for ~70% of the universe at predict time while the model trained on populated
 rows, and turned "has 1h data" into "was picked before" — a cohort reaching
 +2% at ~2x the base rate, i.e. a learnable feedback loop.
 
-POST-MERGE OPS: `feature_set_version()` changes `24bd854eae74` →
-`67f45c5ed724`, which un-does all 56 recorded research configs (#110) and makes
-the champion reference cross-feature-set until a re-benchmark. Re-benchmark the
-champion, and note the overnight loop will re-sweep 56 configs on a new feature
-set — a multiple-comparisons hazard worth watching rather than trusting.
+POST-MERGE OPS, in order:
+1. `twopercent intraday --interval 1h --days 700` — the one-off backfill. The
+   nightly routine refreshes only 5 days; it will NOT build the history.
+2. Re-benchmark the champion. `feature_set_version()` changes `24bd854eae74` →
+   `67f45c5ed724`, which un-does all 56 recorded research configs (#110) and
+   leaves the champion reference cross-feature-set until that re-run.
+
+The A/B above is deliberately NOT recorded in `experiments` yet. Recording a row
+under the new feature set from an unmerged branch would itself make the live
+champion reference cross-feature-set — the precise hazard #110 exists to
+prevent — so it waits for the merge that makes the feature set real.
+
+And when the overnight loop re-sweeps those 56 configs on a new feature set, its
+"winner" is a best-of-56 on freshly-invalidated ground. Quote it with that
+attached, or not at all.
 
 **Coverage checks gained two states 2026-08-28.** A calendared 13:00 half day
 is `early_close`, NOT a fault: treated as a truncation it produced six

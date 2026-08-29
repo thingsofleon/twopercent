@@ -30,6 +30,26 @@ from twopercent.scan import _THRESHOLD_EPSILON, DEFAULT_THRESHOLD, touch_event_p
 
 logger = logging.getLogger(__name__)
 
+# A regular 1h session is exactly 7 bars (09:30..15:30). Require ALL of them.
+#
+# This started as "require most of them" with a >=5 floor, and every weakening
+# of that idea turned out to admit a fabricated session shape:
+#   * a bar COUNT says nothing about WHICH bars. 1,948 real sessions clear a
+#     >=5 count with no 15:30 bar, so last_hour_drift described the 13:30 hour
+#     and close_volume_share divided by the wrong numerator.
+#   * adding "and the closing bar is present" still admits INTERIOR holes:
+#     14,181 real sessions have both ends and only 5-6 bars, so the VWAP and the
+#     session volume are computed over a day with an hour missing from the
+#     middle. Measured, they are a different population -- reach 29.9% vs 33.0%
+#     -- and the distortion has no known sign: close_volume_share is LOWER on
+#     them (0.200 vs 0.243), not inflated as a shrunken denominator would
+#     suggest, because the holed sessions are disproportionately illiquid names.
+#
+# Requiring the complete session costs 1.2% of otherwise-usable rows (97.7% ->
+# 96.5% coverage) and removes the whole class. A half day (4 bars) is therefore
+# NULL, which is correct: it is a different session, not a damaged one.
+INTRADAY_SESSION_BARS = 7
+INTRADAY_CLOSE_HOUR = 15
 MIN_HISTORY_DAYS = 20
 
 FEATURE_COLUMNS = [
@@ -52,6 +72,34 @@ FEATURE_COLUMNS = [
     "days_since_2pct",
     "volume_accel",
     "dist_52w_high",
+]
+
+# #79 phase 2: the SIGNAL day's intraday shape (1h bars). COMPUTED, CANARY-
+# WATCHED, and deliberately NOT model inputs.
+#
+# They are safe -- the timing survived four adversarial passes -- but they do
+# not pay for themselves yet. Paired walk-forward: AUC +0.0022 (p=0.039, best of
+# two metrics on 12 folds, no multiplicity correction) and NOTHING on what the
+# product ships (lift 2.0997 -> 2.1108, precision@20 p=0.76). Listing them here
+# would change feature_set_version(), which invalidates all 56 recorded research
+# configs (#110) and forces a champion re-benchmark -- a permanent cost for a
+# maybe.
+#
+# The measurement is also underpowered BY CONSTRUCTION and cannot yet settle it:
+# Yahoo serves ~730 days of 1h against a daily history reaching 2021, so these
+# are observable in only 21-36% of training rows in every fold. The decisive
+# test is both arms restricted to the intraday era (train from 2024-10-01),
+# where coverage is ~95%. Promoting them is one line plus a re-benchmark;
+# un-spending the research ledger is not, and that asymmetry is the whole
+# argument for waiting.
+#
+# They stay in the frame and in the canary's watch list so they cannot rot
+# silently while they wait.
+INTRADAY_FEATURE_COLUMNS = [
+    "close_vwap_gap",
+    "last_hour_drift",
+    "intraday_vol",
+    "close_volume_share",
 ]
 
 # Metadata, NOT a feature: trailing median volume over the last 20 bars
@@ -142,6 +190,32 @@ market AS (
     FROM daily_returns
     GROUP BY date
 ),
+intraday_day AS (
+    -- #79 phase 2. The SIGNAL day's own intraday shape, from 1h bars. Every
+    -- column below is an aggregate over bars of signal_date S ONLY, so all are
+    -- known at S's close -- the same standing as oc_return_today. The TARGET
+    -- day's intraday bars are never read; that would be the most direct
+    -- lookahead available in this codebase, which is why the lookahead canary
+    -- now mutates intraday_prices (it previously mutated only `prices`, so a
+    -- leak from here would have passed it VACUOUSLY).
+    --
+    -- 1h is the only interval deep enough to train on: the referee's standard
+    -- window is 12 months and 5m/1m reach ~53 and ~34 days.
+    SELECT
+        symbol,
+        date,
+        sum(close * volume) / nullif(sum(volume), 0) AS vwap,
+        count(*) AS bars,
+        stddev_samp((close - open) / nullif(open, 0)) AS intraday_vol,
+        last(close ORDER BY ts) AS last_close,
+        last((close - open) / nullif(open, 0) ORDER BY ts) AS last_bar_ret,
+        last(volume ORDER BY ts) AS last_bar_vol,
+        sum(volume) AS session_vol,
+        bool_or(EXTRACT(hour FROM ts) = {INTRADAY_CLOSE_HOUR}) AS has_close_bar
+    FROM intraday_prices
+    WHERE interval = '1h'
+    GROUP BY symbol, date
+),
 sector_day AS (
     SELECT
         d.date,
@@ -186,15 +260,105 @@ SELECT
     s.days_since_2pct,
     s.volume_accel,
     s.dist_52w_high,
+    -- Phase-2 intraday features. NULL wherever the signal day has no 1h
+    -- record, which is most of history until the backfill completes -- the
+    -- existing dropped-column semantics already handle a column the model
+    -- cannot use, loudly.
+    CASE WHEN i.bars = {INTRADAY_SESSION_BARS} AND i.has_close_bar
+         THEN (i.last_close - i.vwap) / nullif(i.vwap, 0) END AS close_vwap_gap,
+    CASE WHEN i.bars = {INTRADAY_SESSION_BARS} AND i.has_close_bar
+         THEN i.last_bar_ret END AS last_hour_drift,
+    CASE WHEN i.bars = {INTRADAY_SESSION_BARS} AND i.has_close_bar
+         THEN i.intraday_vol END AS intraday_vol,
+    CASE WHEN i.bars = {INTRADAY_SESSION_BARS} AND i.has_close_bar
+         THEN i.last_bar_vol / nullif(i.session_vol, 0) END AS close_volume_share,
     s.median_vol_20,
     s.history_days
 FROM per_symbol s
 JOIN market m ON s.date = m.date
 LEFT JOIN latest_universe u USING (symbol)
 LEFT JOIN sector_day sd ON sd.date = s.date AND sd.sector = u.sector
+LEFT JOIN intraday_day i ON i.symbol = s.symbol AND i.date = s.date
 WHERE s.date >= ? AND s.date <= ?
 ORDER BY s.date, s.symbol
 """
+
+
+def _warn_intraday_coverage(out: pd.DataFrame) -> None:
+    """Say out loud how much of the frame has NO intraday features, and why.
+
+    CLAUDE.md: anything that skips or filters must warn loudly about what it
+    excluded. But loudly is not the same as constantly, and this warning has to
+    survive the alarm-fatigue test the doctor's checks just failed twice.
+
+    So it separates two populations that mean opposite things:
+
+      * STRUCTURAL -- signal dates before the provider's 1h horizon. Daily
+        history reaches 2021-07 and Yahoo serves ~730 days of 1h, so roughly
+        63% of the frame can NEVER have these features. Nothing is wrong and
+        nothing can be done; a standing 63% WARNING on every single call would
+        train the operator to ignore the line that also carries the real news.
+        Reported once, at INFO, as a fact about the data.
+
+      * RECENT -- dates the 1h capture was supposed to cover and did not. THIS
+        is the one that decays forward: it is what a stopped capture, a
+        picks-only regression, or a provider outage looks like, and it is worth
+        a WARNING every time it appears.
+    """
+    if out.empty:
+        return
+    missing = out["close_vwap_gap"].isna()
+    if not missing.any():
+        return
+    signal = pd.to_datetime(out["signal_date"])
+    covered = signal[~missing]
+    if covered.empty:
+        logger.warning(
+            "intraday features are unavailable on ALL %d rows — the 1h capture has "
+            "never run, or its record does not overlap this frame (build it with "
+            "`twopercent intraday --interval 1h --days 700`)",
+            len(out),
+        )
+        return
+
+    horizon = covered.min()
+    structural = missing & (signal < horizon)
+    recent = missing & (signal >= horizon)
+    if structural.any():
+        logger.info(
+            "intraday features are structurally absent before %s on %d of %d rows "
+            "(%.0f%%): the provider serves ~730 days of 1h and daily history is "
+            "longer — expected, not a fault",
+            horizon.date(),
+            int(structural.sum()),
+            len(out),
+            100.0 * structural.mean(),
+        )
+    if not recent.any():
+        return
+
+    in_era = signal >= horizon
+    by_day = recent.groupby(signal.dt.date).sum()
+    day_totals = in_era.groupby(signal.dt.date).sum()
+    blank = by_day[(day_totals > 0) & (by_day == day_totals)]
+    detail = ""
+    if len(blank):
+        shown = ", ".join(str(d) for d in list(blank.index)[:5])
+        detail = (
+            f"; {len(blank)} day(s) since {horizon.date()} have NO usable 1h session "
+            f"for ANY symbol ({shown}{', ...' if len(blank) > 5 else ''})"
+        )
+    logger.warning(
+        "intraday features missing on %d of %d rows (%.1f%%) INSIDE the covered era "
+        "(since %s): no 1h record, or a session that is not a complete %d-bar "
+        "regular session%s",
+        int(recent.sum()),
+        int(in_era.sum()),
+        100.0 * recent.sum() / max(int(in_era.sum()), 1),
+        horizon.date(),
+        INTRADAY_SESSION_BARS,
+        detail,
+    )
 
 
 def feature_set_version() -> str:
@@ -241,6 +405,7 @@ def feature_frame(
             MIN_HISTORY_DAYS,
         )
     out = df[~thin].drop(columns="history_days").reset_index(drop=True)
+    _warn_intraday_coverage(out)
     nan_sector = out["sector_breadth"].isna()
     if not out.empty and nan_sector.all():
         logger.warning(

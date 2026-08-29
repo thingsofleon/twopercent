@@ -157,13 +157,77 @@ def seed_history(
     return df
 
 
+def seed_intraday(con, symbols: list[str], dates, interval: str = "1h", bars: int = 7):
+    """Seed a full intraday session per symbol-day, shaped so every phase-2
+    feature is LIVE (non-NaN) and VARIES across symbols and days.
+
+    Without this the canary compares NaN to NaN for the intraday features and
+    passes vacuously — the exact failure the notna() guards exist to catch. The
+    per-bar drift and volume ramp differ by symbol and day so close_vwap_gap,
+    last_hour_drift, intraday_vol and close_volume_share are all multi-valued
+    (a constant column crashes sklearn's binner; see CLAUDE.md).
+
+    TWO of the four columns are invariant to a UNIFORM scaling, so the canary's
+    mutation has to be non-uniform to detect them at all:
+      * close_volume_share is a volume RATIO -- volume*k cancels exactly.
+      * close_vwap_gap is scale-invariant in PRICE -- close*k cancels exactly,
+        leaving the volume weights as the only lever.
+    Hence the wide per-bar volume spread below and the per-bar multiplier in the
+    canary's UPDATE. Both were verified by injecting a leak into each column
+    ALONE and confirming the canary fails.
+    """
+    import datetime as _dt
+
+    from twopercent import store as _store
+
+    rows = []
+    for si, sym in enumerate(symbols):
+        for di, day in enumerate(dates):
+            base = 100.0 + si
+            for b in range(bars):
+                drift = 0.002 * (b + 1) * (1 + 0.1 * si) * (1 + 0.05 * (di % 3))
+                o = base * (1 + drift)
+                c = base * (1 + drift + 0.001 * ((b + si) % 3 + 1))
+                rows.append(
+                    {
+                        "symbol": sym,
+                        "ts": _dt.datetime.combine(day, _dt.time(9, 30))
+                        + _dt.timedelta(minutes=60 * b),
+                        "date": day,
+                        "interval": interval,
+                        "open": o,
+                        "high": max(o, c) * 1.002,
+                        "low": min(o, c) * 0.998,
+                        "close": c,
+                        # WIDE per-bar spread (1x .. 64x across the session), not
+                        # a gentle ramp. close_vwap_gap is exactly scale-invariant
+                        # in price -- close*k cancels in (last_close - vwap)/vwap --
+                        # so the canary can only catch a leak there via the volume
+                        # REWEIGHTING of the VWAP. On a flat ramp that margin was
+                        # ~1e-5, caught only through float noise in the 13th digit.
+                        "volume": 10_000 * (2**b) + 100 * si + 10 * (di % 5),
+                    }
+                )
+    frame = pd.DataFrame(rows)
+    _store.connect  # noqa: B018 - keep the import meaningful for readers
+    con.register("_seed_intraday", frame)
+    con.execute("INSERT INTO intraday_prices SELECT * FROM _seed_intraday")
+    con.unregister("_seed_intraday")
+    return frame
+
+
 # Slight deterministic variation keeps every feature column multi-valued
 # (sklearn's binner rejects constant columns).
 RUNNER_OC = [0.03 + 0.001 * (i % 5) for i in range(100)]  # +3.0–3.4% every day
 FLAT_OC = [0.002 + 0.001 * (i % 3) for i in range(100)]  # +0.2–0.4%, never 2%
 
 
-def seed_planted(con, n_each: int = 30, universe_symbols: list[str] | None = None) -> list[str]:
+def seed_planted(
+    con,
+    n_each: int = 30,
+    universe_symbols: list[str] | None = None,
+    with_intraday: bool = True,
+) -> list[str]:
     """Planted-signal history: RUN* symbols do +2% every day, FLT* never do.
 
     universe_symbols restricts which symbols get a universe row (default all);
@@ -189,6 +253,15 @@ def seed_planted(con, n_each: int = 30, universe_symbols: list[str] | None = Non
         ),
         as_of=pd.Timestamp("2026-06-01").date(),
     )
+    if with_intraday:
+        # Phase-2 intraday features are all-NaN without this, so the strategies
+        # drop them loudly and a test named "silent when all features observed"
+        # would be asserting the opposite of its name. Off only for tests that
+        # deliberately exercise the dropped-column path.
+        days = [
+            r[0] for r in con.execute("SELECT DISTINCT date FROM prices ORDER BY date").fetchall()
+        ]
+        seed_intraday(con, list(data), days)
     return list(data)
 
 

@@ -578,8 +578,7 @@ POST-MERGE OPS: re-run `twopercent benchmark` (records symbol), then
 `twopercent intraday`. LIMITS, measured not assumed: Yahoo serves ~60 TRADING days
 of 5m bars, so the SIM row's earlier history can NEVER be resolved; and ~29% of
 ambiguous days have both triggers inside ONE 5m bar, which no amount of backfill
-fixes. Phase 2 (prior-day intraday FEATURES) is NOT built — it additionally
-requires extending the lookahead canary to mutate `intraday_prices`.
+fixes. Phase 2 (prior-day intraday FEATURES) is BUILT — see below.
 
 **Cross-checked 2026-08-10** (1m vs 5m) — and the check is WEAKER than it first
 appeared, so read the limits before quoting it. 5m is a server-side RESAMPLE of
@@ -608,6 +607,139 @@ Both intervals are captured by the score routine daily, because 5m expires at
 ~60 calendar days and 1m at ~30 — intraday_prices is the one table a re-run
 cannot rebuild (though the daily full-window refetch does give ~20 trading days
 of slack, so a single missed run is not fatal).
+
+**Implemented 2026-08-28** (#79 phase 2): four features from the SIGNAL day's
+own 1h session — `close_vwap_gap`, `last_hour_drift`, `intraday_vol`,
+`close_volume_share` — each an aggregate over bars of date S only, never the
+target day. 1h because it is the only interval deep enough to train on (5m/1m
+reach 53 and 34 days); limits measured, not guessed: `-729d` returns bars,
+`-750d` is empty, one request serves 365 days and 730 is empty, so 700/350
+keeps margin from both boundaries. Backfill landed 9,361,414 bars / 3,132
+symbols / 480 trading days (2024-09-30 →), 97% frame coverage.
+
+THE CANARY NOW MUTATES `intraday_prices`, discharging the warning phase 1 left
+standing. It needed more than adding the table: the seeded store had no
+intraday rows, so the four columns compared NaN to NaN and passed vacuously;
+and TWO columns are invariant to a uniform scaling — `close_volume_share` is a
+volume ratio (`volume*7` left it byte-identical) and `close_vwap_gap` is
+scale-invariant in price (`close*3` cancels exactly, leaving a 1.0e-13 float
+-noise margin). The mutation is now non-uniform and the seeded volume spread
+wide; measured margin on `close_vwap_gap` went 1.0e-13 → 1.3e-01. Every column
+was verified by injecting a leak into it ALONE and watching the canary fail.
+
+**MEASURED: a tiny ranking gain that does NOT reach the picks.** Paired
+walk-forward on the shipped code, one process, one feature frame, identical
+folds and seeds, 3 seeds averaged:
+
+| test | n | without | with | delta | positive | p |
+|---|---|---|---|---|---|---|
+| AUC, paired by FOLD | 12 | 0.72901 | 0.73124 | +0.00222 | 9/12 | 0.039 |
+| p@20, paired by DAY | 250 | 0.73560 | 0.73660 | +0.00100 | 114/250 | 0.76 |
+
+Read p=0.039 with the caution it deserves: 12 folds, two metrics examined, and
+no multiplicity correction — it is suggestive, not established. The picks metric
+is flatly null. An independent adversarial re-run agreed in direction and got a
+slightly stronger AUC result (+0.0024, 10/12 folds, p=0.005), which is the range
+of disagreement to expect between two implementations of the same test.
+
+My first pass called this "adds nothing", comparing a difference of MEANS
+against the unpaired RANGE of 3 seeds. That ruler is biased toward the null —
+the range of 3 iid draws is ~1.69σ, so a genuine ~1.5σ effect is guaranteed to
+look absent. The correction is recorded rather than quietly fixed.
+LOCKED-IN: pair on folds/days and average over seeds; never compare a
+difference of means against an unpaired range.
+
+1h is UNIVERSE-WIDE, unlike 5m/1m. Picks-only would have made the features NaN
+for ~70% of the universe at predict time while the model trained on populated
+rows, and turned "has 1h data" into "was picked before" — a cohort reaching
++2% at ~2x the base rate, i.e. a learnable feedback loop.
+
+**DECIDED 2026-08-29: the four are COMPUTED and CANARY-WATCHED but NOT model
+inputs.** `features.INTRADAY_FEATURE_COLUMNS` holds them; `FEATURE_COLUMNS`
+does not. `feature_set_version()` therefore stays `24bd854eae74`, byte-identical
+to main — all 56 recorded research configs remain valid and no champion
+re-benchmark is forced.
+
+The reasoning, so it is not re-litigated from scratch: they are SAFE (the timing
+survived four adversarial passes) but do not PAY yet (AUC +0.0022 at p=0.039,
+best of two metrics on 12 folds with no multiplicity correction; nothing on
+lift, 2.0997 → 2.1108). Promotion is one line plus a re-benchmark; un-spending
+the ledger is not, and that asymmetry decided it.
+
+The evidence is also underpowered BY CONSTRUCTION, so this is "not yet", not
+"they do not work": Yahoo serves ~730 days of 1h against daily history reaching
+2021, so the columns are observable in only 21–36% of training rows per fold.
+**The decisive follow-up is both arms restricted to the intraday era (train from
+2024-10-01), where coverage is ~95%.** File that before promoting or dropping.
+
+The canary watches them despite their being unused — keying that list on
+`FEATURE_COLUMNS` alone would have silently dropped the four most leak-prone
+columns in the frame the moment they were held back.
+
+POST-MERGE OPS, in order:
+1. `twopercent intraday --interval 1h --days 700` — the one-off backfill. The
+   nightly routine refreshes only 10 days for 1h; it will NOT build the history.
+   (5m/1m keep re-asking their FULL window nightly — that re-ask is their
+   self-healing after a missed run, and shortening it to match 1h would quietly
+   remove it.)
+2. Nothing else. No re-benchmark, no ledger invalidation — that is precisely
+   what holding them out buys.
+
+If they are ever promoted: the fingerprint moves to `67f45c5ed724`, the 56
+configs re-open, and the overnight loop's next "winner" is a best-of-56 on
+freshly-invalidated ground. Quote it with that attached, or not at all.
+
+**Half days are identified by CALENDAR, never by data.** Two failed attempts
+are recorded because both were false ALL-CLEARS, the failure this project ranks
+worst. (1) Classifying by last timestamp exempted any session ending 12:30 —
+and since 1h bars are hourly, that is every outage starting between 12:30 and
+13:30. (2) Confirming via daily-bar agreement does not work either, and not
+because the threshold was wrong: truncating real full sessions at 12:30 scores
+0.315–0.534 against genuine half days at 0.543–0.742. The populations TOUCH,
+because the two cases contain nearly the same bars and enough names print their
+extremes before noon. `intraday.HALF_DAYS` is an explicit list (~3 dates/year,
+published years ahead); a nominated session not on it is TRUNCATED and, past
+`HALF_DAY_CALENDAR_THROUGH`, says so and asks to be extended. A stale list
+therefore degrades to a false alarm, never to silence.
+
+**Both ends of a session use the MEDIAN across symbols.** `max(last_minute)`
+was the mirror of the `min(first_minute)` hole and survived the fix that closed
+it: 47 of 50 symbols dying at 11:30 with 3 printing to 15:30 loses 54% of the
+day's bars and fires nothing — not truncated, not thin (the symbol count is
+untouched; only bars vanish). The median is stable on real data: 930 on all 473
+normal days, 690 on all five half days, zero spread p01–p99. The CALENDAR picks
+which expectation applies; a half day is not a softer test, it is a different
+one. Half days expect 690, one bar earlier than the last bar starting before
+13:00 — measured, because that 12:30 bar covers 30 minutes of a low-volume
+session and most names never print it, unlike the equally partial 15:30 bar
+that the closing auction fills.
+
+**The feature gate requires a COMPLETE session (7 bars), not "most of one".**
+Every weakening admitted a fabricated shape: a bar count says nothing about
+WHICH bars (1,948 sessions clear ≥5 with no 15:30 bar), and adding the closing
+bar still admits INTERIOR holes (14,181 sessions have both ends and 5–6 bars,
+so the VWAP and session volume span a day with an hour missing from the middle).
+They are a different population — reach 29.9% vs 33.0% — and the distortion has
+no known sign: `close_volume_share` is LOWER on them (0.200 vs 0.243), not
+inflated as a shrunken denominator would suggest, because they skew illiquid.
+Cost is 1.2% of usable rows (97.5% → 96.3% coverage).
+
+**The canary now RESHAPES the future, not just its values.** `bars` and
+`has_close_bar` are selected columns one keystroke from a feature expression,
+and a feature reading them off the target day passed the value-mutation
+unchanged (7.0 stays 7.0) — a leak that would be genuinely predictive, since a
+complete session tracks liquidity and activity. The canary now also DELETEs the
+future's closing bars. Verified by injecting exactly that leak.
+
+**Coverage checks gained two states 2026-08-28.** A calendared 13:00 half day
+is `early_close`, NOT a fault: treated as a truncation it produced six
+permanent, unclearable doctor problems, the same alarm-fatigue trap as #94 and
+the 1m boundary. And `LATE_OPEN` is new — 2026-02-02 lost 09:30–12:30
+market-wide while still closing at 15:30, so every existing check read it clean;
+a `min()` over first bars was defeated by three names that did print at 09:30,
+so the morning statistic is the MEDIAN across symbols while the closing one
+stays `max` (feed liveness). Measured over 480 sessions: flags exactly
+2026-01-30 (TRUNCATED) and 2026-02-02 (LATE_OPEN), adds nothing on 5m/1m.
 
 ## Status
 

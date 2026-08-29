@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 
 from tests.conftest import seed_history
-from twopercent import intraday, strategy
+from twopercent import intraday, scan, store, strategy
 
 # Well inside seed_history's default 40 business days from 2026-01-05, so the
 # session has the prior bars daily_returns' glitch guard needs.
@@ -798,3 +798,269 @@ def test_a_span_never_exceeds_its_interval_request_cap():
         limits = intraday.spec(interval)
         assert limits["span"] <= limits["lookback"]
         assert limits["span"] > 0 and limits["minutes"] > 0
+
+
+def test_picked_symbols_bounds_each_interval_by_its_own_retention_window(con):
+    """A deep-lookback interval must not inflate the shallow ones' symbol list.
+
+    #94 bounded picked_symbols to the retention window because every extra
+    symbol costs requests on a rate-limited provider. That bound was
+    `max(lookback)` across ALL specs, so adding the 1h spec (700 days) silently
+    became the horizon for 5m (60) and 1m (25) too -- doubling the symbol count
+    on the two captures that CANNOT be rebuilt after their window closes, for
+    names that have no fetchable bars at those intervals anyway.
+
+    There was no test on picked_symbols at all, which is exactly why that was
+    invisible. This is it.
+    """
+    today = dt.date.today()
+    rows = pd.DataFrame(
+        {
+            "strategy": ["baseline_gbm_v1"] * 2,
+            # One pick inside every window, one only 1h could ever want.
+            "signal_date": [today - dt.timedelta(days=3), today - dt.timedelta(days=400)],
+            "symbol": ["FRESH", "OLD1H"],
+            "prob": [0.9, 0.9],
+            "rank": [1, 1],
+            "created_ts": [pd.Timestamp("2026-08-28")] * 2,
+            "universe_as_of": [today] * 2,
+            "event": [scan.TOUCH_EVENT] * 2,
+        }
+    )
+    con.register("_picks", rows)
+    con.execute("INSERT INTO predictions BY NAME SELECT * FROM _picks")
+    con.unregister("_picks")
+
+    assert intraday.picked_symbols(con, interval="1m") == ["FRESH"]
+    assert intraday.picked_symbols(con, interval="5m") == ["FRESH"]
+    # Only the deep interval reaches back far enough to want the old pick.
+    assert sorted(intraday.picked_symbols(con, interval="1h")) == ["FRESH", "OLD1H"]
+
+
+def test_1h_captures_the_universe_while_5m_and_1m_stay_picks_only(con):
+    """1h feeds FEATURES, so it must cover every symbol the model SCORES.
+
+    Left picks-only, the phase-2 columns would go NaN for ~70% of the universe
+    at predict time while the model trained on rows where they were populated,
+    and "has 1h data" would decay into "was picked by this model before" — a
+    cohort reaching +2% at roughly twice the base rate, i.e. a feedback loop the
+    model can learn. 5m/1m stay picks-only: they serve the explorer, and every
+    extra symbol is a request on a rate-limited provider.
+    """
+    today = dt.date.today()
+    universe = pd.DataFrame(
+        {
+            "symbol": ["PICKED", "NEVERPICKED"],
+            "name": ["a", "b"],
+            "market_cap": [2e9, 1e9],
+            "sector": ["Tech", "Tech"],
+        }
+    )
+    store.upsert_universe(con, universe, as_of=today)
+    picks = pd.DataFrame(
+        {
+            "strategy": ["baseline_gbm_v1"],
+            "signal_date": [today - dt.timedelta(days=2)],
+            "symbol": ["PICKED"],
+            "prob": [0.9],
+            "rank": [1],
+            "created_ts": [pd.Timestamp("2026-08-28")],
+            "universe_as_of": [today],
+            "event": [scan.TOUCH_EVENT],
+        }
+    )
+    con.register("_p", picks)
+    con.execute("INSERT INTO predictions BY NAME SELECT * FROM _p")
+    con.unregister("_p")
+
+    for interval in ("5m", "1m"):
+        symbols, scope = intraday.capture_symbols(con, interval)
+        assert symbols == ["PICKED"], f"{interval} must stay picks-only"
+        assert scope == "picked"
+
+    symbols, scope = intraday.capture_symbols(con, "1h")
+    assert sorted(symbols) == ["NEVERPICKED", "PICKED"]
+    assert scope == "universe"
+
+
+def _seed_session(con, symbols, day, hours, interval="1h"):
+    rows = pd.DataFrame(
+        [
+            {
+                "symbol": sym,
+                "ts": dt.datetime.combine(day, dt.time(h, 30)),
+                "date": day,
+                "interval": interval,
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "volume": 1_000,
+            }
+            for sym in symbols
+            for h in hours
+        ]
+    )
+    con.register("_s", rows)
+    con.execute("INSERT INTO intraday_prices SELECT * FROM _s")
+    con.unregister("_s")
+
+
+def test_a_calendared_half_day_is_not_a_coverage_fault(con):
+    """A 13:00 half day ends three hours early BY DESIGN.
+
+    Treated as a truncation it produced six permanent, unclearable doctor
+    problems — a check that cries wolf forever teaches the operator to ignore
+    it, the same alarm-fatigue trap #94 and the 1m boundary already cost us.
+    """
+    syms = [f"S{i:02d}" for i in range(10)]
+    full, half = dt.date(2025, 11, 26), dt.date(2025, 11, 28)  # a REAL half day
+    _seed_session(con, syms, full, [9, 10, 11, 12, 13, 14, 15])
+    _seed_session(con, syms, half, [9, 10, 11, 12])  # last bar 12:30, a 13:00 close
+
+    cov = intraday.session_coverage(con)
+    # session_coverage returns DATE as datetime64; comparing it to a
+    # datetime.date matches nothing SILENTLY (the trap this project keeps
+    # re-hitting). Normalise both sides.
+    row = cov[pd.to_datetime(cov["date"]).dt.date == half].iloc[0]
+    assert row["early_close"] and not row["truncated"]
+    bad = intraday.coverage_problems(con)
+    assert half not in set(pd.to_datetime(bad["date"]).dt.date)
+
+
+def test_an_outage_that_mimics_a_half_day_is_still_a_fault(con):
+    """The dangerous half of accepting half days: a FALSE ALL-CLEAR.
+
+    1h bars are hourly, so ANY outage beginning between 12:30 and 13:30 leaves
+    12:30 as the last bar — indistinguishable from a 13:00 close by timestamp
+    alone, and a full hour of onset times silently exempted on the one table a
+    re-run cannot rebuild.
+
+    It is equally indistinguishable from the DATA. Truncating real full sessions
+    at 12:30 gives agreement 0.315–0.534 against genuine half days at
+    0.543–0.742 — populations that touch, because the two cases contain nearly
+    the same bars and enough names print their extremes before noon. Only the
+    calendar separates them.
+    """
+    syms = [f"S{i:02d}" for i in range(10)]
+    half = dt.date(2025, 11, 28)  # in HALF_DAYS
+    outage = dt.date(2025, 12, 3)  # an ordinary Wednesday
+    assert outage not in intraday.HALF_DAYS
+    _seed_session(con, syms, half, [9, 10, 11, 12])
+    _seed_session(con, syms, outage, [9, 10, 11, 12])  # IDENTICAL bars
+
+    cov = intraday.session_coverage(con)
+    by_day = dict(zip(pd.to_datetime(cov["date"]).dt.date, cov.to_dict("records"), strict=True))
+    assert by_day[half]["early_close"] and not by_day[half]["truncated"]
+    assert by_day[outage]["truncated"] and not by_day[outage]["early_close"]
+    assert outage in set(pd.to_datetime(intraday.coverage_problems(con)["date"]).dt.date)
+
+
+def test_a_half_day_past_the_calendar_fails_loudly_and_says_why(con, caplog):
+    """A stale calendar must degrade to a false ALARM that explains itself,
+    never to silence."""
+    syms = [f"S{i:02d}" for i in range(10)]
+    beyond = dt.date(2029, 11, 23)
+    assert beyond > intraday.HALF_DAY_CALENDAR_THROUGH
+    # The shape a REAL half day has: measured, they end at 11:30, not 12:30.
+    _seed_session(con, syms, beyond, [9, 10, 11])
+    with caplog.at_level("WARNING"):
+        cov = intraday.session_coverage(con)
+    row = cov[pd.to_datetime(cov["date"]).dt.date == beyond].iloc[0]
+    assert row["truncated"] and not row["early_close"]
+    assert "extend intraday.HALF_DAYS" in caplog.text
+
+
+def test_a_feed_that_dies_mid_session_is_still_truncated(con):
+    """Accepting the half-day end must not accept every short session."""
+    syms = [f"S{i:02d}" for i in range(10)]
+    good, dead = dt.date(2026, 3, 2), dt.date(2026, 3, 3)
+    _seed_session(con, syms, good, [9, 10, 11, 12, 13, 14, 15])
+    _seed_session(con, syms, dead, [9, 10])  # feed died at 10:30 — neither end
+
+    cov = intraday.session_coverage(con)
+    row = cov[pd.to_datetime(cov["date"]).dt.date == dead].iloc[0]
+    assert row["truncated"] and not row["early_close"]
+    assert intraday.coverage_verdict(row) == "TRUNCATED"
+
+
+def test_a_session_missing_its_morning_is_caught_despite_stragglers(con):
+    """2026-02-02 lost 09:30–12:30 market-wide yet closed at 15:30.
+
+    Every existing check read it clean: the last bar was on time, the symbol
+    count was normal, and a handful of names DID print at 09:30 — so a min()
+    over first bars saw 09:30 and shrugged. The statistic has to be robust.
+    """
+    syms = [f"S{i:02d}" for i in range(20)]
+    good, gap = dt.date(2026, 3, 2), dt.date(2026, 3, 3)
+    _seed_session(con, syms, good, [9, 10, 11, 12, 13, 14, 15])
+    _seed_session(con, syms[:2], gap, [9, 10, 11, 12, 13, 14, 15])  # the stragglers
+    _seed_session(con, syms[2:], gap, [13, 14, 15])  # everyone else: afternoon only
+
+    cov = intraday.session_coverage(con)
+    row = cov[pd.to_datetime(cov["date"]).dt.date == gap].iloc[0]
+    assert row["late_open"], "a market-wide missing morning must be a fault"
+    assert not row["truncated"], "it closed on time — that is not a truncation"
+    assert intraday.coverage_verdict(row) == "LATE_OPEN"
+    bad = intraday.coverage_problems(con)
+    assert gap in set(pd.to_datetime(bad["date"]).dt.date)
+
+
+def test_the_nightly_capture_refreshes_a_short_window_not_the_whole_retention(con, monkeypatch):
+    """The nightly run must not re-pull the full retention window.
+
+    The retention window is how far back the provider will SERVE; it is not how
+    far back a nightly run should ASK. Pulling 1h's 700 days for the whole
+    universe every night is a ~10x provider load AND silently rewrites two years
+    of feature history as the provider revises bars — so a recorded experiment
+    would stop reproducing run to run.
+
+    No test covered the routine's intraday step at all, which is how both this
+    and the symbol-scope regression stayed invisible.
+    """
+    from twopercent import routine
+
+    calls = []
+
+    def fake_ingest(_con, symbols, start, end, interval):
+        calls.append({"interval": interval, "symbols": list(symbols), "start": start, "end": end})
+        return intraday.IngestResult(interval=interval, symbols_requested=len(symbols))
+
+    monkeypatch.setattr(intraday, "ingest", fake_ingest)
+    monkeypatch.setattr(intraday, "coverage_problems", lambda _con: pd.DataFrame())
+    store.upsert_universe(
+        con,
+        pd.DataFrame({"symbol": ["AAA"], "name": ["a"], "market_cap": [1e9], "sector": ["Tech"]}),
+        as_of=dt.date.today(),
+    )
+    picks = pd.DataFrame(
+        {
+            "strategy": ["baseline_gbm_v1"],
+            "signal_date": [dt.date.today() - dt.timedelta(days=2)],
+            "symbol": ["AAA"],
+            "prob": [0.9],
+            "rank": [1],
+            "created_ts": [pd.Timestamp("2026-08-28")],
+            "universe_as_of": [dt.date.today()],
+            "event": [scan.TOUCH_EVENT],
+        }
+    )
+    con.register("_p", picks)
+    con.execute("INSERT INTO predictions BY NAME SELECT * FROM _p")
+    con.unregister("_p")
+
+    report = routine.RoutineReport()
+    routine._intraday_step(report, con)
+
+    assert {c["interval"] for c in calls} == set(intraday.INTERVALS)
+    by_interval = {c["interval"]: (c["end"] - c["start"]).days for c in calls}
+    # 1h is universe-wide: a nightly re-ask of its retention window would rewrite
+    # two years of feature history every night.
+    assert by_interval["1h"] == intraday.spec("1h")["refresh"] < intraday.spec("1h")["lookback"]
+    # 5m/1m are picks-only, and re-asking their whole window IS their
+    # self-healing after a missed run — do not "optimise" it away.
+    for interval in ("5m", "1m"):
+        assert by_interval[interval] == intraday.spec(interval)["lookback"], (
+            f"{interval} must keep re-asking its full window; that is how a "
+            "missed run repairs itself on a table a re-run cannot rebuild"
+        )

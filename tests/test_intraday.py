@@ -965,7 +965,7 @@ def test_an_outage_that_mimics_a_half_day_is_still_a_fault(con):
     _seed_session(con, syms, outage, [9, 10, 11, 12])  # identical timestamps
 
     cov = intraday.session_coverage(con)
-    by_day = {d: r for d, r in zip(pd.to_datetime(cov["date"]).dt.date, cov.to_dict("records"))}
+    by_day = dict(zip(pd.to_datetime(cov["date"]).dt.date, cov.to_dict("records"), strict=True))
     assert by_day[half]["early_close"] and not by_day[half]["truncated"]
     assert by_day[outage]["truncated"] and not by_day[outage]["early_close"]
     assert outage in set(pd.to_datetime(intraday.coverage_problems(con)["date"]).dt.date)

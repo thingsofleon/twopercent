@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 
 from tests.conftest import seed_history
-from twopercent import intraday, strategy
+from twopercent import intraday, scan, store, strategy
 
 # Well inside seed_history's default 40 business days from 2026-01-05, so the
 # session has the prior bars daily_returns' glitch guard needs.
@@ -798,3 +798,166 @@ def test_a_span_never_exceeds_its_interval_request_cap():
         limits = intraday.spec(interval)
         assert limits["span"] <= limits["lookback"]
         assert limits["span"] > 0 and limits["minutes"] > 0
+
+
+def test_picked_symbols_bounds_each_interval_by_its_own_retention_window(con):
+    """A deep-lookback interval must not inflate the shallow ones' symbol list.
+
+    #94 bounded picked_symbols to the retention window because every extra
+    symbol costs requests on a rate-limited provider. That bound was
+    `max(lookback)` across ALL specs, so adding the 1h spec (700 days) silently
+    became the horizon for 5m (60) and 1m (25) too -- doubling the symbol count
+    on the two captures that CANNOT be rebuilt after their window closes, for
+    names that have no fetchable bars at those intervals anyway.
+
+    There was no test on picked_symbols at all, which is exactly why that was
+    invisible. This is it.
+    """
+    today = dt.date.today()
+    rows = pd.DataFrame(
+        {
+            "strategy": ["baseline_gbm_v1"] * 2,
+            # One pick inside every window, one only 1h could ever want.
+            "signal_date": [today - dt.timedelta(days=3), today - dt.timedelta(days=400)],
+            "symbol": ["FRESH", "OLD1H"],
+            "prob": [0.9, 0.9],
+            "rank": [1, 1],
+            "created_ts": [pd.Timestamp("2026-08-28")] * 2,
+            "universe_as_of": [today] * 2,
+            "event": [scan.TOUCH_EVENT] * 2,
+        }
+    )
+    con.register("_picks", rows)
+    con.execute("INSERT INTO predictions BY NAME SELECT * FROM _picks")
+    con.unregister("_picks")
+
+    assert intraday.picked_symbols(con, interval="1m") == ["FRESH"]
+    assert intraday.picked_symbols(con, interval="5m") == ["FRESH"]
+    # Only the deep interval reaches back far enough to want the old pick.
+    assert sorted(intraday.picked_symbols(con, interval="1h")) == ["FRESH", "OLD1H"]
+
+
+def test_1h_captures_the_universe_while_5m_and_1m_stay_picks_only(con):
+    """1h feeds FEATURES, so it must cover every symbol the model SCORES.
+
+    Left picks-only, the phase-2 columns would go NaN for ~70% of the universe
+    at predict time while the model trained on rows where they were populated,
+    and "has 1h data" would decay into "was picked by this model before" — a
+    cohort reaching +2% at roughly twice the base rate, i.e. a feedback loop the
+    model can learn. 5m/1m stay picks-only: they serve the explorer, and every
+    extra symbol is a request on a rate-limited provider.
+    """
+    today = dt.date.today()
+    universe = pd.DataFrame(
+        {
+            "symbol": ["PICKED", "NEVERPICKED"],
+            "name": ["a", "b"],
+            "market_cap": [2e9, 1e9],
+            "sector": ["Tech", "Tech"],
+        }
+    )
+    store.upsert_universe(con, universe, as_of=today)
+    picks = pd.DataFrame(
+        {
+            "strategy": ["baseline_gbm_v1"],
+            "signal_date": [today - dt.timedelta(days=2)],
+            "symbol": ["PICKED"],
+            "prob": [0.9],
+            "rank": [1],
+            "created_ts": [pd.Timestamp("2026-08-28")],
+            "universe_as_of": [today],
+            "event": [scan.TOUCH_EVENT],
+        }
+    )
+    con.register("_p", picks)
+    con.execute("INSERT INTO predictions BY NAME SELECT * FROM _p")
+    con.unregister("_p")
+
+    for interval in ("5m", "1m"):
+        symbols, scope = intraday.capture_symbols(con, interval)
+        assert symbols == ["PICKED"], f"{interval} must stay picks-only"
+        assert scope == "picked"
+
+    symbols, scope = intraday.capture_symbols(con, "1h")
+    assert sorted(symbols) == ["NEVERPICKED", "PICKED"]
+    assert scope == "universe"
+
+
+def _seed_session(con, symbols, day, hours, interval="1h"):
+    rows = pd.DataFrame(
+        [
+            {
+                "symbol": sym,
+                "ts": dt.datetime.combine(day, dt.time(h, 30)),
+                "date": day,
+                "interval": interval,
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "volume": 1_000,
+            }
+            for sym in symbols
+            for h in hours
+        ]
+    )
+    con.register("_s", rows)
+    con.execute("INSERT INTO intraday_prices SELECT * FROM _s")
+    con.unregister("_s")
+
+
+def test_a_calendared_half_day_is_not_a_coverage_fault(con):
+    """A 13:00 half day ends three hours early BY DESIGN.
+
+    Treated as a truncation it produced six permanent, unclearable doctor
+    problems — a check that cries wolf forever teaches the operator to ignore
+    it, the same alarm-fatigue trap #94 and the 1m boundary already cost us.
+    """
+    syms = [f"S{i:02d}" for i in range(10)]
+    full, half = dt.date(2026, 3, 2), dt.date(2026, 3, 3)
+    _seed_session(con, syms, full, [9, 10, 11, 12, 13, 14, 15])
+    _seed_session(con, syms, half, [9, 10, 11, 12])  # last bar 12:30, a 13:00 close
+
+    cov = intraday.session_coverage(con)
+    # session_coverage returns DATE as datetime64; comparing it to a
+    # datetime.date matches nothing SILENTLY (the trap this project keeps
+    # re-hitting). Normalise both sides.
+    row = cov[pd.to_datetime(cov["date"]).dt.date == half].iloc[0]
+    assert row["early_close"] and not row["truncated"]
+    bad = intraday.coverage_problems(con)
+    assert half not in set(pd.to_datetime(bad["date"]).dt.date)
+
+
+def test_a_feed_that_dies_mid_session_is_still_truncated(con):
+    """Accepting the half-day end must not accept every short session."""
+    syms = [f"S{i:02d}" for i in range(10)]
+    good, dead = dt.date(2026, 3, 2), dt.date(2026, 3, 3)
+    _seed_session(con, syms, good, [9, 10, 11, 12, 13, 14, 15])
+    _seed_session(con, syms, dead, [9, 10])  # feed died at 10:30 — neither end
+
+    cov = intraday.session_coverage(con)
+    row = cov[pd.to_datetime(cov["date"]).dt.date == dead].iloc[0]
+    assert row["truncated"] and not row["early_close"]
+    assert intraday.coverage_verdict(row) == "TRUNCATED"
+
+
+def test_a_session_missing_its_morning_is_caught_despite_stragglers(con):
+    """2026-02-02 lost 09:30–12:30 market-wide yet closed at 15:30.
+
+    Every existing check read it clean: the last bar was on time, the symbol
+    count was normal, and a handful of names DID print at 09:30 — so a min()
+    over first bars saw 09:30 and shrugged. The statistic has to be robust.
+    """
+    syms = [f"S{i:02d}" for i in range(20)]
+    good, gap = dt.date(2026, 3, 2), dt.date(2026, 3, 3)
+    _seed_session(con, syms, good, [9, 10, 11, 12, 13, 14, 15])
+    _seed_session(con, syms[:2], gap, [9, 10, 11, 12, 13, 14, 15])  # the stragglers
+    _seed_session(con, syms[2:], gap, [13, 14, 15])  # everyone else: afternoon only
+
+    cov = intraday.session_coverage(con)
+    row = cov[pd.to_datetime(cov["date"]).dt.date == gap].iloc[0]
+    assert row["late_open"], "a market-wide missing morning must be a fault"
+    assert not row["truncated"], "it closed on time — that is not a truncation"
+    assert intraday.coverage_verdict(row) == "LATE_OPEN"
+    bad = intraday.coverage_problems(con)
+    assert gap in set(pd.to_datetime(bad["date"]).dt.date)

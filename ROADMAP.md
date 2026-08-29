@@ -578,8 +578,7 @@ POST-MERGE OPS: re-run `twopercent benchmark` (records symbol), then
 `twopercent intraday`. LIMITS, measured not assumed: Yahoo serves ~60 TRADING days
 of 5m bars, so the SIM row's earlier history can NEVER be resolved; and ~29% of
 ambiguous days have both triggers inside ONE 5m bar, which no amount of backfill
-fixes. Phase 2 (prior-day intraday FEATURES) is NOT built — it additionally
-requires extending the lookahead canary to mutate `intraday_prices`.
+fixes. Phase 2 (prior-day intraday FEATURES) is BUILT — see below.
 
 **Cross-checked 2026-08-10** (1m vs 5m) — and the check is WEAKER than it first
 appeared, so read the limits before quoting it. 5m is a server-side RESAMPLE of
@@ -608,6 +607,57 @@ Both intervals are captured by the score routine daily, because 5m expires at
 ~60 calendar days and 1m at ~30 — intraday_prices is the one table a re-run
 cannot rebuild (though the daily full-window refetch does give ~20 trading days
 of slack, so a single missed run is not fatal).
+
+**Implemented 2026-08-28** (#79 phase 2): four features from the SIGNAL day's
+own 1h session — `close_vwap_gap`, `last_hour_drift`, `intraday_vol`,
+`close_volume_share` — each an aggregate over bars of date S only, never the
+target day. 1h because it is the only interval deep enough to train on (5m/1m
+reach 53 and 34 days); limits measured, not guessed: `-729d` returns bars,
+`-750d` is empty, one request serves 365 days and 730 is empty, so 700/350
+keeps margin from both boundaries. Backfill landed 9,361,414 bars / 3,132
+symbols / 480 trading days (2024-09-30 →), 97% frame coverage.
+
+THE CANARY NOW MUTATES `intraday_prices`, discharging the warning phase 1 left
+standing. It needed more than adding the table: the seeded store had no
+intraday rows, so the four columns compared NaN to NaN and passed vacuously;
+and TWO columns are invariant to a uniform scaling — `close_volume_share` is a
+volume ratio (`volume*7` left it byte-identical) and `close_vwap_gap` is
+scale-invariant in price (`close*3` cancels exactly, leaving a 1.0e-13 float
+-noise margin). The mutation is now non-uniform and the seeded volume spread
+wide; measured margin on `close_vwap_gap` went 1.0e-13 → 1.3e-01. Every column
+was verified by injecting a leak into it ALONE and watching the canary fail.
+
+**MEASURED: they do not improve the picks.** Walk-forward, 12 folds, 250 test
+days, 3 seeds/arm: AUC +0.0019, lift +0.0023, p@20 +0.0009, p@5 +0.0000.
+An independent paired re-run (single process, per-fold pairing) put AUC at
++0.0024, positive in 10/12 folds, t=3.47 p=0.005 — a real but tiny ranking
+gain that does NOT survive to the shipped metric: precision@20 day-paired
+p=0.24, precision@5 p=0.42. My first pass called this "adds nothing" off an
+unpaired seed-range comparison; that ruler is biased toward the null (the range
+of 3 draws is ~1.69σ) and the correction is recorded here rather than quietly
+fixed. LOCKED-IN: pair on folds/days and average over seeds — never compare a
+difference of means against an unpaired range.
+
+1h is UNIVERSE-WIDE, unlike 5m/1m. Picks-only would have made the features NaN
+for ~70% of the universe at predict time while the model trained on populated
+rows, and turned "has 1h data" into "was picked before" — a cohort reaching
++2% at ~2x the base rate, i.e. a learnable feedback loop.
+
+POST-MERGE OPS: `feature_set_version()` changes `24bd854eae74` →
+`67f45c5ed724`, which un-does all 56 recorded research configs (#110) and makes
+the champion reference cross-feature-set until a re-benchmark. Re-benchmark the
+champion, and note the overnight loop will re-sweep 56 configs on a new feature
+set — a multiple-comparisons hazard worth watching rather than trusting.
+
+**Coverage checks gained two states 2026-08-28.** A calendared 13:00 half day
+is `early_close`, NOT a fault: treated as a truncation it produced six
+permanent, unclearable doctor problems, the same alarm-fatigue trap as #94 and
+the 1m boundary. And `LATE_OPEN` is new — 2026-02-02 lost 09:30–12:30
+market-wide while still closing at 15:30, so every existing check read it clean;
+a `min()` over first bars was defeated by three names that did print at 09:30,
+so the morning statistic is the MEDIAN across symbols while the closing one
+stays `max` (feed liveness). Measured over 480 sessions: flags exactly
+2026-01-30 (TRUNCATED) and 2026-02-02 (LATE_OPEN), adds nothing on 5m/1m.
 
 ## Status
 

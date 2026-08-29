@@ -303,3 +303,120 @@ def test_feature_set_version_changes_with_the_columns():
         assert F.feature_set_version() == base
     finally:
         F.FEATURE_COLUMNS = original
+
+
+def _one_intraday_session(con, symbol, day, hours, *, interval="1h"):
+    """Insert a session with EXACTLY the given hours, so the gate can be probed."""
+    rows = pd.DataFrame(
+        {
+            "symbol": symbol,
+            "ts": [dt.datetime.combine(day, dt.time(h, 30)) for h in hours],
+            "date": day,
+            "interval": interval,
+            "open": [100.0 + h for h in hours],
+            "high": [101.0 + h for h in hours],
+            "low": [99.0 + h for h in hours],
+            "close": [100.5 + h for h in hours],
+            "volume": [1_000 * (h + 1) for h in hours],
+        }
+    )
+    con.register("_sess", rows)
+    con.execute("INSERT INTO intraday_prices SELECT * FROM _sess")
+    con.unregister("_sess")
+
+
+def test_intraday_gate_requires_the_closing_bar_not_merely_a_bar_count(con):
+    """A session can clear MIN_INTRADAY_BARS and still have no 15:30 bar.
+
+    1,948 real sessions do. For those, `last(close ORDER BY ts)` is the 13:30 or
+    14:30 close, so last_hour_drift is not the last hour and close_volume_share
+    divides by the wrong numerator -- precisely the fabricated shape the floor
+    exists to prevent. The count is necessary, not sufficient.
+    """
+    seed_history(con, {"AAA": [0.01] * 30, "BBB": [0.01] * 30}, vary_volume=True)
+    days = [r[0] for r in con.execute("SELECT DISTINCT date FROM prices ORDER BY date").fetchall()]
+    day = days[-2]
+    # Six bars — comfortably over the floor — but the session stops at 14:30.
+    _one_intraday_session(con, "AAA", day, [9, 10, 11, 12, 13, 14])
+    # Five bars, gappy, but the CLOSING bar is present.
+    _one_intraday_session(con, "BBB", day, [9, 11, 13, 14, 15])
+
+    frame = feature_frame(con)
+    # signal_date comes back as datetime64 while `day` is a datetime.date --
+    # comparing the two directly matches NOTHING silently (the dtype trap this
+    # project has hit three times). Normalise before selecting.
+    sig = pd.to_datetime(frame["signal_date"]).dt.date
+    cols = ["close_vwap_gap", "last_hour_drift", "intraday_vol", "close_volume_share"]
+    aaa = frame[(frame["symbol"] == "AAA") & (sig == day)].iloc[0]
+    bbb = frame[(frame["symbol"] == "BBB") & (sig == day)].iloc[0]
+
+    assert aaa[cols].isna().all(), "6 bars with no closing bar must NOT produce features"
+    assert bbb[cols].notna().all(), "5 bars including the close is a usable session"
+
+
+def test_intraday_gate_boundary_is_adversarial_not_round(con):
+    """Exactly MIN_INTRADAY_BARS passes; one fewer does not. Both include 15:30,
+    so the bar COUNT is the only thing under test (CLAUDE.md: test boundaries)."""
+    seed_history(con, {"AAA": [0.01] * 30, "BBB": [0.01] * 30}, vary_volume=True)
+    days = [r[0] for r in con.execute("SELECT DISTINCT date FROM prices ORDER BY date").fetchall()]
+    day = days[-2]
+    _one_intraday_session(con, "AAA", day, [12, 13, 14, 15])  # 4 = floor - 1
+    _one_intraday_session(con, "BBB", day, [11, 12, 13, 14, 15])  # 5 = floor
+
+    frame = feature_frame(con)
+    sig = pd.to_datetime(frame["signal_date"]).dt.date
+    cols = ["close_vwap_gap", "last_hour_drift", "intraday_vol", "close_volume_share"]
+    aaa = frame[(frame["symbol"] == "AAA") & (sig == day)].iloc[0]
+    bbb = frame[(frame["symbol"] == "BBB") & (sig == day)].iloc[0]
+    assert aaa[cols].isna().all()
+    assert bbb[cols].notna().all()
+
+
+def test_intraday_features_read_only_1h_bars(con):
+    """The `interval = '1h'` filter is load-bearing and was untested.
+
+    25,099 real symbol-days hold more than one interval. Dropping the filter
+    mixes 5m bars into the aggregate and corrupts every column silently -- a
+    measured ANET session went from close_volume_share 0.254 to 0.055.
+    """
+    seed_history(con, {"AAA": [0.01] * 30}, vary_volume=True)
+    days = [r[0] for r in con.execute("SELECT DISTINCT date FROM prices ORDER BY date").fetchall()]
+    day = days[-2]
+    _one_intraday_session(con, "AAA", day, [9, 10, 11, 12, 13, 14, 15])
+    clean = feature_frame(con)
+    clean_sig = pd.to_datetime(clean["signal_date"]).dt.date
+    clean_row = clean[(clean["symbol"] == "AAA") & (clean_sig == day)].iloc[0]
+
+    # Same day, a DENSE 5m record that would dominate any unfiltered aggregate.
+    _one_intraday_session(con, "AAA", day, list(range(9, 16)), interval="5m")
+    mixed = feature_frame(con)
+    mixed_sig = pd.to_datetime(mixed["signal_date"]).dt.date
+    mixed_row = mixed[(mixed["symbol"] == "AAA") & (mixed_sig == day)].iloc[0]
+
+    for col in ["close_vwap_gap", "last_hour_drift", "intraday_vol", "close_volume_share"]:
+        assert clean_row[col] == mixed_row[col] or (
+            pd.isna(clean_row[col]) and pd.isna(mixed_row[col])
+        ), f"{col} changed when 5m bars were added — the interval filter is not holding"
+
+
+def test_missing_intraday_coverage_is_reported_not_silent(con, caplog):
+    """A silently 70%-NaN feature column trains a model on something the live
+    path will not have. The gate must SAY what it excluded (CLAUDE.md)."""
+    seed_history(con, {"AAA": [0.01] * 30, "BBB": [0.01] * 30}, vary_volume=True)
+    days = [r[0] for r in con.execute("SELECT DISTINCT date FROM prices ORDER BY date").fetchall()]
+    # AAA gets a full record; BBB gets none at all — and one whole day is blank.
+    seed_intraday(con, ["AAA"], days[:-3])
+    with caplog.at_level("WARNING"):
+        feature_frame(con)
+    assert "intraday features unavailable" in caplog.text
+    assert "NO usable 1h session for ANY symbol" in caplog.text
+
+
+def test_full_intraday_coverage_reports_nothing(con, caplog):
+    """The warning must be a NO-OP on complete data, or it becomes alarm fatigue."""
+    seed_history(con, {"AAA": [0.01] * 30}, vary_volume=True)
+    days = [r[0] for r in con.execute("SELECT DISTINCT date FROM prices ORDER BY date").fetchall()]
+    seed_intraday(con, ["AAA"], days)
+    with caplog.at_level("WARNING"):
+        feature_frame(con)
+    assert "intraday features unavailable" not in caplog.text

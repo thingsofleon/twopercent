@@ -166,6 +166,15 @@ def seed_intraday(con, symbols: list[str], dates, interval: str = "1h", bars: in
     per-bar drift and volume ramp differ by symbol and day so close_vwap_gap,
     last_hour_drift, intraday_vol and close_volume_share are all multi-valued
     (a constant column crashes sklearn's binner; see CLAUDE.md).
+
+    TWO of the four columns are invariant to a UNIFORM scaling, so the canary's
+    mutation has to be non-uniform to detect them at all:
+      * close_volume_share is a volume RATIO -- volume*k cancels exactly.
+      * close_vwap_gap is scale-invariant in PRICE -- close*k cancels exactly,
+        leaving the volume weights as the only lever.
+    Hence the wide per-bar volume spread below and the per-bar multiplier in the
+    canary's UPDATE. Both were verified by injecting a leak into each column
+    ALONE and confirming the canary fails.
     """
     import datetime as _dt
 
@@ -190,7 +199,13 @@ def seed_intraday(con, symbols: list[str], dates, interval: str = "1h", bars: in
                         "high": max(o, c) * 1.002,
                         "low": min(o, c) * 0.998,
                         "close": c,
-                        "volume": 10_000 + 1_000 * b + 100 * si + 10 * (di % 5),
+                        # WIDE per-bar spread (1x .. 64x across the session), not
+                        # a gentle ramp. close_vwap_gap is exactly scale-invariant
+                        # in price -- close*k cancels in (last_close - vwap)/vwap --
+                        # so the canary can only catch a leak there via the volume
+                        # REWEIGHTING of the VWAP. On a flat ramp that margin was
+                        # ~1e-5, caught only through float noise in the 13th digit.
+                        "volume": 10_000 * (2**b) + 100 * si + 10 * (di % 5),
                     }
                 )
     frame = pd.DataFrame(rows)

@@ -430,7 +430,7 @@ def _intraday_lines(report: DoctorReport, examples: int) -> list[str]:
     if bad.empty:
         return lines
     for row in bad.head(examples).itertuples():
-        why = "TRUNCATED" if row.truncated else "THIN"
+        why = intraday.coverage_verdict(row)
         detail = (
             f"last bar +{int(row.last_minute)}min vs +{int(row.expected_last_minute)} expected"
             if row.truncated

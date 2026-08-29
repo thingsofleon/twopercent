@@ -577,19 +577,24 @@ def test_doctor_reports_a_thin_intraday_session(con):
         day = dt.date(2026, 1, 5) + dt.timedelta(days=d)
         n_syms = 20 if d < 5 else 2  # last session captures a tenth of the names
         for k in range(n_syms):
-            rows.append(
-                {
-                    "symbol": f"S{k}",
-                    "ts": dt.datetime.combine(day, dt.time(15, 55)),
-                    "date": day,
-                    "interval": "5m",
-                    "open": 100.0,
-                    "high": 100.5,
-                    "low": 99.5,
-                    "close": 100.0,
-                    "volume": 1000,
-                }
-            )
+            # A full session per symbol, so the ONLY thing that varies is the
+            # symbol COUNT. Seeding just the 15:55 bar left every day missing
+            # its morning, which is now (correctly) its own fault — the fixture
+            # has to isolate the variable the test is named for.
+            for hh, mm in ((9, 30), (12, 0), (15, 55)):
+                rows.append(
+                    {
+                        "symbol": f"S{k}",
+                        "ts": dt.datetime.combine(day, dt.time(hh, mm)),
+                        "date": day,
+                        "interval": "5m",
+                        "open": 100.0,
+                        "high": 100.5,
+                        "low": 99.5,
+                        "close": 100.0,
+                        "volume": 1000,
+                    }
+                )
     con.register("_thin", pd.DataFrame(rows))
     con.execute("INSERT INTO intraday_prices SELECT * FROM _thin")
 

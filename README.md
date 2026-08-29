@@ -25,6 +25,7 @@ uv run twopercent predict              # ranked +2% candidates (logged)
 uv run twopercent dashboard            # static dashboard.html
 uv run twopercent intraday             # 5m bars for picked symbols (exit-path resolution)
 uv run twopercent intraday --interval 1m   # 1m bars (ground truth; expires in ~30 days)
+uv run twopercent intraday --interval 1h   # 1h bars, WHOLE UNIVERSE (feeds signal-day features)
 uv run twopercent intraday-validate    # cross-check 5m verdicts against 1m
 uv run twopercent benchmark            # walk-forward benchmark -> experiments row
 uv run twopercent routine              # pre-open daily cycle (predict mode)
@@ -256,12 +257,20 @@ to `logs/routine.log`:
 | score | `Mon..Fri 14:45 America/Denver` | 16:45 ET, post-close | `uv run twopercent routine --mode score` |
 | research | `daily 22:00 America/Denver` | 00:00 ET, overnight | `uv run twopercent research` |
 
-The score run also CAPTURES intraday bars (5m and 1m) for picked symbols. That
-step is time-critical and unlike every other table it is not reproducible:
-Yahoo serves ~60 calendar days of 5m and ~30 of 1m, so a session not captured
-inside that window is gone permanently. It is non-gating (WARN at worst, after
-scoring and the email are complete) but warns loudly, because a silent failure
-here is invisible until the data is already unrecoverable.
+The score run also CAPTURES intraday bars. That step is time-critical and
+unlike every other table it is not reproducible: Yahoo serves ~60 calendar days
+of 5m, ~30 of 1m and ~730 of 1h, so a session not captured inside that window is
+gone permanently. It is non-gating (WARN at worst, after scoring and the email
+are complete) but warns loudly, because a silent failure here is invisible until
+the data is already unrecoverable.
+
+Two different scopes, deliberately: **5m and 1m cover the model's PICKS**
+(they resolve which of the +2% limit and the -1% stop came first, and every
+extra symbol is a request on a rate-limited provider), while **1h covers the
+WHOLE UNIVERSE** because it feeds signal-day features (#79 phase 2), which must
+exist for every symbol the model scores — not just the ones it already liked.
+Each interval's pick horizon is its own retention window; using the deepest for
+all of them silently doubled the 5m/1m symbol lists once already.
 
 (Research runs every day, weekends included — it is offline compute against
 the local store, and its own clock gate refuses anything outside 16:30–05:00

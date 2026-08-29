@@ -380,34 +380,41 @@ def ingest_cmd(
 @app.command("intraday")
 def intraday_cmd(
     days: int = typer.Option(
-        intraday_mod.MAX_LOOKBACK_DAYS,
+        0,
         "--days",
-        help="Calendar days back to fetch (Yahoo serves ~60 at 5m; longer is clamped).",
+        help="Calendar days back to fetch. 0 (default) uses the interval's own "
+        "measured retention window; longer is clamped.",
     ),
-    top: int = typer.Option(20, "--top", help="Pick ranks whose symbols to fetch."),
+    top: int = typer.Option(20, "--top", help="Pick ranks whose symbols to fetch (5m/1m)."),
     interval: str = typer.Option(
-        intraday_mod.INTERVAL, "--interval", help="Bar interval: 5m or 1m."
+        intraday_mod.INTERVAL, "--interval", help="Bar interval: 5m, 1m or 1h."
     ),
     db: Path = DbOption,
 ) -> None:
-    """Fetch intraday bars for the symbols this model actually picked.
+    """Fetch intraday bars: 5m/1m for the model's picks, 1h for the universe.
 
-    Picks-only by design: the explorer needs the ordering of the +2% limit and
-    the -1% stop on days the model traded, not the whole universe. Exit codes:
-    0 clean, 1 ran with gaps (some symbols returned nothing), 2 failed.
+    5m and 1m are picks-only by design — the explorer needs the ordering of the
+    +2% limit and the -1% stop on days the model traded. 1h is universe-wide
+    because it feeds FEATURES (#79 phase 2), which must exist for every symbol
+    the model scores, not just the ones it already liked.
+
+    This command is the ONLY supported way to build or refresh 1h history: run
+    it with `--interval 1h` after a universe refresh. Exit codes: 0 clean,
+    1 ran with gaps (some symbols returned nothing), 2 failed.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     con = store.connect(db)
     end = dt.date.today() + dt.timedelta(days=1)
-    start = end - dt.timedelta(days=days)  # ingest clamps and says so
-    symbols = intraday_mod.picked_symbols(con, top_n=top)
+    # Default to the INTERVAL'S OWN window, not 5m's: --days defaulted to the 5m
+    # constant, so `--interval 1h` silently fetched 60 of its 700 available days.
+    start = end - dt.timedelta(days=days or intraday_mod.spec(interval)["lookback"])
+    symbols, scope = intraday_mod.capture_symbols(con, interval, top_n=top)
     if not symbols:
-        typer.echo("No picked symbols found — run `twopercent predict` or `benchmark` first.")
+        typer.echo(
+            f"No {scope} symbols found — run `twopercent predict`, `benchmark` or `universe` first."
+        )
         raise typer.Exit(2)
-    typer.echo(
-        f"Fetching {intraday_mod.INTERVAL} bars for {len(symbols)} picked symbol(s), "
-        f"{start} .. {end}"
-    )
+    typer.echo(f"Fetching {interval} bars for {len(symbols)} {scope} symbol(s), {start} .. {end}")
     result = intraday_mod.ingest(con, symbols, start, end, interval=interval)
     typer.echo(result.summary())
     if result.batches_failed:

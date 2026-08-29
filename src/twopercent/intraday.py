@@ -1,4 +1,4 @@
-"""Intraday bars for exit-path resolution (#79 phase 1).
+"""Intraday bars: exit-path resolution (#79 phase 1) and features (phase 2).
 
 Daily bars say WHETHER the +2% limit and the -1% stop were both touched; they
 carry no clock, so they cannot say WHICH CAME FIRST. On 61% of the sim picks
@@ -7,15 +7,29 @@ both were touched, and the two orderings are entirely different trades (out at
 strategy.pick_return_band has to return a (worst, best) band. This module fills
 that gap by replaying 5-minute bars.
 
-OUTCOME SIDE ONLY. These bars describe the TARGET day — the day being predicted
-— so any feature computed from them would be lookahead of the most direct kind.
-Nothing here may be imported by features.py, and `intraday_prices` must never
-appear in FEATURE_COLUMNS. The one legitimate consumer is the dashboard's exit
--rule explorer, which is a display-only what-if and never a decision number
-(see validate-new-strategy §4). Prior-day intraday FEATURES are a separate,
-unbuilt phase 2 that additionally requires extending the lookahead canary to
-mutate this table — the canary today mutates only `prices`, so a leak here
-would pass it vacuously.
+TWO SIDES, and the distinction is the whole safety argument. Read carefully.
+
+  * OUTCOME side (5m/1m, phase 1). These replay the TARGET day — the day being
+    predicted — so any FEATURE computed from them is lookahead of the most
+    direct kind. Their only consumers are the exit-path resolver and the
+    dashboard's exit-rule explorer, a display-only what-if that is never a
+    decision number (see validate-new-strategy §4).
+
+  * FEATURE side (1h, phase 2). features.py aggregates the SIGNAL day's own 1h
+    session — bars of date S, known at S's close, the same standing as
+    oc_return_today. It NEVER reads the target day's bars.
+
+So `intraday_prices` now legitimately reaches FEATURE_COLUMNS, and the sentence
+that used to stand here forbidding it is gone. What replaces the ban is the
+check the ban was a proxy for: THE LOOKAHEAD CANARY NOW MUTATES THIS TABLE.
+It previously mutated only `prices`, so a leak from here would have passed it
+vacuously — that warning has been discharged, not deleted. Two of the four
+phase-2 columns are invariant to a uniform scaling (a volume ratio; a
+price-scale-invariant gap), so the mutation is deliberately non-uniform; see
+tests/conftest.py::seed_intraday before weakening it.
+
+Anything added here that a feature might read must keep that property: signal
+day only, and detectable by the canary.
 
 Three integrity gates, all non-destructive and all LOUD, because a silently
 incomplete intraday record does not just add noise — it moves the answer:
@@ -61,7 +75,7 @@ import duckdb
 import pandas as pd
 import yfinance as yf
 
-from twopercent import scan, strategy
+from twopercent import scan, store, strategy
 
 logger = logging.getLogger(__name__)
 
@@ -730,21 +744,52 @@ def stop_fills(
         con.unregister("_fill_pairs")
 
 
+def capture_symbols(
+    con: duckdb.DuckDBPyConnection, interval: str, top_n: int = 20
+) -> tuple[list[str], str]:
+    """Who to fetch `interval` for, and a one-word reason to print.
+
+    5m/1m are PICKS-ONLY: they exist to resolve the ordering of the +2% limit
+    and the -1% stop on days the model traded, and every extra symbol costs
+    requests on a rate-limited provider.
+
+    1h is UNIVERSE-WIDE, because it feeds FEATURES (#79 phase 2) rather than
+    the explorer. Restricting it to picks would be a slow-motion disaster with
+    two heads: the features would go NaN for ~70% of the universe at predict
+    time while the model trained on rows where they were populated, and
+    "has 1h data" would decay into "was picked by this model before" -- a
+    cohort whose reach rate is roughly twice the base rate, i.e. a feedback
+    loop the model can learn. Neither failure announces itself.
+    """
+    if interval == "1h":
+        return store.all_universe_symbols(con), "universe"
+    return picked_symbols(con, top_n=top_n, interval=interval), "picked"
+
+
 def picked_symbols(
-    con: duckdb.DuckDBPyConnection, top_n: int = 20, since: dt.date | None = None
+    con: duckdb.DuckDBPyConnection,
+    top_n: int = 20,
+    since: dt.date | None = None,
+    interval: str = "5m",
 ) -> list[str]:
     """Symbols the model actually picked — logged predictions and sim picks.
 
     Picks-only by design: the explorer needs the ordering of the +2% limit and
     the -1% stop on days the model traded, not the whole universe.
     """
-    # Bounded to the RETENTION WINDOW. The pick set grows ~20 names a day
-    # forever, and every symbol costs requests on a provider this project
-    # already has rate-limit issues with (#31/#34). Symbols last picked outside
-    # the window have no fetchable bars anyway, so including them buys nothing.
-    horizon = since or dt.date.today() - dt.timedelta(
-        days=max(s["lookback"] for s in _SPECS.values())
-    )
+    # Bounded to the RETENTION WINDOW OF THE INTERVAL BEING FETCHED. The pick
+    # set grows ~20 names a day forever, and every symbol costs requests on a
+    # provider this project already has rate-limit issues with (#31/#34).
+    # Symbols last picked outside the window have no fetchable bars anyway, so
+    # including them buys nothing.
+    #
+    # PER-INTERVAL, not max() over all specs: this was max() and 1h's 700-day
+    # lookback silently became the horizon for 5m and 1m too, doubling their
+    # symbol count (measured 423 -> 887) and re-opening the very #94 regression
+    # the comment above describes. The extra 464 names have NO fetchable 5m/1m
+    # bars -- they are pure rate-limit cost on the two captures that cannot be
+    # rebuilt after the fact.
+    horizon = since or dt.date.today() - dt.timedelta(days=_SPECS[interval]["lookback"])
     return [
         r[0]
         for r in con.execute(
@@ -1143,6 +1188,19 @@ def trailing_exits(
 # Regular session close, minutes past midnight exchange-local. The last bar of a
 # complete session STARTS one bar-width before it (15:55 at 5m, 15:59 at 1m).
 SESSION_CLOSE_MINUTES = 16 * 60
+# US equity half days close at 13:00. They are a REGULAR, calendared session
+# end, not a truncation, and treating them as one made the doctor cry wolf
+# forever: at 1h the five half-days inside the 700-day window read TRUNCATED on
+# every single run, permanently, with no action available to clear them. Five
+# lines above, TRUNCATION_SLACK_MINUTES claims "one bar of slack absorbs a
+# venue's early close on a half day" -- that was never true. A half day ends
+# THREE HOURS early, which no per-bar slack can or should absorb.
+#
+# Accepting it as an alternative valid end is what distinguishes the calendared
+# short session from a real one: 2026-01-30, whose feed died at 10:30, stays
+# flagged precisely because 10:30 is neither end.
+EARLY_CLOSE_MINUTES = 13 * 60
+SESSION_OPEN_MINUTES = 9 * 60 + 30
 # A session is short if its last bar starts more than this many minutes before
 # the expected final slot. One bar of slack absorbs a venue's early close on a
 # half day without hiding a real truncation.
@@ -1166,6 +1224,18 @@ COVERAGE_MIN_FRACTION = 0.9
 COVERAGE_MEDIAN_WINDOW = 5
 
 
+def _last_bar_start(close_minutes: int, minutes: int) -> int:
+    """Minute-of-day at which the session's LAST bar starts.
+
+    Bars are anchored to the 09:30 open, so this is not simply close - width:
+    a 390-minute session does not divide by 60, and the last 1h bar starts at
+    15:30 (930), not 15:00. The old `SESSION_CLOSE_MINUTES - minutes` happened
+    to be right for 5m and 1m and was 30 minutes early for 1h -- harmless only
+    because it is compared as a lower bound.
+    """
+    return SESSION_OPEN_MINUTES + ((close_minutes - SESSION_OPEN_MINUTES - 1) // minutes) * minutes
+
+
 def session_coverage(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
     """Per (interval, date) capture health, read from intraday_prices RAW.
 
@@ -1179,8 +1249,14 @@ def session_coverage(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
       * TRUNCATED — the session's last bar starts well before the close. A
         provider cutting the feed at 15:10 leaves a session that passes every
         per-bar check and is simply missing its final hour.
+      * LATE_OPEN — the session is missing its MORNING for most of the
+        universe. 2026-02-02 lost 09:30 through 12:30 market-wide while still
+        closing at 15:30, so every other check here read it as clean.
       * THIN — symbol count materially below the trailing median. A batch that
         failed silently, or a rate limit, removes names rather than minutes.
+
+    A calendared 13:00 half day is NONE of these. It is a regular short session
+    and is reported as early_close, not as a fault.
 
     Neither is visible in row counts alone, which is why the ingest step's
     "N bars; M/M symbols" could report success on both.
@@ -1188,31 +1264,75 @@ def session_coverage(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
     rows = []
     for interval in INTERVALS:
         minutes = spec(interval)["minutes"]
-        expected_last = SESSION_CLOSE_MINUTES - minutes
+        expected_last = _last_bar_start(SESSION_CLOSE_MINUTES, minutes)
+        early_close_last = _last_bar_start(EARLY_CLOSE_MINUTES, minutes)
         frame = con.execute(
             f"""
-            WITH per_day AS (
-                SELECT date,
+            WITH per_symbol AS (
+                SELECT date, symbol,
                        count(*) AS bars,
-                       count(DISTINCT symbol) AS symbols,
-                       max(date_diff('minute', date, ts)) AS last_minute
+                       min(date_diff('minute', date, ts)) AS first_minute
+                FROM intraday_prices
+                WHERE interval = '{interval}'
+                GROUP BY date, symbol
+            ),
+            per_day AS (
+                -- The two ends want DIFFERENT statistics, and the reason is not
+                -- symmetry-breaking for its own sake:
+                --   last_minute = MAX -- "was the feed still alive at the close?"
+                --     One symbol printing at 15:30 answers yes. A median is wrong
+                --     here because illiquid names routinely skip the final bar, so
+                --     it reads 11:30 on a normal half day and the tight half-day
+                --     match falls apart.
+                --   first_minute = MEDIAN -- "was the market's morning captured
+                --     for the universe?" A min is decided by one name: three
+                --     stragglers that happened to print at 09:30 on 2026-02-02
+                --     hid a morning missing for 99.9% of symbols.
+                -- Measured over 480 sessions: this pair flags 2026-02-02 and
+                -- nothing else, and adds no flags at all on 5m/1m.
+                SELECT date,
+                       sum(bars) AS bars,
+                       count(*) AS symbols,
+                       median(first_minute) AS first_minute
+                FROM per_symbol
+                GROUP BY date
+            ),
+            per_day_last AS (
+                SELECT date, max(date_diff('minute', date, ts)) AS last_minute
                 FROM intraday_prices
                 WHERE interval = '{interval}'
                 GROUP BY date
+            ),
+            joined AS (
+                SELECT d.date, d.bars, d.symbols, d.first_minute, l.last_minute
+                FROM per_day d JOIN per_day_last l USING (date)
             )
-            SELECT date, bars, symbols, last_minute,
+            SELECT date, bars, symbols, last_minute, first_minute,
                    median(symbols) OVER (
                        ORDER BY date ROWS BETWEEN {COVERAGE_MEDIAN_WINDOW} PRECEDING
                                               AND 1 PRECEDING
                    ) AS trailing_median_symbols
-            FROM per_day ORDER BY date
+            FROM joined ORDER BY date
             """
         ).fetchdf()
         if frame.empty:
             continue
         frame.insert(0, "interval", interval)
         frame["expected_last_minute"] = expected_last
-        frame["truncated"] = frame["last_minute"] < expected_last - TRUNCATION_SLACK_MINUTES
+        # Either calendared end counts as complete. A half day is not a fault,
+        # and a permanent unclearable fault is worse than no check at all.
+        full = frame["last_minute"] >= expected_last - TRUNCATION_SLACK_MINUTES
+        # The half-day end is matched TIGHTLY (a window, not a floor). A floor
+        # would swallow every real truncation between 13:00 and the close --
+        # a feed dying at 14:00 must still be a fault.
+        half = (frame["last_minute"] - early_close_last).abs() <= TRUNCATION_SLACK_MINUTES
+        frame["early_close"] = half & ~full
+        frame["truncated"] = ~(full | half)
+        # A session can also lose its FRONT, and nothing here could see it:
+        # 2026-02-02 is missing 09:30 through 12:30 market-wide, yet its last
+        # bar is 15:30 so every check above reads clean. Same silent data loss,
+        # opposite end of the day.
+        frame["late_open"] = frame["first_minute"] > SESSION_OPEN_MINUTES + TRUNCATION_SLACK_MINUTES
         # A NULL trailing median (the first sessions ever captured) cannot be
         # judged against a baseline, so those are NOT called thin — same rule the
         # daily completeness gate uses, and made explicit rather than implied.
@@ -1228,13 +1348,30 @@ def session_coverage(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
                 "bars",
                 "symbols",
                 "last_minute",
+                "first_minute",
                 "trailing_median_symbols",
                 "expected_last_minute",
+                "early_close",
                 "truncated",
+                "late_open",
                 "thin",
             ]
         )
     return pd.concat(rows, ignore_index=True)
+
+
+def coverage_verdict(row) -> str:
+    """One word for why a session is a problem. ONE definition, shared.
+
+    The doctor and the routine each rendered this inline as a two-way
+    truncated/thin ternary, so adding a third state would silently have made
+    every LATE_OPEN session read "THIN" in both places.
+    """
+    if getattr(row, "truncated", False):
+        return "TRUNCATED"
+    if getattr(row, "late_open", False):
+        return "LATE_OPEN"
+    return "THIN"
 
 
 def coverage_problems(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
@@ -1242,5 +1379,5 @@ def coverage_problems(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
     frame = session_coverage(con)
     if frame.empty:
         return frame
-    bad = frame[frame["truncated"] | frame["thin"]].copy()
+    bad = frame[frame["truncated"] | frame["thin"] | frame["late_open"]].copy()
     return bad.sort_values(["date", "interval"], ascending=[False, True])

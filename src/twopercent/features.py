@@ -33,7 +33,15 @@ logger = logging.getLogger(__name__)
 # A 1h session is 7 bars (09:30-16:00). Require most of them: a session with
 # one or two bars produces a VWAP and a "last hour" that describe a fragment,
 # not a day. Sessions below the floor yield NULL rather than a fabricated shape.
+#
+# The bar COUNT alone does not say the fragment is the right one. 1,948 real
+# sessions clear the count while missing the 15:30 bar, and for those
+# last_hour_drift describes the 13:30 or 14:30 hour and close_volume_share
+# divides the wrong numerator -- exactly the fabricated shape this floor exists
+# to prevent. So the closing bar is required TOO; the count is necessary, not
+# sufficient.
 MIN_INTRADAY_BARS = 5
+INTRADAY_CLOSE_HOUR = 15
 MIN_HISTORY_DAYS = 20
 
 FEATURE_COLUMNS = [
@@ -171,7 +179,8 @@ intraday_day AS (
         last(close ORDER BY ts) AS last_close,
         last((close - open) / nullif(open, 0) ORDER BY ts) AS last_bar_ret,
         last(volume ORDER BY ts) AS last_bar_vol,
-        sum(volume) AS session_vol
+        sum(volume) AS session_vol,
+        bool_or(EXTRACT(hour FROM ts) = {INTRADAY_CLOSE_HOUR}) AS has_close_bar
     FROM intraday_prices
     WHERE interval = '1h'
     GROUP BY symbol, date
@@ -224,11 +233,13 @@ SELECT
     -- record, which is most of history until the backfill completes -- the
     -- existing dropped-column semantics already handle a column the model
     -- cannot use, loudly.
-    CASE WHEN i.bars >= {MIN_INTRADAY_BARS}
+    CASE WHEN i.bars >= {MIN_INTRADAY_BARS} AND i.has_close_bar
          THEN (i.last_close - i.vwap) / nullif(i.vwap, 0) END AS close_vwap_gap,
-    CASE WHEN i.bars >= {MIN_INTRADAY_BARS} THEN i.last_bar_ret END AS last_hour_drift,
-    CASE WHEN i.bars >= {MIN_INTRADAY_BARS} THEN i.intraday_vol END AS intraday_vol,
-    CASE WHEN i.bars >= {MIN_INTRADAY_BARS}
+    CASE WHEN i.bars >= {MIN_INTRADAY_BARS} AND i.has_close_bar
+         THEN i.last_bar_ret END AS last_hour_drift,
+    CASE WHEN i.bars >= {MIN_INTRADAY_BARS} AND i.has_close_bar
+         THEN i.intraday_vol END AS intraday_vol,
+    CASE WHEN i.bars >= {MIN_INTRADAY_BARS} AND i.has_close_bar
          THEN i.last_bar_vol / nullif(i.session_vol, 0) END AS close_volume_share,
     s.median_vol_20,
     s.history_days
@@ -240,6 +251,47 @@ LEFT JOIN intraday_day i ON i.symbol = s.symbol AND i.date = s.date
 WHERE s.date >= ? AND s.date <= ?
 ORDER BY s.date, s.symbol
 """
+
+
+def _warn_intraday_coverage(out: pd.DataFrame) -> None:
+    """Say out loud how much of the frame has NO intraday features, and why.
+
+    CLAUDE.md: anything that skips or filters must warn loudly about what it
+    excluded. The intraday gate excludes silently in three distinct ways, and
+    each one means something different operationally:
+      * no 1h record at all -- the backfill has not reached those dates, or the
+        capture is not running for those symbols (the dangerous one: it decays
+        forward);
+      * a record that fails the bar/closing-bar gate -- half-days and outages;
+      * whole trading days with zero coverage -- a provider gap, which is what
+        2026-01-30 and 2026-02-02 are.
+    A silent 70%-NaN column trains a model on a feature the live path will not
+    have, which is precisely the failure this project keeps re-learning.
+    """
+    if out.empty:
+        return
+    missing = out["close_vwap_gap"].isna()
+    if not missing.any():
+        return
+    share = 100.0 * missing.mean()
+    by_day = missing.groupby(out["signal_date"]).mean()
+    blank_days = by_day[by_day == 1.0]
+    detail = ""
+    if len(blank_days):
+        shown = ", ".join(str(d) for d in list(blank_days.index)[:5])
+        detail = (
+            f"; {len(blank_days)} trading day(s) have NO usable 1h session for ANY "
+            f"symbol ({shown}{', ...' if len(blank_days) > 5 else ''})"
+        )
+    logger.warning(
+        "intraday features unavailable on %d of %d rows (%.1f%%): no 1h record, or a "
+        "session failing the >=%d-bar / closing-bar gate%s",
+        int(missing.sum()),
+        len(out),
+        share,
+        MIN_INTRADAY_BARS,
+        detail,
+    )
 
 
 def feature_set_version() -> str:
@@ -286,6 +338,7 @@ def feature_frame(
             MIN_HISTORY_DAYS,
         )
     out = df[~thin].drop(columns="history_days").reset_index(drop=True)
+    _warn_intraday_coverage(out)
     nan_sector = out["sector_breadth"].isna()
     if not out.empty and nan_sector.all():
         logger.warning(

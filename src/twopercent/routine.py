@@ -513,19 +513,23 @@ def _intraday_step(report: RoutineReport, con, top_n: int = 20) -> None:
     run whose real work has been done. But it warns LOUDLY, because a silent
     failure here is invisible until the window has closed and the data is gone.
     """
-    try:
-        symbols = intraday.picked_symbols(con, top_n=top_n)
-    except Exception as exc:
-        report.add("intraday", WARN, f"could not list picked symbols: {exc}")
-        return
-    if not symbols:
-        report.add("intraday", OK, "no picked symbols yet — nothing to capture")
-        return
     details, worst = [], OK
     for interval in intraday.INTERVALS:
         limits = intraday.spec(interval)
         end = dt.date.today() + dt.timedelta(days=1)
         start = end - dt.timedelta(days=limits["lookback"])
+        # Resolved PER INTERVAL, two ways: 5m/1m fetch PICKS bounded by their own
+        # retention window (1h's 700 days must never inflate them -- #94 stays
+        # closed), 1h fetches the whole UNIVERSE because it feeds features.
+        try:
+            symbols, scope = intraday.capture_symbols(con, interval, top_n=top_n)
+        except Exception as exc:
+            details.append(f"{interval}: could not list symbols: {exc}")
+            worst = WARN
+            continue
+        if not symbols:
+            details.append(f"{interval}: no {scope} symbols yet — nothing to capture")
+            continue
         try:
             result = intraday.ingest(con, symbols, start, end, interval=interval)
         except Exception as exc:
@@ -550,7 +554,7 @@ def _intraday_step(report: RoutineReport, con, top_n: int = 20) -> None:
         details.append(
             f"{len(bad)} session(s) with a coverage fault, newest "
             f"{worst_row['date']} {worst_row['interval']} "
-            f"{'TRUNCATED' if worst_row['truncated'] else 'THIN'}"
+            f"{intraday.coverage_verdict(worst_row)}"
         )
     report.add("intraday", worst, "; ".join(details))
 

@@ -686,6 +686,35 @@ published years ahead); a nominated session not on it is TRUNCATED and, past
 `HALF_DAY_CALENDAR_THROUGH`, says so and asks to be extended. A stale list
 therefore degrades to a false alarm, never to silence.
 
+**Both ends of a session use the MEDIAN across symbols.** `max(last_minute)`
+was the mirror of the `min(first_minute)` hole and survived the fix that closed
+it: 47 of 50 symbols dying at 11:30 with 3 printing to 15:30 loses 54% of the
+day's bars and fires nothing — not truncated, not thin (the symbol count is
+untouched; only bars vanish). The median is stable on real data: 930 on all 473
+normal days, 690 on all five half days, zero spread p01–p99. The CALENDAR picks
+which expectation applies; a half day is not a softer test, it is a different
+one. Half days expect 690, one bar earlier than the last bar starting before
+13:00 — measured, because that 12:30 bar covers 30 minutes of a low-volume
+session and most names never print it, unlike the equally partial 15:30 bar
+that the closing auction fills.
+
+**The feature gate requires a COMPLETE session (7 bars), not "most of one".**
+Every weakening admitted a fabricated shape: a bar count says nothing about
+WHICH bars (1,948 sessions clear ≥5 with no 15:30 bar), and adding the closing
+bar still admits INTERIOR holes (14,181 sessions have both ends and 5–6 bars,
+so the VWAP and session volume span a day with an hour missing from the middle).
+They are a different population — reach 29.9% vs 33.0% — and the distortion has
+no known sign: `close_volume_share` is LOWER on them (0.200 vs 0.243), not
+inflated as a shrunken denominator would suggest, because they skew illiquid.
+Cost is 1.2% of usable rows (97.5% → 96.3% coverage).
+
+**The canary now RESHAPES the future, not just its values.** `bars` and
+`has_close_bar` are selected columns one keystroke from a feature expression,
+and a feature reading them off the target day passed the value-mutation
+unchanged (7.0 stays 7.0) — a leak that would be genuinely predictive, since a
+complete session tracks liquidity and activity. The canary now also DELETEs the
+future's closing bars. Verified by injecting exactly that leak.
+
 **Coverage checks gained two states 2026-08-28.** A calendared 13:00 half day
 is `early_close`, NOT a fault: treated as a truncation it produced six
 permanent, unclearable doctor problems, the same alarm-fatigue trap as #94 and

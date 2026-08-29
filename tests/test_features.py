@@ -5,7 +5,12 @@ import pandas as pd
 
 from tests.conftest import seed_history, seed_intraday
 from twopercent import store
-from twopercent.features import FEATURE_COLUMNS, METADATA_COLUMNS, feature_frame
+from twopercent.features import (
+    FEATURE_COLUMNS,
+    INTRADAY_CLOSE_HOUR,
+    METADATA_COLUMNS,
+    feature_frame,
+)
 
 
 def _varied(n: int, seed: int) -> list[float]:
@@ -90,6 +95,16 @@ def test_lookahead_canary(con):
         "low = low * 1.5, close = close * 3, "
         "volume = volume * (3 + (EXTRACT(hour FROM ts) % 5)) WHERE date > ?",
         [cutoff],
+    )
+    # Mutating VALUES cannot detect a leak of session STRUCTURE. `bars` and
+    # `has_close_bar` are selected columns in the intraday CTE, one keystroke
+    # from a feature expression, and a feature reading them off the TARGET day
+    # would sail through the update above unchanged (7.0 stays 7.0). Such a leak
+    # would be genuinely predictive too — a complete session tracks liquidity
+    # and activity, which track the outcome. So the future is also RESHAPED.
+    con.execute(
+        "DELETE FROM intraday_prices WHERE date > ? AND EXTRACT(hour FROM ts) = ?",
+        [cutoff, INTRADAY_CLOSE_HOUR],
     )
     after = feature_frame(con)
     vec_after = after[after["signal_date"] == cutoff].set_index("symbol")[watched]
@@ -338,8 +353,8 @@ def test_intraday_gate_requires_the_closing_bar_not_merely_a_bar_count(con):
     day = days[-2]
     # Six bars — comfortably over the floor — but the session stops at 14:30.
     _one_intraday_session(con, "AAA", day, [9, 10, 11, 12, 13, 14])
-    # Five bars, gappy, but the CLOSING bar is present.
-    _one_intraday_session(con, "BBB", day, [9, 11, 13, 14, 15])
+    # A complete session — the only kind that yields features.
+    _one_intraday_session(con, "BBB", day, [9, 10, 11, 12, 13, 14, 15])
 
     frame = feature_frame(con)
     # signal_date comes back as datetime64 while `day` is a datetime.date --
@@ -351,17 +366,17 @@ def test_intraday_gate_requires_the_closing_bar_not_merely_a_bar_count(con):
     bbb = frame[(frame["symbol"] == "BBB") & (sig == day)].iloc[0]
 
     assert aaa[cols].isna().all(), "6 bars with no closing bar must NOT produce features"
-    assert bbb[cols].notna().all(), "5 bars including the close is a usable session"
+    assert bbb[cols].notna().all(), "a complete 7-bar session is usable"
 
 
 def test_intraday_gate_boundary_is_adversarial_not_round(con):
-    """Exactly MIN_INTRADAY_BARS passes; one fewer does not. Both include 15:30,
-    so the bar COUNT is the only thing under test (CLAUDE.md: test boundaries)."""
+    """Exactly the full session passes; one bar fewer does not. Both include
+    15:30, so completeness is the only thing under test (CLAUDE.md)."""
     seed_history(con, {"AAA": [0.01] * 30, "BBB": [0.01] * 30}, vary_volume=True)
     days = [r[0] for r in con.execute("SELECT DISTINCT date FROM prices ORDER BY date").fetchall()]
     day = days[-2]
-    _one_intraday_session(con, "AAA", day, [12, 13, 14, 15])  # 4 = floor - 1
-    _one_intraday_session(con, "BBB", day, [11, 12, 13, 14, 15])  # 5 = floor
+    _one_intraday_session(con, "AAA", day, [9, 10, 11, 13, 14, 15])  # a HOLE at 12:30
+    _one_intraday_session(con, "BBB", day, [9, 10, 11, 12, 13, 14, 15])  # complete
 
     frame = feature_frame(con)
     sig = pd.to_datetime(frame["signal_date"]).dt.date

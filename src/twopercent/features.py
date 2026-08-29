@@ -30,17 +30,25 @@ from twopercent.scan import _THRESHOLD_EPSILON, DEFAULT_THRESHOLD, touch_event_p
 
 logger = logging.getLogger(__name__)
 
-# A 1h session is 7 bars (09:30-16:00). Require most of them: a session with
-# one or two bars produces a VWAP and a "last hour" that describe a fragment,
-# not a day. Sessions below the floor yield NULL rather than a fabricated shape.
+# A regular 1h session is exactly 7 bars (09:30..15:30). Require ALL of them.
 #
-# The bar COUNT alone does not say the fragment is the right one. 1,948 real
-# sessions clear the count while missing the 15:30 bar, and for those
-# last_hour_drift describes the 13:30 or 14:30 hour and close_volume_share
-# divides the wrong numerator -- exactly the fabricated shape this floor exists
-# to prevent. So the closing bar is required TOO; the count is necessary, not
-# sufficient.
-MIN_INTRADAY_BARS = 5
+# This started as "require most of them" with a >=5 floor, and every weakening
+# of that idea turned out to admit a fabricated session shape:
+#   * a bar COUNT says nothing about WHICH bars. 1,948 real sessions clear a
+#     >=5 count with no 15:30 bar, so last_hour_drift described the 13:30 hour
+#     and close_volume_share divided by the wrong numerator.
+#   * adding "and the closing bar is present" still admits INTERIOR holes:
+#     14,181 real sessions have both ends and only 5-6 bars, so the VWAP and the
+#     session volume are computed over a day with an hour missing from the
+#     middle. Measured, they are a different population -- reach 29.9% vs 33.0%
+#     -- and the distortion has no known sign: close_volume_share is LOWER on
+#     them (0.200 vs 0.243), not inflated as a shrunken denominator would
+#     suggest, because the holed sessions are disproportionately illiquid names.
+#
+# Requiring the complete session costs 1.2% of otherwise-usable rows (97.7% ->
+# 96.5% coverage) and removes the whole class. A half day (4 bars) is therefore
+# NULL, which is correct: it is a different session, not a damaged one.
+INTRADAY_SESSION_BARS = 7
 INTRADAY_CLOSE_HOUR = 15
 MIN_HISTORY_DAYS = 20
 
@@ -233,13 +241,13 @@ SELECT
     -- record, which is most of history until the backfill completes -- the
     -- existing dropped-column semantics already handle a column the model
     -- cannot use, loudly.
-    CASE WHEN i.bars >= {MIN_INTRADAY_BARS} AND i.has_close_bar
+    CASE WHEN i.bars = {INTRADAY_SESSION_BARS} AND i.has_close_bar
          THEN (i.last_close - i.vwap) / nullif(i.vwap, 0) END AS close_vwap_gap,
-    CASE WHEN i.bars >= {MIN_INTRADAY_BARS} AND i.has_close_bar
+    CASE WHEN i.bars = {INTRADAY_SESSION_BARS} AND i.has_close_bar
          THEN i.last_bar_ret END AS last_hour_drift,
-    CASE WHEN i.bars >= {MIN_INTRADAY_BARS} AND i.has_close_bar
+    CASE WHEN i.bars = {INTRADAY_SESSION_BARS} AND i.has_close_bar
          THEN i.intraday_vol END AS intraday_vol,
-    CASE WHEN i.bars >= {MIN_INTRADAY_BARS} AND i.has_close_bar
+    CASE WHEN i.bars = {INTRADAY_SESSION_BARS} AND i.has_close_bar
          THEN i.last_bar_vol / nullif(i.session_vol, 0) END AS close_volume_share,
     s.median_vol_20,
     s.history_days
@@ -319,13 +327,13 @@ def _warn_intraday_coverage(out: pd.DataFrame) -> None:
         )
     logger.warning(
         "intraday features missing on %d of %d rows (%.1f%%) INSIDE the covered era "
-        "(since %s): no 1h record, or a session failing the >=%d-bar / closing-bar "
-        "gate%s",
+        "(since %s): no 1h record, or a session that is not a complete %d-bar "
+        "regular session%s",
         int(recent.sum()),
         int(in_era.sum()),
         100.0 * recent.sum() / max(int(in_era.sum()), 1),
         horizon.date(),
-        MIN_INTRADAY_BARS,
+        INTRADAY_SESSION_BARS,
         detail,
     )
 

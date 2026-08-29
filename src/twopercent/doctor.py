@@ -431,11 +431,7 @@ def _intraday_lines(report: DoctorReport, examples: int) -> list[str]:
         return lines
     for row in bad.head(examples).itertuples():
         why = intraday.coverage_verdict(row)
-        detail = (
-            f"last bar +{int(row.last_minute)}min vs +{int(row.expected_last_minute)} expected"
-            if row.truncated
-            else f"{int(row.symbols)} symbols vs {row.trailing_median_symbols:.0f} trailing median"
-        )
+        detail = intraday.coverage_detail(row)
         lines.append(f"    {row.date:%Y-%m-%d} {row.interval:<3} {why:<10} {detail}")
     _overflow(lines, len(bad), examples)
     return lines

@@ -962,7 +962,8 @@ def test_a_half_day_past_the_calendar_fails_loudly_and_says_why(con, caplog):
     syms = [f"S{i:02d}" for i in range(10)]
     beyond = dt.date(2029, 11, 23)
     assert beyond > intraday.HALF_DAY_CALENDAR_THROUGH
-    _seed_session(con, syms, beyond, [9, 10, 11, 12])
+    # The shape a REAL half day has: measured, they end at 11:30, not 12:30.
+    _seed_session(con, syms, beyond, [9, 10, 11])
     with caplog.at_level("WARNING"):
         cov = intraday.session_coverage(con)
     row = cov[pd.to_datetime(cov["date"]).dt.date == beyond].iloc[0]
@@ -1055,7 +1056,7 @@ def test_the_nightly_capture_refreshes_a_short_window_not_the_whole_retention(co
     by_interval = {c["interval"]: (c["end"] - c["start"]).days for c in calls}
     # 1h is universe-wide: a nightly re-ask of its retention window would rewrite
     # two years of feature history every night.
-    assert by_interval["1h"] == 5 < intraday.spec("1h")["lookback"]
+    assert by_interval["1h"] == intraday.spec("1h")["refresh"] < intraday.spec("1h")["lookback"]
     # 5m/1m are picks-only, and re-asking their whole window IS their
     # self-healing after a missed run — do not "optimise" it away.
     for interval in ("5m", "1m"):

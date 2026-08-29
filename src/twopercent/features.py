@@ -72,7 +72,30 @@ FEATURE_COLUMNS = [
     "days_since_2pct",
     "volume_accel",
     "dist_52w_high",
-    # #79 phase 2: the SIGNAL day's intraday shape (1h bars).
+]
+
+# #79 phase 2: the SIGNAL day's intraday shape (1h bars). COMPUTED, CANARY-
+# WATCHED, and deliberately NOT model inputs.
+#
+# They are safe -- the timing survived four adversarial passes -- but they do
+# not pay for themselves yet. Paired walk-forward: AUC +0.0022 (p=0.039, best of
+# two metrics on 12 folds, no multiplicity correction) and NOTHING on what the
+# product ships (lift 2.0997 -> 2.1108, precision@20 p=0.76). Listing them here
+# would change feature_set_version(), which invalidates all 56 recorded research
+# configs (#110) and forces a champion re-benchmark -- a permanent cost for a
+# maybe.
+#
+# The measurement is also underpowered BY CONSTRUCTION and cannot yet settle it:
+# Yahoo serves ~730 days of 1h against a daily history reaching 2021, so these
+# are observable in only 21-36% of training rows in every fold. The decisive
+# test is both arms restricted to the intraday era (train from 2024-10-01),
+# where coverage is ~95%. Promoting them is one line plus a re-benchmark;
+# un-spending the research ledger is not, and that asymmetry is the whole
+# argument for waiting.
+#
+# They stay in the frame and in the canary's watch list so they cannot rot
+# silently while they wait.
+INTRADAY_FEATURE_COLUMNS = [
     "close_vwap_gap",
     "last_hour_drift",
     "intraday_vol",

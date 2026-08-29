@@ -654,24 +654,40 @@ for ~70% of the universe at predict time while the model trained on populated
 rows, and turned "has 1h data" into "was picked before" — a cohort reaching
 +2% at ~2x the base rate, i.e. a learnable feedback loop.
 
+**DECIDED 2026-08-29: the four are COMPUTED and CANARY-WATCHED but NOT model
+inputs.** `features.INTRADAY_FEATURE_COLUMNS` holds them; `FEATURE_COLUMNS`
+does not. `feature_set_version()` therefore stays `24bd854eae74`, byte-identical
+to main — all 56 recorded research configs remain valid and no champion
+re-benchmark is forced.
+
+The reasoning, so it is not re-litigated from scratch: they are SAFE (the timing
+survived four adversarial passes) but do not PAY yet (AUC +0.0022 at p=0.039,
+best of two metrics on 12 folds with no multiplicity correction; nothing on
+lift, 2.0997 → 2.1108). Promotion is one line plus a re-benchmark; un-spending
+the ledger is not, and that asymmetry decided it.
+
+The evidence is also underpowered BY CONSTRUCTION, so this is "not yet", not
+"they do not work": Yahoo serves ~730 days of 1h against daily history reaching
+2021, so the columns are observable in only 21–36% of training rows per fold.
+**The decisive follow-up is both arms restricted to the intraday era (train from
+2024-10-01), where coverage is ~95%.** File that before promoting or dropping.
+
+The canary watches them despite their being unused — keying that list on
+`FEATURE_COLUMNS` alone would have silently dropped the four most leak-prone
+columns in the frame the moment they were held back.
+
 POST-MERGE OPS, in order:
 1. `twopercent intraday --interval 1h --days 700` — the one-off backfill. The
-   nightly routine refreshes only 5 days for 1h; it will NOT build the history.
+   nightly routine refreshes only 10 days for 1h; it will NOT build the history.
    (5m/1m keep re-asking their FULL window nightly — that re-ask is their
    self-healing after a missed run, and shortening it to match 1h would quietly
    remove it.)
-2. Re-benchmark the champion. `feature_set_version()` changes `24bd854eae74` →
-   `67f45c5ed724`, which un-does all 56 recorded research configs (#110) and
-   leaves the champion reference cross-feature-set until that re-run.
+2. Nothing else. No re-benchmark, no ledger invalidation — that is precisely
+   what holding them out buys.
 
-The A/B above is deliberately NOT recorded in `experiments` yet. Recording a row
-under the new feature set from an unmerged branch would itself make the live
-champion reference cross-feature-set — the precise hazard #110 exists to
-prevent — so it waits for the merge that makes the feature set real.
-
-And when the overnight loop re-sweeps those 56 configs on a new feature set, its
-"winner" is a best-of-56 on freshly-invalidated ground. Quote it with that
-attached, or not at all.
+If they are ever promoted: the fingerprint moves to `67f45c5ed724`, the 56
+configs re-open, and the overnight loop's next "winner" is a best-of-56 on
+freshly-invalidated ground. Quote it with that attached, or not at all.
 
 **Half days are identified by CALENDAR, never by data.** Two failed attempts
 are recorded because both were false ALL-CLEARS, the failure this project ranks

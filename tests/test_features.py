@@ -8,6 +8,7 @@ from twopercent import store
 from twopercent.features import (
     FEATURE_COLUMNS,
     INTRADAY_CLOSE_HOUR,
+    INTRADAY_FEATURE_COLUMNS,
     METADATA_COLUMNS,
     feature_frame,
 )
@@ -37,7 +38,12 @@ def test_lookahead_canary(con):
     Covers the sector features too: both symbols share a sector, so
     sector_breadth/sector_excess are live values, not incidental NaNs.
     """
-    watched = FEATURE_COLUMNS + METADATA_COLUMNS  # metadata must be trailing-only too
+    # INTRADAY_FEATURE_COLUMNS are watched even though they are NOT model inputs:
+    # they are computed, they are the most leak-prone columns in the frame, and
+    # keying this list on FEATURE_COLUMNS alone would have silently dropped them
+    # from the canary the moment they were held back — making four rounds of
+    # work on exactly this check vacuous.
+    watched = FEATURE_COLUMNS + METADATA_COLUMNS + INTRADAY_FEATURE_COLUMNS
     seed_history(con, {"AAA": _varied(60, 1), "BBB": _varied(60, 2)})
     _seed_universe(con, {"AAA": "Technology", "BBB": "Technology"})
     # Intraday bars for EVERY seeded day, or the phase-2 features are all-NaN

@@ -906,6 +906,24 @@ def _seed_session(con, symbols, day, hours, interval="1h"):
     con.unregister("_s")
 
 
+def _seed_daily_highs(con, symbols, days, high_by_day):
+    rows = [
+        {
+            "symbol": sym,
+            "date": day,
+            "open": 100.0,
+            "high": high_by_day[day],
+            "low": 99.0,
+            "close": 100.5,
+            "adj_close": 100.5,
+            "volume": 1_000_000,
+        }
+        for sym in symbols
+        for day in days
+    ]
+    store.upsert_prices(con, pd.DataFrame(rows))
+
+
 def test_a_calendared_half_day_is_not_a_coverage_fault(con):
     """A 13:00 half day ends three hours early BY DESIGN.
 
@@ -915,6 +933,7 @@ def test_a_calendared_half_day_is_not_a_coverage_fault(con):
     """
     syms = [f"S{i:02d}" for i in range(10)]
     full, half = dt.date(2026, 3, 2), dt.date(2026, 3, 3)
+    _seed_daily_highs(con, syms, [full, half], {full: 101.0, half: 101.0})
     _seed_session(con, syms, full, [9, 10, 11, 12, 13, 14, 15])
     _seed_session(con, syms, half, [9, 10, 11, 12])  # last bar 12:30, a 13:00 close
 
@@ -926,6 +945,40 @@ def test_a_calendared_half_day_is_not_a_coverage_fault(con):
     assert row["early_close"] and not row["truncated"]
     bad = intraday.coverage_problems(con)
     assert half not in set(pd.to_datetime(bad["date"]).dt.date)
+
+
+def test_an_outage_that_mimics_a_half_day_is_still_a_fault(con):
+    """The dangerous half of accepting half days: a FALSE ALL-CLEAR.
+
+    1h bars are hourly, so ANY outage beginning between 12:30 and 13:30 leaves
+    12:30 as the last bar — indistinguishable from a 13:00 close by timestamp
+    alone, and a full hour of onset times silently exempted on the one table a
+    re-run cannot rebuild. The timestamp only NOMINATES; the daily bar's high
+    and low CONFIRM. A real half day's short session is the whole day and
+    reproduces them; a morning-only record cannot.
+    """
+    syms = [f"S{i:02d}" for i in range(10)]
+    half, outage = dt.date(2026, 3, 3), dt.date(2026, 3, 4)
+    # The outage day traded on to a 105 high in an afternoon the record missed.
+    _seed_daily_highs(con, syms, [half, outage], {half: 101.0, outage: 105.0})
+    _seed_session(con, syms, half, [9, 10, 11, 12])
+    _seed_session(con, syms, outage, [9, 10, 11, 12])  # identical timestamps
+
+    cov = intraday.session_coverage(con)
+    by_day = {d: r for d, r in zip(pd.to_datetime(cov["date"]).dt.date, cov.to_dict("records"))}
+    assert by_day[half]["early_close"] and not by_day[half]["truncated"]
+    assert by_day[outage]["truncated"] and not by_day[outage]["early_close"]
+    assert outage in set(pd.to_datetime(intraday.coverage_problems(con)["date"]).dt.date)
+
+
+def test_an_unverifiable_short_session_is_not_given_the_benefit_of_the_doubt(con):
+    """No daily bar to check against means UNVERIFIED, never 'agreed'."""
+    syms = [f"S{i:02d}" for i in range(10)]
+    day = dt.date(2026, 3, 3)
+    _seed_session(con, syms, day, [9, 10, 11, 12])  # no daily bars seeded at all
+    cov = intraday.session_coverage(con)
+    row = cov[pd.to_datetime(cov["date"]).dt.date == day].iloc[0]
+    assert row["truncated"] and not row["early_close"]
 
 
 def test_a_feed_that_dies_mid_session_is_still_truncated(con):

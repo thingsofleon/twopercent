@@ -1200,6 +1200,20 @@ SESSION_CLOSE_MINUTES = 16 * 60
 # short session from a real one: 2026-01-30, whose feed died at 10:30, stays
 # flagged precisely because 10:30 is neither end.
 EARLY_CLOSE_MINUTES = 13 * 60
+# A half day is not identifiable from the LAST TIMESTAMP alone, and treating it
+# as if it were replaced five false alarms with something strictly worse: a
+# false ALL-CLEAR. Any 1h outage beginning anywhere between 12:30 and 13:30
+# leaves 12:30 as the last bar, exactly like a real 13:00 close -- a full hour
+# of onset times, silently exempted, on the one table a re-run cannot rebuild.
+#
+# So the timestamp only NOMINATES a session. What confirms it is the same
+# completeness test the resolver already relies on: the intraday record must
+# REPRODUCE the daily bar's high and low. A real half day's short session IS the
+# whole day, so it agrees; an outage's morning-only record cannot, because the
+# afternoon it never saw is in the daily bar. No calendar to maintain, and it
+# measures the property actually at stake (is this record complete?) rather than
+# a proxy for it. Unverifiable (no daily bar) is NOT treated as agreement.
+EARLY_CLOSE_MIN_AGREEMENT = 0.9
 SESSION_OPEN_MINUTES = 9 * 60 + 30
 # A session is short if its last bar starts more than this many minutes before
 # the expected final slot. One bar of slack absorbs a venue's early close on a
@@ -1325,7 +1339,18 @@ def session_coverage(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
         # The half-day end is matched TIGHTLY (a window, not a floor). A floor
         # would swallow every real truncation between 13:00 and the close --
         # a feed dying at 14:00 must still be a fault.
-        half = (frame["last_minute"] - early_close_last).abs() <= TRUNCATION_SLACK_MINUTES
+        # NOMINATED by the timestamp, CONFIRMED by daily-bar agreement.
+        nominated = (frame["last_minute"] - early_close_last).abs() <= TRUNCATION_SLACK_MINUTES
+        agreement = con.execute(
+            f"""
+            SELECT date, avg(CASE WHEN agrees THEN 1.0 ELSE 0.0 END) AS agree_frac
+            FROM ({session_agreement_sql(interval)}) GROUP BY date
+            """
+        ).fetchdf()
+        frame = frame.merge(agreement, on="date", how="left")
+        # A day with no daily bar to check against is UNVERIFIED, not agreed.
+        frame["agree_frac"] = frame["agree_frac"].fillna(0.0)
+        half = nominated & (frame["agree_frac"] >= EARLY_CLOSE_MIN_AGREEMENT)
         frame["early_close"] = half & ~full
         frame["truncated"] = ~(full | half)
         # A session can also lose its FRONT, and nothing here could see it:
@@ -1351,6 +1376,7 @@ def session_coverage(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
                 "first_minute",
                 "trailing_median_symbols",
                 "expected_last_minute",
+                "agree_frac",
                 "early_close",
                 "truncated",
                 "late_open",

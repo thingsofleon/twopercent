@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 from tests.conftest import seed_planted
-from twopercent import backtest, store, strategies
+from twopercent import backtest, features, store, strategies
 from twopercent.features import FEATURE_COLUMNS
 from twopercent.strategies.base import _REGISTRY, register
 
@@ -194,3 +194,60 @@ def test_benchmark_default_records_empty_strategy_params(con, monkeypatch):
     assert metrics["lift"] > 1.5  # unchanged no-params behavior
     params = json.loads(store.list_experiments(con)["params"].iloc[0])
     assert params["strategy_params"] == {}
+
+
+def test_feature_columns_override_reaches_every_strategy():
+    """A strategy is a (features-used + model + params) unit — the features half
+    must be settable, or an A/B has to edit the shipped list to run."""
+    subset = ["oc_return_today", "ret_5d", "vol_20d"]
+    for name in ("baseline_gbm_v1", "logreg_v1", "xgb_gbm_v1"):
+        assert strategies.get(name, feature_columns=subset).configured_columns == subset
+        assert strategies.get(name).configured_columns == list(features.FEATURE_COLUMNS)
+
+
+def test_feature_columns_may_name_the_held_intraday_columns():
+    columns = [*features.FEATURE_COLUMNS, *features.INTRADAY_FEATURE_COLUMNS]
+    assert strategies.get("baseline_gbm_v1", feature_columns=columns).configured_columns == columns
+
+
+def test_feature_columns_is_a_whitelist_not_a_passthrough():
+    """The override is the one seam a LABEL could reach fit() through."""
+    for leak in ("did_2pct_next", "next_oc_return", "target_date", "median_vol_20"):
+        with pytest.raises(ValueError, match="unknown feature_columns"):
+            strategies.get("baseline_gbm_v1", feature_columns=[*features.FEATURE_COLUMNS, leak])
+
+
+def test_feature_columns_rejects_empty_and_duplicates():
+    with pytest.raises(ValueError, match="feature_columns is empty"):
+        strategies.get("baseline_gbm_v1", feature_columns=[])
+    with pytest.raises(ValueError, match="duplicate feature_columns"):
+        strategies.get("baseline_gbm_v1", feature_columns=["ret_5d", "ret_5d"])
+
+
+def test_overridden_strategy_trains_on_only_those_columns(con, monkeypatch):
+    monkeypatch.setattr(backtest, "MIN_TRAIN_ROWS", 500)
+    seed_planted(con)
+    train = features.feature_frame(con)
+    train = train[train["did_2pct_next"].notna()]
+    strategy = strategies.get("baseline_gbm_v1", feature_columns=["oc_return_today", "ret_5d"])
+    strategy.fit(train)
+    assert strategy._columns == ["oc_return_today", "ret_5d"]
+    assert len(strategy.predict_proba(train)) == len(train)
+
+
+def test_benchmark_records_the_feature_set_the_model_actually_saw(con, monkeypatch):
+    """A ledger row naming the shipped feature set while the model trained on a
+    different one is exactly the lie the fingerprint exists to prevent (#110)."""
+    monkeypatch.setattr(backtest, "MIN_TRAIN_ROWS", 500)
+    seed_planted(con)
+    columns = [*features.FEATURE_COLUMNS, *features.INTRADAY_FEATURE_COLUMNS]
+    backtest.run_benchmark(
+        con,
+        "baseline_gbm_v1",
+        months=2,
+        top_n=5,
+        strategy_params={"feature_columns": columns},
+    )
+    params = json.loads(store.list_experiments(con)["params"].iloc[0])
+    assert params["feature_set"] == features.feature_set_version(columns)
+    assert params["feature_set"] != features.feature_set_version()

@@ -268,8 +268,13 @@ def run_benchmark(
             # features, so the feature set is part of the run's identity (#110).
             # Without it the research done-ledger counted every past config
             # "done" after a feature change and the loop no-op'd on results that
-            # no longer described the model (#78).
-            "feature_set": features.feature_set_version(),
+            # no longer described the model (#78). Hashed from the columns the
+            # strategy was CONFIGURED with, not the shipped list: a
+            # feature_columns override (ab.py's arms) would otherwise record a
+            # fingerprint naming features the model never saw.
+            "feature_set": features.feature_set_version(
+                getattr(strategy, "configured_columns", None)
+            ),
         }
         # Which device actually trained (strategies expose resolved_device
         # when it matters, e.g. xgb's CUDA probe). A sibling of

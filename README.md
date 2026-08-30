@@ -28,6 +28,7 @@ uv run twopercent intraday --interval 1m   # 1m bars (ground truth; expires in ~
 uv run twopercent intraday --interval 1h   # 1h bars, WHOLE UNIVERSE (feeds signal-day features)
 uv run twopercent intraday-validate    # cross-check 5m verdicts against 1m
 uv run twopercent benchmark            # walk-forward benchmark -> experiments row
+uv run twopercent ab --add <column>    # paired feature-set A/B (records nothing)
 uv run twopercent routine              # pre-open daily cycle (predict mode)
 uv run twopercent routine --mode score # post-close scoring + degradation check
 uv run twopercent research             # overnight experiment queue (budget 8/night)
@@ -170,6 +171,36 @@ WARN (exit 1 class), never exit 2 — the prediction is already logged either
 way, and no credential ever appears in logs or summaries. Dashboard render
 trouble WARNs and falls back to the composed text email; on that fallback a
 missing `dashboard.html` warns again and sends without the attachment.
+
+## Deciding a new feature (`twopercent ab`)
+
+The benchmark answers "is this STRATEGY better". It cannot answer "do these
+COLUMNS pay": each arm needs its own feature list, and two separately recorded
+rows over different months are not a comparison. `twopercent ab` runs every arm
+in one process over one feature frame and one fold list, so the column list is
+the only thing that differs:
+
+```sh
+uv run twopercent ab --add close_vwap_gap --add intraday_vol \
+    --seeds 42,43,44 --train-start 2024-10-01
+```
+
+- AUC is paired by **fold**, precision@N by **day** — the unit each metric is
+  actually computed over.
+- Seeds are averaged WITHIN a fold/day *before* pairing. Comparing a difference
+  of arm means against the SPREAD of a few seeds is the mistake that produced a
+  wrong first answer on both feature batches so far: seed spread is model-fit
+  variance, not sampling variance, and the range of 3 iid draws is ~1.69 sigma.
+- Both a t-test and an exact sign test are always reported. Quoting whichever
+  is smaller is the same best-of-two error, one level up.
+- `--train-start` confines every arm to an era where the columns are observed.
+  It moves the training window for all arms, so the run stays comparable across
+  arms and stops being comparable to the standard-window benchmark.
+- It **records nothing**. An A/B is not a benchmark and never enters the
+  promotion gauntlet.
+- A column that is all-NaN over the selected rows is a hard error, not a
+  finding: strategies drop such a column, so the arms would train identically
+  and the run would report "no difference" as though it had measured one.
 
 ## The research loop (overnight)
 

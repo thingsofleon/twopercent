@@ -323,6 +323,71 @@ a SYSTEMATIC offset (AUC up in 56/56 here) into a band that is Bonferroni on
 NOISE, so a larger feature effect would have filed a promotion candidate that
 was purely an artifact.
 
+## The intraday four, decided on a powered test (#116, 2026-08-30)
+
+#115 held the four signal-day intraday features out of `FEATURE_COLUMNS` on
+evidence that was underpowered by construction (21–36% coverage in training
+rows). #116 re-ran the comparison with **both arms confined to the intraday era**
+(`--train-start 2024-10-01`), where coverage is **91.2%** of selected rows and
+88.5–90.9% of every fold's training rows. Same 12 folds, same 250 test days,
+same rows, 3 seeds averaged within fold/day before pairing; `twopercent ab`, one
+process, nothing recorded.
+
+| | without (17) | with (21) | delta |
+|---|---|---|---|
+| AUC | 0.72902 | 0.73114 | **+0.00214** |
+| precision@20 | 0.73053 | 0.73913 | **+0.00860** |
+| lift | 2.0872 | 2.1118 | +0.0246 |
+
+| test | n | positive | p(t) | p(sign) | detectable at 80% power |
+|---|---|---|---|---|---|
+| AUC, paired by FOLD | 12 | 10/12 | **0.0047** | 0.0386 | 0.00187 |
+| p@20, paired by DAY | 250 | 125 up / 98 down / 27 tied | **0.0223** | 0.0814 | 0.01153 |
+
+Two primary tests, so the threshold is 0.025 Bonferroni-corrected.
+
+**The AUC gain is now established.** +0.00214 clears the run's own minimum
+detectable effect, holds in 10 of 12 folds, and survives the correction. At 25%
+coverage this was arguable; at 91% it is not. The four features carry real
+information about the next day's reach.
+
+**The precision@20 gain is not.** It clears the corrected threshold on the
+t-test alone and fails every other way of looking at it:
+
+- The sign test says nothing (p = 0.081): 125 days up, 98 down, 27 tied. The
+  mean is carried by magnitude on a minority of days, not by a daily edge.
+- The effect (+0.0086) is BELOW the run's own 80%-power MDE (+0.0115), so the
+  detection came from the low-power regime where a barely-significant estimate
+  is the inflated tail of its own sampling distribution.
+- It fails the project's own both-halves rule: first half +0.0051 (p = 0.31),
+  second half +0.0121 (p = 0.033).
+- Excluding the two best months it falls to +0.0051 (p = 0.21, 103/208 days).
+  Monthly deltas run +0.028 (2026-07) to −0.010 (2026-02), 8 of 12 positive,
+  and the MOST RECENT month — the closest thing here to out-of-sample — is
+  **negative** (2026-08, −0.0092).
+- It is not a coverage ramp: training coverage rises only 88.5% → 90.9% across
+  the twelve folds and the fold-level AUC deltas show no matching trend.
+
+**DECIDED: the four stay held.** `feature_set_version()` remains `24bd854eae74`,
+the 56 recorded configs stay valid, no re-benchmark is forced.
+
+Two honest notes on that decision, so it is not read as more clear-cut than it
+is. First, #116's rule as written is a NECESSARY condition ("promote only on a
+gain that reaches the shipped metric"), never a sufficient one; read as
+sufficient, p(t) = 0.0223 < 0.025 would say promote. Sufficiency was never
+pre-registered, and the halves/leave-out-months checks that overturned it were
+not pre-registered either — they can only argue against promotion, and the
+default they fall back on costs nothing and reverses in one line. Second, this
+is no longer #115's "they do not pay": they demonstrably sharpen the ranking and
+demonstrably do not move its top. That is the same shape #110's six price
+features showed, and the same suspected cause — collinear volatility measures
+lifting global discrimination without reordering the top 20.
+
+The next move on them is therefore NOT another A/B on the same four columns
+against the same window. Either find a form of them that is not collinear with
+`vol_20d`/`range_20d`, or accept that top-20 precision is the wrong place to
+look for an AUC-sized effect.
+
 ## Paper trading — is the prediction TRADEABLE? (decided 2026-08-13)
 
 The dashboard measures PREDICTION. This measures whether the prediction survives
@@ -671,6 +736,9 @@ The evidence is also underpowered BY CONSTRUCTION, so this is "not yet", not
 2021, so the columns are observable in only 21–36% of training rows per fold.
 **The decisive follow-up is both arms restricted to the intraday era (train from
 2024-10-01), where coverage is ~95%.** File that before promoting or dropping.
+That test was #116 and it has now RUN — see "The intraday four, decided on a
+powered test" below. The hold stands, for a different and better-supported
+reason than the one above.
 
 The canary watches them despite their being unused — keying that list on
 `FEATURE_COLUMNS` alone would have silently dropped the four most leak-prone
@@ -855,5 +923,29 @@ truth for *decisions and plan shape*; GitHub is the source of truth for
   Stale "+2% open-to-close candidates" labels fixed to reach/intraday; the daily
   email reframed from trade suggestions to ranked-prediction language.
   Supersedes/closes #68 (fee removal). Stage C (calibration) remains open.
+  Shipped (#116): `twopercent ab`, a paired feature-set A/B, and the decision it
+  was built to make. Both feature batches so far (#110, #115) were first judged
+  by comparing a difference of arm MEANS against the SPREAD of three seeds — a
+  ruler biased toward the null, since seed spread is model-fit variance and the
+  range of 3 iid draws is ~1.69σ. `ab.py` runs every arm in ONE process over ONE
+  feature frame and ONE fold list, pairs AUC by fold and precision@N by day,
+  averages seeds WITHIN a fold/day before pairing, and always reports both a
+  t-test and an exact sign test plus `mde_80` (the smallest effect the run could
+  have caught) — so an underpowered null can never again read as a verdict. It
+  records nothing and is NOT the referee; a lockstep test pins its reference arm
+  to reproduce `run_benchmark` exactly. Seams: strategies take a `feature_columns`
+  kwarg, a WHITELIST (shipped columns + the held intraday four) because an
+  override is the one seam a label column could reach `fit` through; and the
+  referee now records the fingerprint of the columns the strategy was CONFIGURED
+  with, so a ledger row can no longer name a feature set the model never trained
+  on. `feature_set_version()` with no argument is byte-identical (`24bd854eae74`,
+  pinned by a test on the literal hash). An arm distinguished only by all-NaN
+  columns is a hard ERROR — otherwise both arms train identically and the run
+  reports "no difference" as though it had measured one.
+  The verdict: the intraday four STAY HELD — AUC gain established at 91%
+  coverage (+0.00214, 10/12 folds, p=0.0047, above its own MDE), precision@20
+  gain not (sign test p=0.081, below its own MDE, fails both-halves, collapses
+  to p=0.21 excluding the two best months, negative in the most recent month).
+  See "The intraday four, decided on a powered test" above.
   Exit criterion: a real degradation → investigation cycle observed, or at
   minimum both timers proven live — NOT complete yet.

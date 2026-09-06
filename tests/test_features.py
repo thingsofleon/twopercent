@@ -326,6 +326,21 @@ def test_feature_set_version_changes_with_the_columns():
         F.FEATURE_COLUMNS = original
 
 
+def test_feature_set_version_of_the_shipped_set_is_pinned():
+    """The 56 recorded research configs are keyed on this exact string.
+
+    Changing FEATURE_COLUMNS is allowed and invalidates them on purpose; a
+    refactor that changes the FINGERPRINT without changing the columns would
+    invalidate them by accident, which is the same ledger loss with none of the
+    intent. #115 held the four intraday features out precisely to keep it.
+    """
+    import twopercent.features as F
+
+    assert F.feature_set_version() == "24bd854eae74"
+    assert F.feature_set_version(F.FEATURE_COLUMNS) == F.feature_set_version()
+    assert F.feature_set_version(F.FEATURE_COLUMNS + F.INTRADAY_FEATURE_COLUMNS) == "67f45c5ed724"
+
+
 def _one_intraday_session(con, symbol, day, hours, *, interval="1h"):
     """Insert a session with EXACTLY the given hours, so the gate can be probed."""
     rows = pd.DataFrame(

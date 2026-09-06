@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 from pathlib import Path
 
@@ -21,6 +22,10 @@ app = typer.Typer(help="Scanner + predictor for +2% open-to-close US stock moves
 
 DbOption = typer.Option(store.DEFAULT_DB_PATH, "--db", help="Path to the DuckDB file.")
 OutOption = typer.Option(Path("dashboard.html"), "--out", help="Output HTML path.")
+AbAddOption = typer.Option(
+    None, "--add", help="Column the with-arm adds on top of FEATURE_COLUMNS (repeatable)."
+)
+AbOutOption = typer.Option(None, "--out", help="Write the full result as JSON here.")
 QueueOption = typer.Option(
     Path("research/queue.json"), "--queue", help="Experiment queue JSON (edited via PR)."
 )
@@ -159,6 +164,65 @@ def compare_cmd(
     typer.echo(
         _compare_verdict(strat_a, results[strat_a]["lift"], strat_b, results[strat_b]["lift"])
     )
+
+
+@app.command("ab")
+def ab_cmd(
+    add: list[str] = AbAddOption,
+    strategy: str = typer.Option(None, help="Strategy name (default: champion)."),
+    months: int = typer.Option(12, help="Test months (walk-forward, monthly retrain)."),
+    top: int = typer.Option(20, help="Daily top-N for precision@N."),
+    seeds: str = typer.Option("42,43,44", help="Comma-separated seeds, averaged within fold/day."),
+    train_start: str = typer.Option(
+        None,
+        help="Drop rows with target_date before this ISO date — confines BOTH arms to an era "
+        "where the added columns are observed. Makes the run incomparable to the benchmark.",
+    ),
+    out: Path = AbOutOption,
+    db: Path = DbOption,
+) -> None:
+    """Paired A/B of a feature set against FEATURE_COLUMNS. Records nothing."""
+    from twopercent import ab, champion, features, strategies
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if not add:
+        held = sorted(strategies.SELECTABLE_FEATURE_COLUMNS - set(features.FEATURE_COLUMNS))
+        typer.echo(
+            "--add is required (at least one column). Selectable but not currently shipped: "
+            + (", ".join(held) or "none")
+        )
+        raise typer.Exit(2)
+    name = strategy or champion.get_champion()
+    if name not in strategies.names():
+        typer.echo(f"Unknown strategy {name!r}. Available: {', '.join(strategies.names())}")
+        raise typer.Exit(2)
+    try:
+        seed_values = [int(s) for s in seeds.split(",") if s.strip()]
+    except ValueError:
+        typer.echo(f"--seeds must be comma-separated integers, got {seeds!r}")
+        raise typer.Exit(2) from None
+    if not seed_values:
+        typer.echo("--seeds is empty")
+        raise typer.Exit(2)
+    start = dt.date.fromisoformat(train_start) if train_start else None
+
+    con = store.connect(db)
+    result = ab.run_ab(
+        con,
+        arms={
+            "without": list(features.FEATURE_COLUMNS),
+            "with": list(features.FEATURE_COLUMNS) + list(add),
+        },
+        strategy_name=name,
+        months=months,
+        top_n=top,
+        seeds=seed_values,
+        train_start=start,
+    )
+    typer.echo(ab.format_report(result))
+    if out:
+        out.write_text(json.dumps(result, indent=2, default=str))
+        typer.echo(f"wrote {out}")
 
 
 @app.command("predict")

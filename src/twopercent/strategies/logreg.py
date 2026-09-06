@@ -10,8 +10,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from twopercent.features import FEATURE_COLUMNS
-from twopercent.strategies.base import register
+from twopercent.strategies.base import register, resolve_feature_columns
 
 logger = logging.getLogger(__name__)
 
@@ -19,9 +18,14 @@ logger = logging.getLogger(__name__)
 @register("logreg_v1")
 class LogReg:
     """Impute → scale → logistic regression: a linear yardstick
-    (class-balanced; ranking metrics comparable, brier not)."""
+    (class-balanced; ranking metrics comparable, brier not).
 
-    def __init__(self) -> None:
+    `feature_columns` overrides the model inputs (validated whitelist, see
+    resolve_feature_columns); omitted, it is FEATURE_COLUMNS as always.
+    """
+
+    def __init__(self, feature_columns: list[str] | None = None) -> None:
+        self.configured_columns: list[str] = resolve_feature_columns("logreg_v1", feature_columns)
         # Always empty: unobserved columns are imputed as constants, never dropped.
         self.dropped_columns: list[str] = []
         self._model = Pipeline(
@@ -33,7 +37,7 @@ class LogReg:
         )
 
     def fit(self, train: pd.DataFrame) -> None:
-        empty = [col for col in FEATURE_COLUMNS if train[col].notna().sum() == 0]
+        empty = [col for col in self.configured_columns if train[col].notna().sum() == 0]
         if empty:
             logger.warning(
                 "logreg_v1: %d feature column(s) have zero observed values in training "
@@ -41,8 +45,8 @@ class LogReg:
                 len(empty),
                 ", ".join(empty),
             )
-        self._model.fit(train[FEATURE_COLUMNS], train["did_2pct_next"])
+        self._model.fit(train[self.configured_columns], train["did_2pct_next"])
 
     def predict_proba(self, rows: pd.DataFrame) -> pd.Series:
-        probs = self._model.predict_proba(rows[FEATURE_COLUMNS])[:, 1]
+        probs = self._model.predict_proba(rows[self.configured_columns])[:, 1]
         return pd.Series(probs, index=rows.index)

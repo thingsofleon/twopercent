@@ -5,6 +5,20 @@ from twopercent.strategies import (
     logreg,  # noqa: F401  (registers on import)
     xgb_gbm,  # noqa: F401  (registers on import)
 )
-from twopercent.strategies.base import Strategy, get, names, register
+from twopercent.strategies.base import (
+    SELECTABLE_FEATURE_COLUMNS,
+    Strategy,
+    get,
+    names,
+    register,
+    resolve_feature_columns,
+)
 
-__all__ = ["Strategy", "get", "names", "register"]
+__all__ = [
+    "SELECTABLE_FEATURE_COLUMNS",
+    "Strategy",
+    "get",
+    "names",
+    "register",
+    "resolve_feature_columns",
+]

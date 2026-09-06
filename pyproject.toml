@@ -8,6 +8,10 @@ dependencies = [
     "pandas>=2.2",
     "playwright>=1.61.0",
     "requests>=2.32",
+    # Direct import in ab.py (paired tests). It arrives transitively with
+    # scikit-learn anyway; declared because relying on that is how a dependency
+    # disappears in a future sklearn release.
+    "scipy>=1.14",
     "scikit-learn>=1.9.0",
     "typer>=0.15",
     "xgboost>=3.3.0",

@@ -7,8 +7,7 @@ import logging
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 
-from twopercent.features import FEATURE_COLUMNS
-from twopercent.strategies.base import register
+from twopercent.strategies.base import register, resolve_feature_columns
 
 logger = logging.getLogger(__name__)
 
@@ -24,16 +23,21 @@ class BaselineGBM:
     (research configs use max_iter/learning_rate/max_depth); defaults are
     DEFAULT_PARAMS, so no-arg construction is the historical baseline. An
     unknown kwarg raises TypeError at construction — never a silent default.
+    `feature_columns` overrides the model inputs (validated whitelist, see
+    resolve_feature_columns); omitted, it is FEATURE_COLUMNS as always.
     """
 
-    def __init__(self, **params) -> None:
+    def __init__(self, feature_columns: list[str] | None = None, **params) -> None:
         self._model = HistGradientBoostingClassifier(**{**DEFAULT_PARAMS, **params})
-        self._columns: list[str] = list(FEATURE_COLUMNS)
+        self.configured_columns: list[str] = resolve_feature_columns(
+            "baseline_gbm_v1", feature_columns
+        )
+        self._columns: list[str] = list(self.configured_columns)
         self.dropped_columns: list[str] = []
 
     def fit(self, train: pd.DataFrame) -> None:
-        empty = [col for col in FEATURE_COLUMNS if train[col].notna().sum() == 0]
-        if len(empty) == len(FEATURE_COLUMNS):
+        empty = [col for col in self.configured_columns if train[col].notna().sum() == 0]
+        if len(empty) == len(self.configured_columns):
             raise ValueError(
                 "baseline_gbm_v1: every feature column has zero observed values in "
                 "training data — nothing to train on (migrated store before a universe "
@@ -47,7 +51,7 @@ class BaselineGBM:
                 ", ".join(empty),
             )
         self.dropped_columns = empty
-        self._columns = [col for col in FEATURE_COLUMNS if col not in empty]
+        self._columns = [col for col in self.configured_columns if col not in empty]
         self._model.fit(train[self._columns], train["did_2pct_next"])
 
     def predict_proba(self, rows: pd.DataFrame) -> pd.Series:

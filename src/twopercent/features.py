@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import logging
+from collections.abc import Sequence
 
 import duckdb
 import pandas as pd
@@ -361,8 +362,8 @@ def _warn_intraday_coverage(out: pd.DataFrame) -> None:
     )
 
 
-def feature_set_version() -> str:
-    """Short fingerprint of the active feature set, for experiment identity.
+def feature_set_version(columns: Sequence[str] | None = None) -> str:
+    """Short fingerprint of a feature set, for experiment identity.
 
     A recorded benchmark is only comparable to another run over the SAME
     features. The research loop's done-ledger keyed on (strategy, params) alone,
@@ -375,8 +376,15 @@ def feature_set_version() -> str:
     Redefining what an existing column MEANS without renaming it will not
     invalidate the ledger. Rename the column, or purge the affected rows by hand.
     Sorted, so reordering the list alone does not trigger a pointless re-sweep.
+
+    `columns` defaults to FEATURE_COLUMNS — the shipped set, and the only value
+    that has ever been hashed, so the fingerprint of a normal run is unchanged.
+    It is passed explicitly by the referee when a strategy was pointed at a
+    different set (`configured_columns`): a recorded row whose feature_set named
+    the shipped list while the model trained on another one would be a ledger
+    that lies, which is precisely the failure this fingerprint exists to prevent.
     """
-    joined = ",".join(sorted(FEATURE_COLUMNS))
+    joined = ",".join(sorted(FEATURE_COLUMNS if columns is None else columns))
     return hashlib.sha256(joined.encode()).hexdigest()[:12]
 
 

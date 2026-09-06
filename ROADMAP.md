@@ -346,10 +346,16 @@ process, nothing recorded.
 
 Two primary tests, so the threshold is 0.025 Bonferroni-corrected.
 
-**The AUC gain is now established.** +0.00214 clears the run's own minimum
-detectable effect, holds in 10 of 12 folds, and survives the correction. At 25%
-coverage this was arguable; at 91% it is not. The four features carry real
-information about the next day's reach.
+**The AUC gain is real by this run's primary test.** +0.00214 clears the run's
+own minimum detectable effect, holds in 10 of 12 folds, and its t-test (0.0047)
+survives the correction. At 25% coverage this was arguable; at 91% it is not.
+Caveats that keep "established" out of that sentence (quant-skeptic, 2026-09-06):
+the AUC SIGN test (0.0386) does not clear the corrected 0.025 bar, and
+expanding-window folds share most of their training data, so the 12 fold deltas
+are not independent and the t is optimistic (leave-one-fold-out p stays ≤ 0.011
+in all 12 cases, so it is robust in-sample — but it is still the third look at
+this one window). Read it as: the four features very likely carry real ranking
+information; do not quote it as proven.
 
 **The precision@20 gain is not.** It clears the corrected threshold on the
 t-test alone and fails every other way of looking at it:
@@ -358,7 +364,9 @@ t-test alone and fails every other way of looking at it:
   mean is carried by magnitude on a minority of days, not by a daily edge.
 - The effect (+0.0086) is BELOW the run's own 80%-power MDE (+0.0115), so the
   detection came from the low-power regime where a barely-significant estimate
-  is the inflated tail of its own sampling distribution.
+  is the inflated tail of its own sampling distribution. (This is a restatement
+  of 2.25 < t < 3.08, not evidence independent of the t-test — a winner's-curse
+  reading of the same number, counted once.)
 - It fails the project's own both-halves rule: first half +0.0051 (p = 0.31),
   second half +0.0121 (p = 0.033).
 - Excluding the two best months it falls to +0.0051 (p = 0.21, 103/208 days).
@@ -366,19 +374,40 @@ t-test alone and fails every other way of looking at it:
   and the MOST RECENT month — the closest thing here to out-of-sample — is
   **negative** (2026-08, −0.0092).
 - It is not a coverage ramp: training coverage rises only 88.5% → 90.9% across
-  the twelve folds and the fold-level AUC deltas show no matching trend.
+  the twelve folds and the fold-level AUC deltas show no matching trend. (Those
+  per-fold numbers were recomputed from the store — the shipped
+  `research/ab_116_intraday_era.json` predates the harness recording
+  `coverage_by_fold_train`, which it now does, so future runs carry them.)
+- **Found in review (quant-skeptic, 2026-09-06): the 250 daily deltas are not
+  independent** — every day in a month shares one trained model pair, so the
+  naive t overstates certainty. Fold-clustered SEs (12 clusters, df=11) put
+  p at 0.0253 (CR0) to 0.031 (CR1); a t-test on the 12 monthly means gives
+  0.037 (all three recomputed from the checked-in vectors). No estimator lands
+  below the 0.025 bar — so the pre-registered rule does not say promote even
+  read as sufficient — but CR0 misses it by three ten-thousandths, so the hold
+  does NOT rest on that boundary alone: it rests on the boundary AND the
+  below-MDE effect size AND the silent sign test AND the failed halves AND the
+  negative most-recent month, all pointing the same way.
 
 **DECIDED: the four stay held.** `feature_set_version()` remains `24bd854eae74`,
 the 56 recorded configs stay valid, no re-benchmark is forced.
 
-Two honest notes on that decision, so it is not read as more clear-cut than it
-is. First, #116's rule as written is a NECESSARY condition ("promote only on a
-gain that reaches the shipped metric"), never a sufficient one; read as
-sufficient, p(t) = 0.0223 < 0.025 would say promote. Sufficiency was never
-pre-registered, and the halves/leave-out-months checks that overturned it were
-not pre-registered either — they can only argue against promotion, and the
-default they fall back on costs nothing and reverses in one line. Second, this
-is no longer #115's "they do not pay": they demonstrably sharpen the ranking and
+Three honest notes on that decision, so it is not read as more clear-cut than
+it is. First, #116's rule as written is a NECESSARY condition ("promote only on
+a gain that reaches the shipped metric"), never a sufficient one; read as
+sufficient, the naive p(t) = 0.0223 < 0.025 would have said promote — the
+fold-clustered correction above resolves that tension (p ≥ 0.0253, no), but the
+halves/leave-out-months checks first offered against it were chosen after
+seeing the numbers, and a robustness battery invented per-decision quietly
+shrinks the effective promotion alpha. NEXT TIME: fix the battery in the
+decision issue before the run (the both-halves rule already has pre-existing
+provenance in the promotion gate; leave-out-best-months does not, and is
+mechanically biased toward "not robust"). Second, MULTIPLICITY ACROSS RUNS:
+this same 12-month window has now judged these same four columns THREE times
+(#115's merge-time A/B, its corrected paired re-run, #116). Repeated looks bias
+toward eventually crossing a threshold; a fourth A/B of these columns against
+this window cannot present itself as a clean two-test run. Third, this is no
+longer #115's "they do not pay": they demonstrably sharpen the ranking and
 demonstrably do not move its top. That is the same shape #110's six price
 features showed, and the same suspected cause — collinear volatility measures
 lifting global discrimination without reordering the top 20.

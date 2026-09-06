@@ -142,6 +142,18 @@ def run_ab(
     """
     if len(arms) < 2:
         raise ValueError("an A/B needs at least two arms")
+    if len(set(seeds)) != len(seeds):
+        # Duplicates would double-append to the pooled vectors and trigger a
+        # misleading "strategy ignored the seed" warning about identical runs.
+        raise ValueError(f"duplicate seeds: {list(seeds)}")
+    reserved = {seed_param, "feature_columns"} & set(strategy_params or {})
+    if reserved:
+        # run_ab owns these two keys; silently overwriting a caller's value
+        # would run a different experiment than the one the caller described.
+        raise ValueError(
+            f"strategy_params may not set {sorted(reserved)} — the harness assigns them per "
+            "arm and per seed"
+        )
     arm_names = list(arms)
     resolved = {name: list(cols) for name, cols in arms.items()}
     for name, cols in resolved.items():
@@ -198,8 +210,9 @@ def run_ab(
         a: {s: [] for s in seeds} for a in arms
     }
     dropped: dict[str, set[str]] = {a: set() for a in arms}
-    train_coverage: dict[str, float] = {col: 1.0 for col in under_test}
+    coverage_by_fold: dict[str, dict[str, float]] = {}
     folds_run = 0
+    first_run_start: dt.date | None = None
     floored_row_days = 0
     unscoreable_days = 0
 
@@ -214,8 +227,14 @@ def run_ab(
             )
             continue
         folds_run += 1
-        for col, frac in _column_coverage(train, under_test).items():
-            train_coverage[col] = min(train_coverage[col], frac)
+        if first_run_start is None:
+            # Skipped folds must not be claimed (same rule as the referee): the
+            # reported test_start is the first fold that RAN, or the persisted
+            # result would describe a window the run never tested.
+            first_run_start = month_start
+        # Per-fold training coverage rides in the result so a claim like "no
+        # coverage ramp across folds" is re-derivable from the artifact alone.
+        coverage_by_fold[month_start.isoformat()] = _column_coverage(train, under_test)
         for arm in arm_names:
             for seed in seeds:
                 params = {
@@ -231,6 +250,12 @@ def run_ab(
                 pooled[arm][seed].append((probs, labels))
                 if labels.nunique() > 1:
                     fold_auc[arm][seed][month_start] = float(roc_auc_score(labels, probs))
+                elif arm == arm_names[0] and seed == seeds[0]:
+                    logger.warning(
+                        "fold %s is single-class in its test rows — it contributes no AUC "
+                        "pair, so the AUC n will be smaller than the fold count",
+                        month_start,
+                    )
                 for target_date, day_rows in test.assign(prob=probs).groupby("target_date"):
                     # The referee's selection rule, reused verbatim: the shipped
                     # liquidity floor applies at SELECTION only, never to
@@ -306,11 +331,17 @@ def run_ab(
             labels = pd.concat([lab for _, lab in pooled[arm][seed]])
             if labels.nunique() > 1:
                 pooled_auc.append(float(roc_auc_score(labels, probs)))
-        precision = (
-            sum(precision_by_day[arm].values()) / len(precision_by_day[arm])
-            if precision_by_day[arm]
-            else float("nan")
-        )
+        if not precision_by_day[arm]:
+            raise RuntimeError("every test day fell below the liquidity floor — no top-N to score")
+        precision = sum(precision_by_day[arm].values()) / len(precision_by_day[arm])
+        if not pooled_auc:
+            # The referee reports a None AUC gracefully; an A/B cannot — the
+            # comparison IS the output, and a None would surface an hour later
+            # as a TypeError in the delta arithmetic.
+            raise RuntimeError(
+                f"arm {arm!r}: pooled test labels are single-class — AUC undefined, "
+                "arms cannot be compared"
+            )
         arm_summary[arm] = {
             "auc_by_fold": {k.isoformat(): v for k, v in auc_by_fold[arm].items()},
             "precision_by_day": {k.isoformat(): v for k, v in precision_by_day[arm].items()},
@@ -360,14 +391,18 @@ def run_ab(
         "seed_ignored_by": seed_blind,
         "train_start": train_start.isoformat() if train_start else None,
         "folds": folds_run,
+        "folds_requested": len(folds),
         "test_days": len(precision_by_day[reference]),
-        "test_start": folds[0][0].isoformat(),
+        "test_start": first_run_start.isoformat(),
         "test_end": folds[-1][1].isoformat(),
         "labeled_rows": int(len(labeled)),
         "base_rate": base_rate,
         "columns_under_test": under_test,
         "coverage_all_rows": coverage,
-        "coverage_min_fold_train": train_coverage,
+        "coverage_by_fold_train": coverage_by_fold,
+        "coverage_min_fold_train": {
+            col: min(per_fold[col] for per_fold in coverage_by_fold.values()) for col in under_test
+        },
         "arms": arm_summary,
         "comparisons": comparisons,
         "multiplicity": {

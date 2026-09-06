@@ -32,17 +32,25 @@ def _arms(**kwargs):
     return {"without": WITHOUT, "with": WITH, **kwargs}
 
 
-def test_reference_arm_reproduces_the_referee(con, monkeypatch):
+def test_reference_arm_reproduces_the_referee(con, monkeypatch, caplog):
     """The A/B's ruler IS the benchmark's ruler.
 
     ab.py runs its own fold loop, so nothing but this test stops the two from
     drifting into measuring subtly different things — at which point the
     decision rule ("must reach the SHIPPED metric") would be enforced with a
     ruler the shipped metric is not measured on.
+
+    A third of the runners sit BELOW the liquidity floor, deliberately: with
+    every symbol eligible, deleting the floor filter (or the empty-day skip)
+    from ab.py would leave this test green — parity must be pinned on the
+    partial-coverage path, where the two loops can actually diverge (reviewer
+    finding, PR #117).
     """
     monkeypatch.setattr(backtest, "MIN_TRAIN_ROWS", 500)
     seed_planted(con)
-    metrics = backtest.run_benchmark(con, "baseline_gbm_v1", months=2, top_n=5, record=False)
+    con.execute("UPDATE prices SET volume = 50_000 WHERE symbol LIKE 'RUN0%'")
+    with caplog.at_level(logging.WARNING):
+        metrics = backtest.run_benchmark(con, "baseline_gbm_v1", months=2, top_n=5, record=False)
     result = ab.run_ab(
         con,
         arms=_arms(),
@@ -58,6 +66,48 @@ def test_reference_arm_reproduces_the_referee(con, monkeypatch):
     assert reference["lift"] == pytest.approx(metrics["lift"], abs=5e-4)
     assert result["test_days"] == metrics["test_days"]
     assert result["folds"] == metrics["folds"]
+    # The floored path actually ran — otherwise the pin above proves nothing.
+    assert "liquidity floor" in caplog.text
+
+
+def test_skipped_folds_are_not_claimed_in_test_start(con, monkeypatch):
+    """Same rule the referee already paid for (backtest.first_run_start): the
+    persisted result must describe the window the run TESTED, not the one it
+    requested — a fold skipped for thin training data is not part of it."""
+    monkeypatch.setattr(backtest, "MIN_TRAIN_ROWS", 2000)  # first of 3 folds has ~1200
+    seed_planted(con)
+    result = ab.run_ab(
+        con, arms=_arms(), strategy_name="baseline_gbm_v1", months=3, top_n=5, seeds=[42]
+    )
+    metrics = backtest.run_benchmark(con, "baseline_gbm_v1", months=3, top_n=5, record=False)
+    assert result["folds_requested"] == 3
+    assert result["folds"] == metrics["folds"] == 2
+    assert result["test_start"] == "2026-04-01"  # first fold that RAN, not 2026-03-01
+    assert set(result["coverage_by_fold_train"]) == {"2026-04-01", "2026-05-01"}
+
+
+def test_every_day_floored_is_a_hard_error_not_a_nan(con, monkeypatch):
+    monkeypatch.setattr(backtest, "MIN_TRAIN_ROWS", 500)
+    seed_planted(con)
+    con.execute("UPDATE prices SET volume = 50_000")
+    with pytest.raises(RuntimeError, match="liquidity floor"):
+        ab.run_ab(con, arms=_arms(), strategy_name="baseline_gbm_v1", months=2, top_n=5, seeds=[42])
+
+
+def test_duplicate_seeds_rejected(con):
+    with pytest.raises(ValueError, match="duplicate seeds"):
+        ab.run_ab(con, arms=_arms(), strategy_name="baseline_gbm_v1", seeds=[42, 42, 43])
+
+
+def test_strategy_params_may_not_shadow_harness_owned_keys(con):
+    for params in ({"random_state": 7}, {"feature_columns": WITHOUT}):
+        with pytest.raises(ValueError, match="harness assigns them"):
+            ab.run_ab(
+                con,
+                arms=_arms(),
+                strategy_name="baseline_gbm_v1",
+                strategy_params=params,
+            )
 
 
 def test_arms_are_the_only_difference_and_are_recorded_by_fingerprint(con, monkeypatch):
@@ -153,6 +203,9 @@ def test_coverage_is_reported_for_every_column_under_test(con, monkeypatch):
     for col in features.INTRADAY_FEATURE_COLUMNS:
         assert 0.0 < result["coverage_all_rows"][col] <= 1.0
         assert 0.0 < result["coverage_min_fold_train"][col] <= 1.0
+        per_fold = [f[col] for f in result["coverage_by_fold_train"].values()]
+        assert len(per_fold) == result["folds"]
+        assert result["coverage_min_fold_train"][col] == min(per_fold)
     report = ab.format_report(result)
     assert "Bonferroni" in report
     assert "nothing here is recorded" in report

@@ -258,6 +258,16 @@ def run_benchmark(
         },
     }
     if record:
+        configured_columns = getattr(strategy, "configured_columns", None)
+        if configured_columns is None:
+            # The shipped fingerprint is recorded on TRUST for such a strategy —
+            # exactly the ledger lie the configured_columns recording exists to
+            # prevent, so the trust must at least be loud.
+            logger.warning(
+                "strategy %s does not expose configured_columns — recording the shipped "
+                "feature-set fingerprint on the assumption it trained on FEATURE_COLUMNS",
+                strategy_name,
+            )
         params = {
             "months": months,
             "top_n": top_n,
@@ -272,9 +282,7 @@ def run_benchmark(
             # strategy was CONFIGURED with, not the shipped list: a
             # feature_columns override (ab.py's arms) would otherwise record a
             # fingerprint naming features the model never saw.
-            "feature_set": features.feature_set_version(
-                getattr(strategy, "configured_columns", None)
-            ),
+            "feature_set": features.feature_set_version(configured_columns),
         }
         # Which device actually trained (strategies expose resolved_device
         # when it matters, e.g. xgb's CUDA probe). A sibling of

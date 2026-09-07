@@ -31,6 +31,19 @@ be corrected — and it will be, it is currently an estimate — without rewriti
 history, and the same trades can be shown at several cost levels. report()
 returns a SENSITIVITY table rather than one number, because a single net figure
 invites trusting a cost assumption that has not been measured.
+
+OUTCOMES ARE FROZEN AT FIRST RECORDING — deliberately, and it costs accuracy.
+The score run records ~50 minutes after the close, and the provider's bars keep
+revising after that: measured 2026-09-08 on the live store, 15 recorded days
+disagreed with the then-current tape by ~30pp of top-1 compounded growth (4
+fill verdicts flipped by revised opens/highs; on one day the eventual rank-1
+symbol's bar had not arrived at recording time at all). The ledger keeps the
+FIRST post-close observation anyway, because re-recording would let a table
+sold as immutable rewrite itself every time the feed moved — but that makes it
+a record of what was SEEN, not of the final tape, and the two can disagree.
+drift() measures that disagreement instead of leaving it to be discovered;
+--grid prints it. The revisions observed so far were not systematically
+conservative (three hurt the ledger, one helped).
 """
 
 from __future__ import annotations
@@ -106,7 +119,12 @@ GRID_RULES = ("hold_close", "limit_2pct")
 GRID_BASKETS = (1, 5, 10, PAPER_TOP_N)
 # Per-basket day floors, replacing the one-size MIN_REPORT_DAYS for grid cells:
 # a top-1 cell is ONE pick per day, so at 20 days its growth is a coin path.
-# Scaled so the smallest baskets cannot graduate first just by being noisy.
+# HONESTY (quant-skeptic, PR #119): these floors do NOT equalize evidence.
+# Measured daily sd runs ~0.052 (top-1) to ~0.011 (top-20), so top-1 at its
+# 60-day floor still carries ~2.7x the standard error of top-20 at 20 days —
+# SE parity would need ~450 top-1 days, which is not a floor, it is a career.
+# The floors only remove the absurdest reads; the per-cell mde80_daily column
+# is the real power statement, and the reader must use it.
 GRID_MIN_DAYS = {1: 60, 5: 40, 10: MIN_REPORT_DAYS, PAPER_TOP_N: MIN_REPORT_DAYS}
 
 
@@ -381,7 +399,18 @@ def _pick_returns(
     counted — the alternative is a growth curve silently computed over easier
     days than the ones on screen. In practice such days are all-or-nothing:
     the columns arrived together in one migration.
+
+    Only GRID_RULES are accepted. This is a hard error, not a convenience:
+    `limit_stop` on a both-touched day returns a (worst, best) BAND, and taking
+    [0] would silently present the lower bound as the number — the repo's
+    signature failure mode. If a band rule ever joins the grid it must return
+    both endpoints, like the explorer does; `trailing` is withdrawn (#105).
     """
+    if rule not in GRID_RULES:
+        raise ValueError(
+            f"unsupported replay rule {rule!r}: only {GRID_RULES} price a ledger row "
+            "exactly (limit_stop is a band, trailing is withdrawn — #118/#105)"
+        )
     ensure_schema(con)
     trades = con.execute(
         "SELECT target_date, symbol, rank, gross_return, exit_reason, oh, ol, oc "
@@ -425,19 +454,23 @@ def grid(con: duckdb.DuckDBPyConnection, strategy: str) -> pd.DataFrame:
     """
     rows = []
     for rule in GRID_RULES:
+        # ONE replay per rule: grid cells and their breakevens share it, so the
+        # exclusion warning fires once per rule, not once per cell (reviewer
+        # finding, PR #119 — five identical warnings read like five problems).
         picks, excluded = _pick_returns(con, strategy, rule)
         for basket in GRID_BASKETS:
-            daily = [
-                float(grp.nsmallest(basket, "rank")["ret"].mean())
-                for _d, grp in picks.groupby("target_date")
-            ]
+            per_day = [grp.nsmallest(basket, "rank") for _d, grp in picks.groupby("target_date")]
+            daily = [float(day["ret"].mean()) for day in per_day]
             n = len(daily)
-            n_trades = sum(min(basket, len(grp)) for _d, grp in picks.groupby("target_date"))
+            n_trades = sum(len(day) for day in per_day)
             growth = 1.0
             for r in daily:
                 growth *= 1 + r
             mean = sum(daily) / n if n else None
             sd = (sum((r - mean) ** 2 for r in daily) / (n - 1)) ** 0.5 if n > 1 else None
+            # Same guard convention as report(): NaN sd must yield None, never a
+            # printed NaN t (the pin test keeps these two surfaces one number).
+            has_sd = sd is not None and sd == sd and sd > 0
             rows.append(
                 {
                     "rule": rule,
@@ -447,12 +480,43 @@ def grid(con: duckdb.DuckDBPyConnection, strategy: str) -> pd.DataFrame:
                     "trades": n_trades,
                     "growth": round(growth, 4) if n else None,
                     "mean_daily": round(mean, 6) if n else None,
-                    "t_stat": round(mean / (sd / n**0.5), 2) if sd else None,
-                    "breakeven_bps": breakeven_bps(con, strategy, basket=basket, rule=rule),
+                    "t_stat": round(mean / (sd / n**0.5), 2) if has_sd else None,
+                    # The smallest daily mean this cell could detect at 80% power
+                    # (two-sided 0.05, normal approx: (z_.975 + z_.80)·se — the
+                    # ab.py idea, constants inlined to stay stdlib). UNCORRECTED
+                    # for the 8-cell family; it is a per-cell power statement,
+                    # not a promotion threshold. It is what stops "not
+                    # significant on 20 days" being read as "no edge".
+                    "mde80_daily": round(2.801585 * sd / n**0.5, 6) if has_sd else None,
+                    "breakeven_bps": _breakeven_from_daily([list(day["ret"]) for day in per_day]),
                     "min_days": GRID_MIN_DAYS[basket],
                 }
             )
     return pd.DataFrame(rows)
+
+
+def _breakeven_from_daily(daily_gross: list[list[float]]) -> float | None:
+    """Bisection for the round-trip cost at which compounding stops; see
+    breakeven_bps for why geometric."""
+    if not daily_gross:
+        return None
+
+    def growth_at(cost: float) -> float:
+        g = 1.0
+        for day in daily_gross:
+            g *= 1 + (sum(r - cost for r in day) / len(day))
+        return g
+
+    if growth_at(0.0) <= 1.0:
+        return 0.0  # no cost makes this profitable
+    lo, hi = 0.0, 0.05  # 0 to 500bps brackets any plausible answer
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if growth_at(mid) > 1.0:
+            lo = mid
+        else:
+            hi = mid
+    return round(lo * 10_000.0, 2)
 
 
 def breakeven_bps(
@@ -475,23 +539,83 @@ def breakeven_bps(
     picks, _excluded = _pick_returns(con, strategy, rule)
     if picks.empty:
         return None
-    daily_gross = [
-        list(grp.nsmallest(basket, "rank")["ret"]) for _d, grp in picks.groupby("target_date")
-    ]
+    return _breakeven_from_daily(
+        [list(grp.nsmallest(basket, "rank")["ret"]) for _d, grp in picks.groupby("target_date")]
+    )
 
-    def growth_at(cost: float) -> float:
-        g = 1.0
-        for day in daily_gross:
-            g *= 1 + (sum(r - cost for r in day) / len(day))
-        return g
 
-    if growth_at(0.0) <= 1.0:
-        return 0.0  # no cost makes this profitable
-    lo, hi = 0.0, 0.05  # 0 to 500bps brackets any plausible answer
-    for _ in range(60):
-        mid = (lo + hi) / 2
-        if growth_at(mid) > 1.0:
-            lo = mid
-        else:
-            hi = mid
-    return round(lo * 10_000.0, 2)
+def drift(con: duckdb.DuckDBPyConnection, strategy: str) -> dict:
+    """How far the frozen ledger has drifted from today's bars. Measured, not guessed.
+
+    Recomputes each recorded pick's outcome through the SAME production path the
+    explorer's LIVE row uses (track.daily_rank_outcomes) and counts
+    disagreements: rows whose oh/ol/oc moved, fill verdicts that flipped, and
+    recorded rows whose symbol no longer appears in today's outcome frame (or
+    appeared only after recording). Zero everywhere means the tape has not
+    moved; anything else quantifies the freeze documented in the module
+    docstring. Read-only; nothing is ever rewritten.
+    """
+    ensure_schema(con)
+    stored = con.execute(
+        "SELECT target_date, symbol, gross_return, exit_reason, oh, ol, oc "
+        "FROM paper_trades WHERE strategy = ? AND rule = ?",
+        [strategy, RULE],
+    ).df()
+    empty = {
+        "rows": 0,
+        "rows_compared": 0,
+        "rows_with_outcomes": 0,
+        "outcome_moved": 0,
+        "fill_flipped": 0,
+        "unmatched": 0,
+    }
+    if stored.empty:
+        return empty
+    current = track.daily_rank_outcomes(con, strategy, top_n=PAPER_TOP_N)
+    if current.empty:
+        return {**empty, "rows": len(stored), "unmatched": len(stored)}
+    stored["target_date"] = pd.to_datetime(stored["target_date"]).dt.date
+    current = current.copy()
+    current["target_date"] = pd.to_datetime(current["target_date"]).dt.date
+    merged = stored.merge(
+        current[["target_date", "symbol", "high_return", "low_return", "oc_return", "hit"]],
+        on=["target_date", "symbol"],
+        how="left",
+    )
+    matched = merged["hit"].notna()
+    moved = fill_flipped = with_outcomes = 0
+    for row in merged[matched].itertuples():
+        was_filled = row.exit_reason == "limit"
+        now_filled = bool(row.hit)
+        if was_filled != now_filled:
+            fill_flipped += 1
+        stored_out = (row.oh, row.ol, row.oc)
+        current_out = (row.high_return, row.low_return, row.oc_return)
+        # Rows recorded before the outcome columns existed have nothing to
+        # compare — they must shrink the DENOMINATOR, not read as "unmoved".
+        if all(a is not None and a == a for a in stored_out):
+            with_outcomes += 1
+            if any(abs(a - b) > 1e-9 for a, b in zip(stored_out, current_out, strict=True)):
+                moved += 1
+    result = {
+        "rows": len(stored),
+        "rows_compared": int(matched.sum()),
+        "rows_with_outcomes": with_outcomes,
+        "outcome_moved": moved,
+        "fill_flipped": fill_flipped,
+        # Recorded symbols absent from today's outcome frame for that day —
+        # the bar vanished or the whole day fell out of the frame.
+        "unmatched": int((~matched).sum()),
+    }
+    if moved or fill_flipped or result["unmatched"]:
+        logger.warning(
+            "paper drift: of %d recorded rows, %d outcome(s) moved vs today's bars, "
+            "%d fill verdict(s) flipped, %d no longer match a current outcome row — the "
+            "ledger keeps its first observation (see module docstring); this is the size "
+            "of that choice",
+            result["rows_with_outcomes"],
+            moved,
+            fill_flipped,
+            result["unmatched"],
+        )
+    return result

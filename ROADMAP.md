@@ -465,8 +465,25 @@ live store that is all 15 days at the time of shipping, so `hold_close` cells
 fill from zero while `limit_2pct` (the recorded rule) keeps its full history.
 First honest read at shipping: limit_2pct is negative at EVERY basket on the
 forward record (top-1 0.87, top-5 0.91, top-20 0.95 gross), while the explorer's
-LIVE row shows top-1 at 1.54 — the difference is the scored days that predate
-the forward ledger, which is precisely the flattery the ledger exists to strip.
+LIVE row shows top-1 at 1.54. That gap was first claimed to be "different day
+sets" and quant-skeptic review MEASURED it as only HALF that (verified
+independently before recording): on the 15 SHARED days top-1 limit compounds to
+0.87 in the ledger vs 1.17 recomputed from today's bars — the other half is
+SAME-DAY disagreement, because the score run records ~50 minutes after the
+close and the provider's bars keep revising (4 fill verdicts flipped by revised
+opens/highs across the top-20 rows; on 2026-08-27 the eventual rank-1 symbol's
+bar had not arrived at recording time at all — a 15.6pp top-1 day swing). The
+ledger FREEZES its first post-close observation by design — re-recording would
+let an immutable table rewrite itself whenever the feed moved — so it records
+what was SEEN, not the final tape; `paper.drift()` measures the disagreement
+and `--grid` prints it, and the revisions observed so far were not
+systematically conservative (three hurt the ledger, one helped). Two more
+review-driven honesty notes: the per-basket floors do NOT equalize evidence
+(top-1 at its 60-day floor still carries ~2.7x the SE of top-20 at 20 days;
+parity would need ~450 days) — the per-cell `mde80_daily` column is the real
+power statement; and the 15 days observed before the primary cell was named
+(top-5 x limit_2pct, 2026-09-07) are SPENT — confirmation counts only days
+arriving after the naming.
 
 ## Reach-predictor pivot (decided 2026-07-25) — separate PREDICTION from TRADING
 

@@ -447,6 +447,27 @@ tail structurally (the same flat charge on a $206 name and a $1.44 one). A
 per-name tick/price floor is computable from data already in the store and would
 put basket-20 breakeven nearer 4bps.
 
+**The replay grid (#118, 2026-09-07).** The ledger now records each pick's
+target-day `oh`/`ol`/`oc` (the `experiment_daily` trio), so every daily exit
+rule replays deterministically from stored rows, forward-only. `twopercent
+paper --grid` prints the WHOLE rule x basket grid — `hold_close` +
+`limit_2pct` (the two an oh/ol/oc row prices exactly; `limit_stop` only ever
+as a band, `trailing` excluded per #105) x baskets 1/5/10/20 — gross, with
+per-cell t and breakeven. Discipline, fixed before the data arrived: per-basket
+day floors (top-1 needs 60d, top-5 40d — one pick a day is a coin path at 20);
+windows are VIEWS, never a selection axis; the grid is a family of 8 cells and
+a winning cell must be NAMED first (dated issue comment) and confirmed only on
+days arriving AFTER the naming — the ledger's analogue of #45's wall-clock
+holdout. **Pre-registered primary cell: top-5 x limit_2pct** (named on #118,
+2026-09-07). Days recorded before the outcome columns existed cannot replay
+non-traded rules and are EXCLUDED and counted, never averaged around — on the
+live store that is all 15 days at the time of shipping, so `hold_close` cells
+fill from zero while `limit_2pct` (the recorded rule) keeps its full history.
+First honest read at shipping: limit_2pct is negative at EVERY basket on the
+forward record (top-1 0.87, top-5 0.91, top-20 0.95 gross), while the explorer's
+LIVE row shows top-1 at 1.54 — the difference is the scored days that predate
+the forward ledger, which is precisely the flattery the ledger exists to strip.
+
 ## Reach-predictor pivot (decided 2026-07-25) — separate PREDICTION from TRADING
 
 Locked-in reframing (supersedes the original open-to-close target and the

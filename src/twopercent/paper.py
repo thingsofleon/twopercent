@@ -42,6 +42,7 @@ import duckdb
 import pandas as pd
 
 from twopercent import scan, track
+from twopercent.strategy import pick_return_band
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +86,28 @@ CREATE TABLE IF NOT EXISTS paper_trades (
 -- was tracked". CREATE TABLE IF NOT EXISTS silently keeps the old shape, which
 -- is how the column went missing on a live store in the first place.
 ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS n_avail INTEGER;
+-- Per-pick outcome returns of the target day (open-to-high/low/close), the
+-- same trio experiment_daily stores: with them, EVERY daily exit rule replays
+-- deterministically from the ledger, forward-only, without re-recording
+-- anything (#118). Nullable and ALTER-added like n_avail: rows recorded
+-- before these existed keep NULL = "outcomes not tracked", and consumers must
+-- EXCLUDE and count such days, never average around them.
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS oh DOUBLE;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS ol DOUBLE;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS oc DOUBLE;
 """
+
+# The replay grid (#118). Rules are the two an oh/ol/oc row prices EXACTLY:
+# limit_stop needs an intraday ordering that daily bars cannot supply (its
+# honest answer is a band, and a band is never a winning cell) and trailing is
+# withdrawn (#105). Baskets are nested prefixes of the recorded top-20; sizes
+# beyond PAPER_TOP_N would need recording more ranks and are out of scope.
+GRID_RULES = ("hold_close", "limit_2pct")
+GRID_BASKETS = (1, 5, 10, PAPER_TOP_N)
+# Per-basket day floors, replacing the one-size MIN_REPORT_DAYS for grid cells:
+# a top-1 cell is ONE pick per day, so at 20 days its growth is a coin path.
+# Scaled so the smallest baskets cannot graduate first just by being noisy.
+GRID_MIN_DAYS = {1: 60, 5: 40, 10: MIN_REPORT_DAYS, PAPER_TOP_N: MIN_REPORT_DAYS}
 
 
 def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
@@ -150,6 +172,12 @@ def record_day(
     # silently substitute it away — survivorship inside a table sold as
     # untainted.
     rows["n_avail"] = n_avail
+    # The target day's outcome returns ride along (#118) so every exit rule —
+    # not just the one traded — replays from this row later. Same-day data,
+    # written at scoring time: nothing here was knowable before the open.
+    rows["oh"] = rows["high_return"]
+    rows["ol"] = rows["low_return"]
+    rows["oc"] = rows["oc_return"]
     if n_avail < PAPER_TOP_N:
         logger.warning(
             "paper: %s traded only %d of the intended top-%d — the missing picks "
@@ -167,6 +195,9 @@ def record_day(
         "gross_return",
         "exit_reason",
         "n_avail",
+        "oh",
+        "ol",
+        "oc",
     ]
     con.register("_paper_in", rows[cols])
     try:
@@ -185,9 +216,9 @@ def record_day(
         con.execute(
             "INSERT INTO paper_trades "
             "(strategy, target_date, symbol, rank, rule, gross_return, exit_reason, "
-            " n_avail, recorded_ts) "
+            " n_avail, oh, ol, oc, recorded_ts) "
             "SELECT strategy, target_date, symbol, rank, rule, gross_return, "
-            "exit_reason, n_avail, now() FROM _paper_in"
+            "exit_reason, n_avail, oh, ol, oc, now() FROM _paper_in"
         )
         con.execute("COMMIT")
     except Exception:
@@ -332,8 +363,103 @@ def basket_sweep(con: duckdb.DuckDBPyConnection, strategy: str) -> pd.DataFrame:
     )
 
 
+def _pick_returns(
+    con: duckdb.DuckDBPyConnection, strategy: str, rule: str
+) -> tuple[pd.DataFrame, int]:
+    """Per-pick gross return of `rule` over the ledger; (frame, excluded_days).
+
+    For the TRADED rule (limit_2pct) the recorded `gross_return` is the answer —
+    the ledger IS the record, and works for every row ever written. Any other
+    rule replays from the stored oh/ol/oc through strategy.pick_return_band,
+    the single definition of exit rules (its band endpoints are equal for every
+    rule allowed in GRID_RULES, so `worst` is exact, not a bound). `filled`
+    is exit_reason == 'limit': the guarded touch event as recorded at scoring
+    time, never a raw high comparison re-derived here.
+
+    A day where ANY recorded pick lacks outcomes (written before the oh/ol/oc
+    columns existed) cannot replay a basket honestly and is EXCLUDED whole and
+    counted — the alternative is a growth curve silently computed over easier
+    days than the ones on screen. In practice such days are all-or-nothing:
+    the columns arrived together in one migration.
+    """
+    ensure_schema(con)
+    trades = con.execute(
+        "SELECT target_date, symbol, rank, gross_return, exit_reason, oh, ol, oc "
+        "FROM paper_trades WHERE strategy = ? AND rule = ? ORDER BY target_date, rank",
+        [strategy, RULE],
+    ).df()
+    if trades.empty:
+        return trades.assign(ret=pd.Series(dtype=float)), 0
+    if rule == RULE:
+        return trades.assign(ret=trades["gross_return"]), 0
+    row_ok = trades[["oh", "ol", "oc"]].notna().all(axis=1)
+    complete_days = trades.assign(_ok=row_ok).groupby("target_date")["_ok"].transform("all")
+    excluded = int(trades.loc[~complete_days, "target_date"].nunique())
+    usable = trades[complete_days].copy()
+    if excluded:
+        logger.warning(
+            "paper grid: %d day(s) excluded from %s replay — recorded before per-pick "
+            "outcomes were stored, so the rule cannot be priced on them",
+            excluded,
+            rule,
+        )
+    if usable.empty:
+        return usable.assign(ret=pd.Series(dtype=float)), excluded
+    usable["ret"] = [
+        pick_return_band(rule, row.ol, row.oc, row.exit_reason == "limit")[0]
+        for row in usable.itertuples()
+    ]
+    return usable, excluded
+
+
+def grid(con: duckdb.DuckDBPyConnection, strategy: str) -> pd.DataFrame:
+    """Every replayable rule x basket cell of the forward record — the WHOLE grid.
+
+    One row per (rule, basket): gross growth, day/trade counts, t-stat and
+    breakeven bps, plus the cell's day floor (`min_days`) and how many days its
+    replay had to exclude. Always the full grid, never one cell — a single cell
+    is a multiple comparison presented as a headline (same reason basket_sweep
+    shows the curve). The grid is a FAMILY of len(GRID_RULES)*len(GRID_BASKETS)
+    cells: per #118 a "winning" cell must be named first and then confirmed on
+    days arriving AFTER it was named; nothing here does that naming.
+    """
+    rows = []
+    for rule in GRID_RULES:
+        picks, excluded = _pick_returns(con, strategy, rule)
+        for basket in GRID_BASKETS:
+            daily = [
+                float(grp.nsmallest(basket, "rank")["ret"].mean())
+                for _d, grp in picks.groupby("target_date")
+            ]
+            n = len(daily)
+            n_trades = sum(min(basket, len(grp)) for _d, grp in picks.groupby("target_date"))
+            growth = 1.0
+            for r in daily:
+                growth *= 1 + r
+            mean = sum(daily) / n if n else None
+            sd = (sum((r - mean) ** 2 for r in daily) / (n - 1)) ** 0.5 if n > 1 else None
+            rows.append(
+                {
+                    "rule": rule,
+                    "basket": basket,
+                    "days": n,
+                    "excluded_days": excluded,
+                    "trades": n_trades,
+                    "growth": round(growth, 4) if n else None,
+                    "mean_daily": round(mean, 6) if n else None,
+                    "t_stat": round(mean / (sd / n**0.5), 2) if sd else None,
+                    "breakeven_bps": breakeven_bps(con, strategy, basket=basket, rule=rule),
+                    "min_days": GRID_MIN_DAYS[basket],
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def breakeven_bps(
-    con: duckdb.DuckDBPyConnection, strategy: str, basket: int = PAPER_TOP_N
+    con: duckdb.DuckDBPyConnection,
+    strategy: str,
+    basket: int = PAPER_TOP_N,
+    rule: str = RULE,
 ) -> float | None:
     """Round-trip cost, in bps, at which the strategy stops compounding upward.
 
@@ -346,16 +472,11 @@ def breakeven_bps(
     already below 1.0, because variance drags. Solved by bisection rather than
     closed form so it tracks whatever report() actually computes.
     """
-    ensure_schema(con)
-    trades = con.execute(
-        "SELECT target_date, rank, gross_return FROM paper_trades WHERE strategy = ? AND rule = ?",
-        [strategy, RULE],
-    ).df()
-    if trades.empty:
+    picks, _excluded = _pick_returns(con, strategy, rule)
+    if picks.empty:
         return None
     daily_gross = [
-        list(grp.nsmallest(basket, "rank")["gross_return"])
-        for _d, grp in trades.groupby("target_date")
+        list(grp.nsmallest(basket, "rank")["ret"]) for _d, grp in picks.groupby("target_date")
     ]
 
     def growth_at(cost: float) -> float:

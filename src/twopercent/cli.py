@@ -513,6 +513,12 @@ def paper_cmd(
     basket: int = typer.Option(
         0, "--basket", help="Equal-weight names per day (default: the recorded top-20)."
     ),
+    show_grid: bool = typer.Option(
+        False,
+        "--grid",
+        help="Every replayable exit rule x basket over the forward record, gross, "
+        "with per-cell day floors. The whole grid, never one cell.",
+    ),
     db: Path = DbOption,
 ) -> None:
     """Net P&L of the FORWARD-ONLY paper record, at several cost levels.
@@ -534,6 +540,28 @@ def paper_cmd(
     # the user actually reads — and at basket 5 the same record shows a
     # breakeven of 72bps against 20bps at the basket the detector reports.
     basket = basket or paper_mod.PAPER_TOP_N
+    if show_grid:
+        g = paper_mod.grid(con, name)
+        if g.empty or not g["days"].any():
+            typer.echo("No paper trades recorded yet — the grid fills in forward-only.")
+            raise typer.Exit(0)
+        typer.echo(f"Paper grid — rule x basket, GROSS, {name} (forward record)")
+        typer.echo(g.to_string(index=False))
+        below = g[g["days"] < g["min_days"]]
+        if len(below):
+            typer.echo(
+                f"\n{len(below)} of {len(g)} cells are below their day floor — their "
+                "growth reads as a finding and is noise (smaller baskets need more days). "
+                "The grid is a family of "
+                f"{len(g)} cells: a winning cell must be NAMED first and then confirmed "
+                "on days arriving after the naming (#118)."
+            )
+        if int(g["excluded_days"].max()):
+            typer.echo(
+                f"Replay excluded up to {int(g['excluded_days'].max())} day(s) recorded "
+                "before per-pick outcomes were stored."
+            )
+        raise typer.Exit(0)
     table = paper_mod.report(con, name, basket=basket)
     if table.empty:
         typer.echo(

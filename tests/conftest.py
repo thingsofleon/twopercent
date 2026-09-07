@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from twopercent import issues, store
+from twopercent import issues, provenance, store
 
 
 @pytest.fixture(autouse=True)
@@ -22,6 +22,26 @@ def isolate_cwd(tmp_path, monkeypatch):
     CWD-relative path (see routine.run).
     """
     monkeypatch.chdir(tmp_path)
+
+
+# Captured BEFORE fake_clean_main patches it, so tests of the real thing
+# (tests/test_provenance.py) can restore it.
+REAL_GIT_STATE = provenance.git_state
+
+
+@pytest.fixture(autouse=True)
+def fake_clean_main(monkeypatch):
+    """Every test sees a clean `main` checkout unless it says otherwise.
+
+    Tests run in an isolated tmp cwd (isolate_cwd) where the real git_state()
+    is UNKNOWABLE — which the #114 code step correctly WARNs about, and which
+    would smear that WARN across every routine/research/benchmark test and
+    spawn three git subprocesses per call. Tests exercising the step's WARN
+    paths monkeypatch provenance.git_state themselves.
+    """
+    monkeypatch.setattr(
+        provenance, "git_state", lambda: provenance.GitState("f" * 40, "main", False)
+    )
 
 
 @pytest.fixture(autouse=True)

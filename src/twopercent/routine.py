@@ -53,6 +53,7 @@ from twopercent import (
     issues,
     notify,
     paper,
+    provenance,
     scan,
     shadow,
     store,
@@ -175,6 +176,27 @@ def run(
     if mode == "score":
         return _run_score(report, now, db_path, out_path, top)
     return _run_predict(report, now, db_path, out_path, top, universe_max_age_days)
+
+
+def _code_step(report: RoutineReport) -> None:
+    """WARN when this run is not a clean checkout of main (#114).
+
+    The systemd units execute whatever branch is sitting in the working
+    directory; a feature branch left checked out ran seven nights of
+    production research and nothing said so. Non-fatal — the operator may be
+    testing deliberately — but never silent, and "cannot verify" is a WARN,
+    not an OK: unverifiable code must not render as verified.
+    """
+    state = provenance.git_state()
+    if state.is_clean_production:
+        report.add("code", OK, state.describe())
+    else:
+        report.add(
+            "code",
+            WARN,
+            f"{state.describe()} — production runs must run merged code on a clean "
+            f"'{provenance.PRODUCTION_BRANCH}' checkout (#114)",
+        )
 
 
 def _connect_step(report: RoutineReport, db_path: Path | str):
@@ -342,6 +364,7 @@ def _run_predict(
         )
         return report
     report.add("clock", OK, f"{now:%a %H:%M} ET, market closed")
+    _code_step(report)
     today = now.date()  # one clock: ET everywhere (a UTC host is 'tomorrow' after 20:00 ET)
 
     con = _connect_step(report, db_path)
@@ -678,6 +701,7 @@ def _run_score(
         )
         return report
     report.add("clock", OK, f"{now:%a %H:%M} ET, post-close scoring window")
+    _code_step(report)
     today = now.date()  # one clock: ET everywhere (a UTC host is 'tomorrow' after 20:00 ET)
 
     con = _connect_step(report, db_path)

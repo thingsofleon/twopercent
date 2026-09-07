@@ -60,7 +60,7 @@ import duckdb
 from twopercent import backtest, champion, features, generate, issues, scan, store
 from twopercent.canonical import _canonical, canonical_params  # noqa: F401  (re-export)
 from twopercent.compare import compare_verdict, lift_winner
-from twopercent.routine import _RANK, FAIL, OK, WARN, Step, _market_is_open
+from twopercent.routine import _RANK, FAIL, OK, WARN, Step, _code_step, _market_is_open
 from twopercent.strategies import xgb_gbm
 
 logger = logging.getLogger(__name__)
@@ -644,6 +644,12 @@ def run(
         report.fatal = True
         return report
     report.add("clock", OK, f"{now:%a %H:%M} Denver, research window")
+    # #114: seven nights of research ran an unmerged branch and nothing said so.
+    # ONE definition of the check — routine._code_step — shared here the way
+    # Step/OK/WARN already are, so the two runners can never disagree about
+    # what counts as production code. Non-fatal: the experiments this run
+    # records carry their commit in params either way.
+    _code_step(report)
 
     try:
         con = store.connect(db_path)

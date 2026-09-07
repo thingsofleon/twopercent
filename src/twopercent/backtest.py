@@ -16,7 +16,7 @@ import duckdb
 import pandas as pd
 from sklearn.metrics import brier_score_loss, roc_auc_score
 
-from twopercent import calibration, features, scan, store, strategies
+from twopercent import calibration, features, provenance, scan, store, strategies
 from twopercent.features import feature_frame
 from twopercent.predict import LIQUIDITY_MIN_MEDIAN_VOLUME
 
@@ -291,6 +291,12 @@ def run_benchmark(
         device = getattr(strategy, "resolved_device", None)
         if device is not None:
             params["device"] = device
+        # Which CODE produced this row (#114): a feature branch left checked
+        # out ran seven nights of production research and nothing recorded it.
+        # A sibling of strategy_params like device — config done-matching keys
+        # on strategy_params only, so provenance never changes config identity.
+        state = provenance.git_state()
+        params["code"] = {"commit": state.commit, "branch": state.branch, "dirty": state.dirty}
         # Both records must land atomically: an experiments row without its
         # daily rows would be counted "done" by the research queue forever
         # while the sim-panel data it promises is missing.

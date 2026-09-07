@@ -990,6 +990,16 @@ truth for *decisions and plan shape*; GitHub is the source of truth for
   Stale "+2% open-to-close candidates" labels fixed to reach/intraday; the daily
   email reframed from trade suggestions to ranked-prediction language.
   Supersedes/closes #68 (fee removal). Stage C (calibration) remains open.
+  Shipped (#114): production runs now prove which CODE they ran. A feature
+  branch left checked out ran seven nights of live research (56 experiments
+  from unmerged code) and nothing — digest, log, or ledger — could say so.
+  Now: every experiments row records `params.code` (full commit, branch, dirty
+  flag; a sibling of `device`, so config done-matching is untouched), and both
+  runners emit a `code` step right after `clock` — OK only on a verified clean
+  `main`, WARN otherwise, and an UNKNOWABLE git state is a WARN, never an OK
+  ("cannot verify" must not render as "verified"). One definition
+  (`routine._code_step`) shared by routine and research. Non-fatal by design:
+  the operator may be testing deliberately, but never silently.
   Shipped (#116): `twopercent ab`, a paired feature-set A/B, and the decision it
   was built to make. Both feature batches so far (#110, #115) were first judged
   by comparing a difference of arm MEANS against the SPREAD of three seeds — a

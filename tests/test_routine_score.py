@@ -115,6 +115,7 @@ def test_score_mode_happy_path_no_predict_no_universe_refresh(ready, monkeypatch
     names = [s.name for s in report.steps]
     assert names == [
         "clock",
+        "code",
         "doctor",
         "ingest",
         "freshness",

@@ -204,8 +204,12 @@ def test_costs_are_not_stored_so_the_model_can_be_corrected(traded):
 def test_breakeven_is_zero_when_the_gross_edge_is_negative(con):
     """ "No cost makes this profitable" must be sayable, not rounded away."""
     paper.ensure_schema(con)
+    # Columns NAMED, never positional — the module's own migration lesson;
+    # a positional VALUES breaks (or worse, silently shifts) on ALTER-added columns.
     con.execute(
-        "INSERT INTO paper_trades VALUES "
+        "INSERT INTO paper_trades "
+        "(strategy, target_date, symbol, rank, rule, gross_return, exit_reason, "
+        " n_avail, recorded_ts) VALUES "
         "('s', DATE '2026-02-02', 'AAA', 1, ?, -0.01, 'close', 20, now())",
         [paper.RULE],
     )
@@ -217,7 +221,9 @@ def test_breakeven_converts_the_edge_into_a_spread_question(con):
     edge bigger than the spread?" — a question about the market, not the model."""
     paper.ensure_schema(con)
     con.execute(
-        "INSERT INTO paper_trades VALUES "
+        "INSERT INTO paper_trades "
+        "(strategy, target_date, symbol, rank, rule, gross_return, exit_reason, "
+        " n_avail, recorded_ts) VALUES "
         "('s', DATE '2026-02-02', 'AAA', 1, ?, 0.004, 'limit', 20, now())",
         [paper.RULE],
     )
@@ -305,3 +311,174 @@ def test_pending_never_offers_a_day_the_guards_would_refuse(traded):
         [dt.datetime.combine(target, dt.time(20, 1))],
     )
     assert paper.pending_days(con, "baseline_gbm_v1", today=target) == []
+
+
+def test_record_day_stores_the_target_days_outcome_returns(traded):
+    """oh/ol/oc ride on every trade so ANY daily exit rule replays later (#118)."""
+    con, target = traded
+    paper.record_day(con, "baseline_gbm_v1", target, today=target)
+    rows = con.execute("SELECT gross_return, exit_reason, oh, ol, oc FROM paper_trades").fetchall()
+    assert rows
+    for gross, reason, oh, ol, oc in rows:
+        assert oh is not None and ol is not None and oc is not None
+        assert ol <= oh  # open-to-low never exceeds open-to-high
+        # The stored gross_return must be exactly what the rule replays from
+        # the stored outcomes — the ledger cannot disagree with itself.
+        expected = 0.02 if reason == "limit" else oc
+        assert abs(gross - expected) < 1e-12
+
+
+def test_old_rows_without_outcomes_survive_migration_and_are_excluded_loudly(traded, caplog):
+    """A pre-upgrade ledger keeps its rows; replay excludes them, counted, never
+    averaged around — the silent-success failure mode this repo collects."""
+    con, target = traded
+    paper.record_day(con, "baseline_gbm_v1", target, today=target)
+    # Simulate a row set recorded before the columns existed.
+    con.execute("UPDATE paper_trades SET oh = NULL, ol = NULL, oc = NULL")
+    import logging as _logging
+
+    with caplog.at_level(_logging.WARNING, logger="twopercent.paper"):
+        picks, excluded = paper._pick_returns(con, "baseline_gbm_v1", "hold_close")
+    assert excluded == 1
+    assert picks.empty
+    assert "excluded from hold_close replay" in caplog.text
+    # The traded rule is untouched: its returns are the record itself.
+    picks_rule, excl_rule = paper._pick_returns(con, "baseline_gbm_v1", paper.RULE)
+    assert excl_rule == 0
+    assert len(picks_rule)
+
+
+def test_grid_covers_every_rule_basket_cell_with_floors(traded):
+    con, target = traded
+    paper.record_day(con, "baseline_gbm_v1", target, today=target)
+    g = paper.grid(con, "baseline_gbm_v1")
+    assert len(g) == len(paper.GRID_RULES) * len(paper.GRID_BASKETS)
+    assert set(g["rule"]) == set(paper.GRID_RULES)
+    assert set(g["basket"]) == set(paper.GRID_BASKETS)
+    # Floors scale down with basket size: top-1 must not graduate first.
+    floors = dict(zip(g["basket"], g["min_days"], strict=False))
+    assert floors[1] > floors[5] > floors[20] == paper.MIN_REPORT_DAYS
+    # One recorded day is below every floor.
+    assert (g["days"] < g["min_days"]).all()
+
+
+def test_grid_limit_cell_matches_report_at_zero_cost(traded):
+    """The grid's limit_2pct x top-20 cell IS report()'s 0bps row — two surfaces,
+    one number, or the grid quietly becomes a second definition of the record."""
+    con, target = traded
+    paper.record_day(con, "baseline_gbm_v1", target, today=target)
+    g = paper.grid(con, "baseline_gbm_v1")
+    cell = g[(g["rule"] == paper.RULE) & (g["basket"] == paper.PAPER_TOP_N)].iloc[0]
+    zero = paper.report(con, "baseline_gbm_v1", basket=paper.PAPER_TOP_N).iloc[0]
+    assert zero["cost_bps"] == 0
+    assert cell["growth"] == zero["growth"]
+    assert cell["trades"] == zero["trades"]
+    assert cell["days"] == zero["days"]
+
+
+def test_hold_close_replay_is_the_close_not_the_limit(traded):
+    """hold_close from the same rows books oc for EVERY pick — including the
+    ones the limit rule capped at +2%."""
+    con, target = traded
+    paper.record_day(con, "baseline_gbm_v1", target, today=target)
+    picks, _ = paper._pick_returns(con, "baseline_gbm_v1", "hold_close")
+    stored = con.execute("SELECT symbol, oc FROM paper_trades ORDER BY rank").df()
+    merged = picks.merge(stored, on="symbol", suffixes=("", "_stored"))
+    assert len(merged) == len(picks)
+    assert (merged["ret"] == merged["oc_stored"]).all()
+
+
+def test_breakeven_generalizes_to_hold_close(traded):
+    con, target = traded
+    paper.record_day(con, "baseline_gbm_v1", target, today=target)
+    be = paper.breakeven_bps(con, "baseline_gbm_v1", basket=5, rule="hold_close")
+    assert be is not None
+    # And the default-rule path is unchanged.
+    assert paper.breakeven_bps(con, "baseline_gbm_v1", basket=5) is not None
+
+
+def test_grid_on_empty_ledger_reports_nothing(con):
+    g = paper.grid(con, "baseline_gbm_v1")
+    assert (g["days"] == 0).all()
+
+
+def test_a_partially_null_day_is_excluded_whole_not_averaged_around(traded, caplog):
+    """The docstring's "in practice all-or-nothing" is an observation, not a
+    guarantee — the partial-coverage path must hold on its own (reviewer, #119)."""
+    con, target = traded
+    paper.record_day(con, "baseline_gbm_v1", target, today=target)
+    # NULL the outcomes of ONE pick only.
+    con.execute(
+        "UPDATE paper_trades SET oh = NULL, ol = NULL, oc = NULL "
+        "WHERE rank = (SELECT max(rank) FROM paper_trades)"
+    )
+    import logging as _logging
+
+    with caplog.at_level(_logging.WARNING, logger="twopercent.paper"):
+        picks, excluded = paper._pick_returns(con, "baseline_gbm_v1", "hold_close")
+    assert excluded == 1
+    assert picks.empty  # the whole day is out, not just the NULL pick
+    # The traded rule keeps the day: its returns are the record itself.
+    picks_rule, _ = paper._pick_returns(con, "baseline_gbm_v1", paper.RULE)
+    assert len(picks_rule)
+
+
+def test_band_and_withdrawn_rules_are_rejected_not_lower_bounded(traded):
+    """limit_stop's honest answer is a BAND; returning its worst endpoint as
+    the number would be a lower bound presented as exact (reviewer, #119)."""
+    con, target = traded
+    paper.record_day(con, "baseline_gbm_v1", target, today=target)
+    for rule in ("limit_stop", "trailing", "no_such_rule"):
+        with pytest.raises(ValueError, match="unsupported replay rule"):
+            paper._pick_returns(con, "baseline_gbm_v1", rule)
+        with pytest.raises(ValueError, match="unsupported replay rule"):
+            paper.breakeven_bps(con, "baseline_gbm_v1", basket=5, rule=rule)
+
+
+def test_drift_is_zero_when_the_tape_has_not_moved(traded):
+    con, target = traded
+    paper.record_day(con, "baseline_gbm_v1", target, today=target)
+    d = paper.drift(con, "baseline_gbm_v1")
+    assert d["rows"] == d["rows_compared"] > 0
+    assert d["outcome_moved"] == d["fill_flipped"] == d["unmatched"] == 0
+
+
+def test_drift_measures_a_post_recording_bar_revision(traded, caplog):
+    """The ledger freezes its first observation; drift() must SIZE that choice
+    instead of leaving revisions to be discovered by accident (quant-skeptic,
+    #119: 4 fill verdicts flipped on the live store within three weeks)."""
+    con, target = traded
+    paper.record_day(con, "baseline_gbm_v1", target, today=target)
+    # Revise one recorded symbol's target-day bar upward so its +2% now fills.
+    sym = con.execute(
+        "SELECT symbol FROM paper_trades WHERE exit_reason = 'close' LIMIT 1"
+    ).fetchone()[0]
+    con.execute(
+        "UPDATE prices SET high = open * 1.05, volume = volume * 3 WHERE symbol = ? AND date = ?",
+        [sym, target],
+    )
+    import logging as _logging
+
+    with caplog.at_level(_logging.WARNING, logger="twopercent.paper"):
+        d = paper.drift(con, "baseline_gbm_v1")
+    assert d["outcome_moved"] >= 1
+    assert d["fill_flipped"] >= 1
+    assert "paper drift" in caplog.text
+    # And nothing was rewritten: the stored row still says close.
+    still = con.execute("SELECT exit_reason FROM paper_trades WHERE symbol = ?", [sym]).fetchone()[
+        0
+    ]
+    assert still == "close"
+
+
+def test_grid_reports_per_cell_power(traded):
+    """mde80_daily is what stops "not significant on 20 days" reading as
+    "no edge" — the #116 lesson, applied to the ledger."""
+    con, target = traded
+    paper.record_day(con, "baseline_gbm_v1", target, today=target)
+    g = paper.grid(con, "baseline_gbm_v1")
+    assert "mde80_daily" in g.columns
+    # One recorded day: no sd, so no t and no mde — None, never NaN.
+    lim = g[g["rule"] == paper.RULE]
+    assert lim["t_stat"].isna().all()
+    assert lim["mde80_daily"].isna().all()

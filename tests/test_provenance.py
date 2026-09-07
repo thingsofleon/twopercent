@@ -29,7 +29,23 @@ def git_repo(tmp_path, monkeypatch):
             subprocess.run(cmd, check=True, capture_output=True)
         (tmp_path / "f.txt").write_text("x")
         subprocess.run(["git", "add", "f.txt"], check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-q", "-m", "init"], check=True, capture_output=True)
+        # -c overrides: a global commit.gpgsign or hooksPath would fail the
+        # throwaway commit and silently skip five tests as "git unavailable".
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+            check=True,
+            capture_output=True,
+        )
     except (OSError, subprocess.SubprocessError):
         pytest.skip("git unavailable")
     return tmp_path
@@ -66,6 +82,20 @@ def test_outside_a_repo_is_unknowable_not_a_crash(tmp_path, monkeypatch):
     # "Cannot verify" must never render as "verified".
     assert not state.is_clean_production
     assert "unknowable" in state.describe()
+
+
+def test_partial_state_renders_unknown_never_innocent():
+    """A timed-out `git status` is not a clean tree: None fields must say
+    UNKNOWN in the digest, or the WARN contradicts its own text (reviewer,
+    #120)."""
+    half = provenance.GitState("a" * 40, "main", None)
+    assert not half.is_clean_production
+    assert "dirty-state unknown" in half.describe()
+    assert "clean" not in half.describe()
+    no_branch = provenance.GitState("a" * 40, None, False)
+    assert not no_branch.is_clean_production
+    assert "branch unknown" in no_branch.describe()
+    assert "None" not in no_branch.describe()
 
 
 def test_git_binary_missing_degrades_to_unknowable(monkeypatch):
@@ -122,3 +152,28 @@ def test_benchmark_records_the_code_that_produced_the_row(con, monkeypatch):
     backtest.run_benchmark(con, "baseline_gbm_v1", months=2, top_n=5)
     params = json.loads(store.list_experiments(con)["params"].iloc[0])
     assert params["code"] == {"commit": "d" * 40, "branch": "feat/live", "dirty": True}
+
+
+def test_research_run_emits_the_code_step(con, tmp_path, monkeypatch):
+    """The runner that actually produced the seven-night failure must be the
+    one pinned: without this, deleting _code_step from research.run leaves the
+    suite green (reviewer, #120). Uses a WARN state so the assertion also
+    proves the step resolves provenance.git_state at call time, not the fake."""
+    import json
+
+    from twopercent import research, store
+
+    monkeypatch.setattr(
+        provenance, "git_state", lambda: provenance.GitState("e" * 40, "feat/left-out", False)
+    )
+    monkeypatch.setattr(research, "_in_research_window", lambda now: True)
+    queue = tmp_path / "queue.json"
+    queue.write_text(json.dumps([]))
+    db = tmp_path / "t.duckdb"
+    store.connect(db).close()
+    report = research.run(db_path=db, queue_path=queue)
+    steps = {s.name: s for s in report.steps}
+    assert "code" in steps
+    assert steps["code"].status == "warn"
+    assert "feat/left-out" in steps["code"].detail
+    assert "#114" in steps["code"].detail

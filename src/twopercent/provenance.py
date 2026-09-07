@@ -49,8 +49,17 @@ class GitState:
         if self.commit is None:
             return "git state unknowable (no git, or not a checkout)"
         short = self.commit[:9]
-        tree = "dirty tree" if self.dirty else "clean"
-        return f"{self.branch} @ {short}, {tree}"
+        # A None field must render as UNKNOWN, never as its innocent value: a
+        # timed-out `git status` is not a clean tree, and printing "clean" next
+        # to a WARN about unverifiable code would contradict the warning itself.
+        branch = self.branch if self.branch is not None else "branch unknown"
+        if self.dirty is None:
+            tree = "dirty-state unknown"
+        elif self.dirty:
+            tree = "dirty tree"
+        else:
+            tree = "clean"
+        return f"{branch} @ {short}, {tree}"
 
 
 def _git(*args: str) -> str | None:
@@ -59,10 +68,15 @@ def _git(*args: str) -> str | None:
             ["git", *args],
             capture_output=True,
             text=True,
+            # Git permits non-UTF8 branch names; strict decoding would raise
+            # UnicodeDecodeError (a ValueError) PAST the except below and make
+            # provenance the thing that kills a production run — the one
+            # failure this module's contract forbids.
+            errors="replace",
             timeout=_GIT_TIMEOUT_S,
             check=True,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
     return out.stdout.strip()
 

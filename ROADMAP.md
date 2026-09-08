@@ -485,6 +485,72 @@ power statement; and the 15 days observed before the primary cell was named
 (top-5 x limit_2pct, 2026-09-07) are SPENT — confirmation counts only days
 arriving after the naming.
 
+## Liquidity-floor study (#121, 2026-09-08) — the cost knob was price, not volume
+
+The August paper read ended with "the edge must get bigger, or the names more
+liquid." `twopercent floors` measured that tradeoff: one process, the referee's
+12 folds, 3 seeds, ONE fitted model per fold×seed shared by every arm (the
+floor applies at SELECTION only — the locked-in rule — so arms differ in the
+eligibility predicate and nothing else), paired by day against the shipped
+100k-share baseline, nothing recorded. Cost model: one tick over the signal
+close, round trip — a LOWER BOUND on cost, so every net number is optimistic.
+Full result with per-day vectors: `research/floors_121.json` (234 days,
+2025-10-01..**2026-09-04** — the final "month" is a 4-day September stub, and
+it happens to be the $2 arm's best "month"; ex-September the cell reads
++4.0bp/day, CR1 p=0.021, 9/11 months positive — weaker, same shape). WINDOW
+REUSE: this is at least the FOURTH substantial multi-arm look at this same
+12-month window (#110's six features, #115/#116's intraday four, now these 18
+tests) — the estimates on it are correspondingly shopworn, stated here the
+same way #116 stated its third look.
+
+| arm | prec | Δprec (p) | tick cost | Δnet/day (p naive → clustered) |
+|---|---|---|---|---|
+| shares≥100k (shipped) | 0.7390 | — | 15bp | — |
+| shares≥250k | 0.7305 | −0.0085 (.002) | 15bp | −0.00005 (.87) |
+| shares≥1M | 0.7177 | −0.0214 (.000) | 15bp | −0.00040 (.43) |
+| dollars≥5M | 0.7244 | −0.0147 (.000→.001) | 12bp | +0.00023 (.54) |
+| **price≥$2 + 100k** | **0.7392** | **+0.0001 (.92)** | **12bp** | **+0.00042 (.006→.014, 10/12 months)** |
+| price≥$5 + 100k | 0.7313 | −0.0077 (.023→.06) | 8bp | +0.00050 (.16) |
+
+Three findings, in order of importance:
+
+1. **No floor rescues the rule: the gross edge of limit_2pct top-20 is
+   NEGATIVE at every arm** (~−0.24%/day → ≈0.57 growth over the year). The
+   year-long walk-forward agrees with the SIM explorer (0.67) and the forward
+   paper ledger, against the August 13-day 1.027 — which was short-window
+   noise. The cost differences the floors can buy (2–7bp/day) are an order of
+   magnitude smaller than the gross bleed. Selection floors were the wrong
+   place to look for tradeability; the edge itself has to change (or the exit
+   rule, or the basket — the paper grid's clocks are accumulating that
+   evidence forward).
+2. **The share floor is the wrong knob, definitively.** Raising it costs
+   precision monotonically (−0.9pp → −2.6pp, every step p<0.001) while cutting
+   tick cost by ZERO — share floors do not remove cheap stocks (median pick
+   price stays ~$11 at every share level). The shipped 100k floor is vindicated
+   as a share floor: anything higher is pure signal loss.
+3. **Price is the right knob — but read the decomposition before the p-value
+   (quant-skeptic, PR #122).** The $2 minimum's Δnet +4.25bp/day splits into
+   **Δcost +2.95bp, which is a deterministic accounting identity** (removing
+   sub-$2 names removes their assumed one-tick cost — certain given the picks,
+   no market outcome involved) **and Δgross +1.30bp at p≈0.39** —
+   indistinguishable from zero. The small p (naive 0.006, fold-clustered
+   0.014, 10/12 months) is mostly testing "does the baseline top-20 regularly
+   contain sub-$2 names" (it does, 175/234 days), priced by an ASSUMED cost
+   model — the cost model looking at itself, not a discovered edge. Precision
+   is genuinely flat (+0.0001, p=0.92; 126/234 days bit-identical; any true
+   loss is <0.43pp per the cell's own MDE). The mechanism is prior-supported
+   (tick cost ~ 1/price) and that is the honest basis for the candidate rule
+   below — not the p-value, which also fails the study's 18-test Bonferroni
+   (bar 0.0028), and is worth nothing while the gross edge is negative.
+
+**DECIDED: no product change now.** Changing the selection floor while the rule
+loses gross would be rearranging deck chairs — and the study is the evidence,
+not the decision (its own multiplicity note says so). **Pre-registered
+(2026-09-08): `price ≥ $2 AND shares ≥ 100k` is the named candidate selection
+rule** if the gross edge ever turns positive; naming it now, on this data,
+means any future evaluation of it is out-of-sample by construction — the same
+naming-then-confirming discipline as the paper grid's primary cell.
+
 ## Reach-predictor pivot (decided 2026-07-25) — separate PREDICTION from TRADING
 
 Locked-in reframing (supersedes the original open-to-close target and the
@@ -990,6 +1056,12 @@ truth for *decisions and plan shape*; GitHub is the source of truth for
   Stale "+2% open-to-close candidates" labels fixed to reach/intraday; the daily
   email reframed from trade suggestions to ranked-prediction language.
   Supersedes/closes #68 (fee removal). Stage C (calibration) remains open.
+  Shipped (#121): the liquidity-floor study — `twopercent floors`, a
+  selection-only sweep on shared fits (arms differ in the eligibility
+  predicate and nothing else), paired by day, records nothing. Verdict: no
+  floor rescues limit_2pct top-20 (gross negative everywhere); share floors
+  cost signal and save nothing; price≥$2 is the named candidate rule if the
+  gross edge turns positive. See "Liquidity-floor study" section.
   Shipped (#114): production runs now prove which CODE they ran. A feature
   branch left checked out ran seven nights of live research (56 experiments
   from unmerged code) and nothing — digest, log, or ledger — could say so.

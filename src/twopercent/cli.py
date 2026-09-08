@@ -225,6 +225,44 @@ def ab_cmd(
         typer.echo(f"wrote {out}")
 
 
+@app.command("floors")
+def floors_cmd(
+    strategy: str = typer.Option(None, help="Strategy name (default: champion)."),
+    months: int = typer.Option(12, help="Test months (walk-forward, monthly retrain)."),
+    top: int = typer.Option(20, help="Daily top-N selection."),
+    seeds: str = typer.Option("42,43,44", help="Comma-separated seeds, averaged within day."),
+    out: Path = AbOutOption,
+    db: Path = DbOption,
+) -> None:
+    """Liquidity-floor study: sweep candidate selection floors on identical fits.
+
+    Records nothing; the floor applies at SELECTION only, so all arms share one
+    fitted model per fold x seed. Net numbers use a one-tick cost proxy and are
+    optimistic — see the module docstring. Adopting a floor is a product PR.
+    """
+    from twopercent import champion, floors, strategies
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    name = strategy or champion.get_champion()
+    if name not in strategies.names():
+        typer.echo(f"Unknown strategy {name!r}. Available: {', '.join(strategies.names())}")
+        raise typer.Exit(2)
+    try:
+        seed_values = [int(s) for s in seeds.split(",") if s.strip()]
+    except ValueError:
+        typer.echo(f"--seeds must be comma-separated integers, got {seeds!r}")
+        raise typer.Exit(2) from None
+    if not seed_values:
+        typer.echo("--seeds is empty")
+        raise typer.Exit(2)
+    con = store.connect(db)
+    result = floors.run_study(con, name, months=months, top_n=top, seeds=seed_values)
+    typer.echo(floors.format_report(result))
+    if out:
+        out.write_text(json.dumps(result, indent=2, default=str))
+        typer.echo(f"wrote {out}")
+
+
 @app.command("predict")
 def predict_cmd(
     strategy: str = typer.Option(None, help="Strategy name (default: champion)."),

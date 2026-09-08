@@ -394,7 +394,12 @@ def run_ab(
         "folds_requested": len(folds),
         "test_days": len(precision_by_day[reference]),
         "test_start": first_run_start.isoformat(),
-        "test_end": folds[-1][1].isoformat(),
+        # Last day present in the paired series, not the final fold's nominal
+        # month-end — a run early in a month would otherwise claim weeks of
+        # test window that contain no data (found in floors.py first; same
+        # defect here, fixed at the source).
+        "test_end": max(precision_by_day[reference]).isoformat(),
+        "final_fold_end_nominal": folds[-1][1].isoformat(),
         "labeled_rows": int(len(labeled)),
         "base_rate": base_rate,
         "columns_under_test": under_test,

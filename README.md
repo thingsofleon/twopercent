@@ -29,6 +29,7 @@ uv run twopercent intraday --interval 1h   # 1h bars, WHOLE UNIVERSE (feeds sign
 uv run twopercent intraday-validate    # cross-check 5m verdicts against 1m
 uv run twopercent benchmark            # walk-forward benchmark -> experiments row
 uv run twopercent ab --add <column>    # paired feature-set A/B (records nothing)
+uv run twopercent floors               # liquidity-floor study on shared fits (records nothing)
 uv run twopercent routine              # pre-open daily cycle (predict mode)
 uv run twopercent routine --mode score # post-close scoring + degradation check
 uv run twopercent research             # overnight experiment queue (budget 8/night)

@@ -86,6 +86,7 @@ def test_routine_happy_path_completes_all_steps(ready):
     names = [s.name for s in report.steps]
     assert names == [
         "clock",
+        "code",
         "doctor",
         "universe",
         "ingest",

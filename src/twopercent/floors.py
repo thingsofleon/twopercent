@@ -38,6 +38,10 @@ from twopercent.scan import DEFAULT_THRESHOLD
 logger = logging.getLogger(__name__)
 
 BASELINE_ARM = f"shares>={LIQUIDITY_MIN_MEDIAN_VOLUME // 1000}k"
+# The study's OWN family: every persisted paired block (alpha, mde_80) must be
+# corrected for it, not for ab.py's 2-test default — #115's error lived
+# precisely in an mde_80 read against the wrong family (reviewer, PR #122).
+PRIMARY_READOUTS = 2  # precision and net
 SHARE_FLOORS = (100_000, 250_000, 500_000, 1_000_000, 2_000_000)
 DOLLAR_FLOORS = (1_000_000, 5_000_000, 20_000_000)
 PRICE_FLOORS = (2.0, 5.0)
@@ -162,6 +166,11 @@ def run_study(
                     bucket = per_day[arm][seed]
                     bucket["precision"][target_date] = float(top["did_2pct_next"].mean())
                     priced = top[top["signal_close"].notna()]
+                    # Selection PROFILE (median price/$vol, thin days) is
+                    # collected from the first seed only: picks/thin_days are
+                    # seed-invariant, and price medians across seeds differ by
+                    # which near-tied names each seed ranks 20th — a profile,
+                    # not a metric, and cheaper than tripling the lists.
                     if seed == seeds[0]:
                         prof = profile[arm]
                         prof["picks"] += len(top)
@@ -189,6 +198,10 @@ def run_study(
         return {k: sum(d[k] for d in per_seed) / len(per_seed) for k in sorted(keys)}
 
     base = {m: seed_mean(BASELINE_ARM, m) for m in metric_names}
+    if not base["precision"]:
+        # ab.py earned this hard error: a table of nan-deltas against a
+        # nonexistent baseline reads like a measurement and is nonsense.
+        raise RuntimeError("every test day fell below the liquidity floor — no top-N to score")
     base_rate = float(
         labeled.loc[labeled["target_date"] >= first_run_start, "did_2pct_next"].mean()
     )
@@ -225,9 +238,13 @@ def run_study(
             "median_dollar_vol": float(dollars.median()) if len(dollars) else None,
         }
         if arm != BASELINE_ARM:
+            family_alpha = ab.NOMINAL_ALPHA / (len(arms) - 1) / PRIMARY_READOUTS
             for metric, key in (("precision", "precision_vs_baseline"), ("net", "net_vs_baseline")):
                 shared = sorted(set(series[metric]) & set(base[metric]))
-                row[key] = ab._paired_test([series[metric][k] - base[metric][k] for k in shared])
+                row[key] = ab._paired_test(
+                    [series[metric][k] - base[metric][k] for k in shared],
+                    alpha=family_alpha,
+                )
         arm_rows[arm] = row
 
     return {
@@ -238,7 +255,12 @@ def run_study(
         "folds": folds_run,
         "folds_requested": len(folds),
         "test_start": first_run_start.isoformat(),
-        "test_end": folds[-1][1].isoformat(),
+        # The LAST DAY THAT EXISTS in the series, not the final fold's nominal
+        # month-end: the first run claimed 2026-09-30 while its data ended
+        # 2026-09-04, a 26-day phantom in a checked-in artifact (quant-skeptic,
+        # PR #122). The nominal fold end rides alongside, labeled as nominal.
+        "test_end": max(base["precision"]).isoformat(),
+        "final_fold_end_nominal": folds[-1][1].isoformat(),
         "base_rate": base_rate,
         "baseline_arm": BASELINE_ARM,
         "cost_model": "one tick (0.01) round trip over signal close — a LOWER BOUND on cost",
@@ -247,7 +269,8 @@ def run_study(
         "arms": arm_rows,
         "multiplicity": {
             "non_baseline_arms": len(arms) - 1,
-            "primary_readouts": 2,
+            "primary_readouts": PRIMARY_READOUTS,
+            "bonferroni_alpha": ab.NOMINAL_ALPHA / (len(arms) - 1) / PRIMARY_READOUTS,
             "note": (
                 "every arm is always reported; adoption of any arm is a product PR "
                 "with its own review, never an output of this study"

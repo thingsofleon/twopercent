@@ -111,3 +111,53 @@ def test_missing_signal_close_is_counted_and_excluded_from_cost(planted, caplog)
 def test_duplicate_seeds_rejected(planted):
     with pytest.raises(ValueError, match="duplicate seeds"):
         floors.run_study(planted, "baseline_gbm_v1", seeds=[42, 42])
+
+
+def test_baseline_arm_reproduces_the_referee_on_the_floored_path(planted, caplog):
+    """The baseline arm IS the shipped selection — pinned against run_benchmark
+    with sub-floor symbols planted, because with every symbol eligible this
+    test would stay green if the floor filter were deleted (the exact trap
+    ab.py's lockstep test fell into first; reviewer, PR #122)."""
+    planted.execute("UPDATE prices SET volume = 50_000 WHERE symbol LIKE 'RUN0%'")
+    with caplog.at_level(logging.WARNING):
+        metrics = backtest.run_benchmark(
+            planted, "baseline_gbm_v1", months=2, top_n=5, record=False
+        )
+    result = floors.run_study(planted, "baseline_gbm_v1", months=2, top_n=5, seeds=[42])
+    base = result["arms"][result["baseline_arm"]]
+    assert base["precision"] == pytest.approx(metrics["precision_at_n"], abs=5e-5)
+    assert base["days"] == metrics["test_days"]
+    assert result["folds"] == metrics["folds"]
+    # The floored path actually ran, or the pin proves nothing.
+    assert "liquidity floor" in caplog.text
+
+
+def test_everything_below_the_baseline_floor_is_a_hard_error(planted):
+    """A table of nan-deltas against a nonexistent baseline reads like a
+    measurement; ab.py earned the hard error and this module inherits it."""
+    planted.execute("UPDATE prices SET volume = 50_000")
+    with pytest.raises(RuntimeError, match="liquidity floor"):
+        floors.run_study(planted, "baseline_gbm_v1", months=2, top_n=5, seeds=[42])
+
+
+def test_paired_blocks_carry_the_studys_own_family_alpha(planted):
+    """mde_80 against the wrong family is how #115 misread its evidence: the
+    persisted blocks must carry THIS study's 18-test alpha, not ab's 2-test
+    default (reviewer, PR #122)."""
+    result = floors.run_study(planted, "baseline_gbm_v1", months=2, top_n=5, seeds=[42])
+    expected = 0.05 / result["multiplicity"]["non_baseline_arms"] / 2
+    assert result["multiplicity"]["bonferroni_alpha"] == pytest.approx(expected)
+    for name, row in result["arms"].items():
+        if name != result["baseline_arm"] and row["days"]:
+            assert row["net_vs_baseline"]["alpha"] == pytest.approx(expected)
+            assert row["precision_vs_baseline"]["alpha"] == pytest.approx(expected)
+
+
+def test_test_end_is_the_last_day_with_data_not_the_nominal_fold_end(planted):
+    """The first live run claimed test_end 2026-09-30 while its series ended
+    2026-09-04 — a 26-day phantom in a checked-in artifact (quant-skeptic,
+    PR #122)."""
+    result = floors.run_study(planted, "baseline_gbm_v1", months=2, top_n=5, seeds=[42])
+    base_days = result["arms"][result["baseline_arm"]]["by_day"]["precision"]
+    assert result["test_end"] == max(base_days)
+    assert result["final_fold_end_nominal"] >= result["test_end"]

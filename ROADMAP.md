@@ -495,7 +495,13 @@ eligibility predicate and nothing else), paired by day against the shipped
 100k-share baseline, nothing recorded. Cost model: one tick over the signal
 close, round trip — a LOWER BOUND on cost, so every net number is optimistic.
 Full result with per-day vectors: `research/floors_121.json` (234 days,
-2025-10-01..2026-09-30).
+2025-10-01..**2026-09-04** — the final "month" is a 4-day September stub, and
+it happens to be the $2 arm's best "month"; ex-September the cell reads
++4.0bp/day, CR1 p=0.021, 9/11 months positive — weaker, same shape). WINDOW
+REUSE: this is at least the FOURTH substantial multi-arm look at this same
+12-month window (#110's six features, #115/#116's intraday four, now these 18
+tests) — the estimates on it are correspondingly shopworn, stated here the
+same way #116 stated its third look.
 
 | arm | prec | Δprec (p) | tick cost | Δnet/day (p naive → clustered) |
 |---|---|---|---|---|
@@ -522,15 +528,20 @@ Three findings, in order of importance:
    tick cost by ZERO — share floors do not remove cheap stocks (median pick
    price stays ~$11 at every share level). The shipped 100k floor is vindicated
    as a share floor: anything higher is pure signal loss.
-3. **Price is the right knob.** A $2 minimum removes the tick-cost extremes
-   while leaving precision byte-flat (+0.0001, p=0.92 under every estimator) —
-   net +4.2bp/day, naive p=0.006, fold-clustered p=0.014, positive in 10 of 12
-   months. The mechanism is prior-supported (tick cost ~ 1/price), and the
-   precision-flatness has a clean reading: sub-$2 names rarely reach the
-   top-20, and when they do, near-equal-probability substitutes exist at a
-   tenth of the cost. HONESTY: it does not survive Bonferroni over the study's
-   18-test family (bar 0.0028), and it is worth nothing while the gross edge
-   is negative.
+3. **Price is the right knob — but read the decomposition before the p-value
+   (quant-skeptic, PR #122).** The $2 minimum's Δnet +4.25bp/day splits into
+   **Δcost +2.95bp, which is a deterministic accounting identity** (removing
+   sub-$2 names removes their assumed one-tick cost — certain given the picks,
+   no market outcome involved) **and Δgross +1.30bp at p≈0.39** —
+   indistinguishable from zero. The small p (naive 0.006, fold-clustered
+   0.014, 10/12 months) is mostly testing "does the baseline top-20 regularly
+   contain sub-$2 names" (it does, 175/234 days), priced by an ASSUMED cost
+   model — the cost model looking at itself, not a discovered edge. Precision
+   is genuinely flat (+0.0001, p=0.92; 126/234 days bit-identical; any true
+   loss is <0.43pp per the cell's own MDE). The mechanism is prior-supported
+   (tick cost ~ 1/price) and that is the honest basis for the candidate rule
+   below — not the p-value, which also fails the study's 18-test Bonferroni
+   (bar 0.0028), and is worth nothing while the gross edge is negative.
 
 **DECIDED: no product change now.** Changing the selection floor while the rule
 loses gross would be rearranging deck chairs — and the study is the evidence,
